@@ -12,6 +12,7 @@ WORKER_LDFLAGS = -lssl -lcrypto -lz -lzstd -ldl -lpthread
 SRCDIR = src
 OBJDIR = obj
 BINDIR = bin
+GPKG_FRAGMENTS = $(wildcard $(SRCDIR)/*.ipp)
 
 TARGETS = $(BINDIR)/gpkg $(BINDIR)/gpkg-worker
 
@@ -20,7 +21,7 @@ all: $(BINDIR) $(OBJDIR) $(TARGETS)
 $(BINDIR) $(OBJDIR):
 	mkdir -p $@
 
-$(BINDIR)/gpkg: $(SRCDIR)/gpkg.cpp
+$(BINDIR)/gpkg: $(SRCDIR)/gpkg.cpp $(GPKG_FRAGMENTS)
 	$(CXX) $(CXXFLAGS) -o $@ $< $(GPKG_LDFLAGS)
 	$(STRIP) $@
 
