@@ -87,9 +87,8 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
     }
     if (!ask_confirmation("Do you want to continue?")) return 0;
 
-    std::cout << Color::CYAN << "[*] Downloading " << updates.size()
-              << " package(s) with up to " << std::min(MAX_PARALLEL_PACKAGE_DOWNLOADS, updates.size())
-              << " parallel workers..." << Color::RESET << std::endl;
+    std::cout << Color::CYAN << "[*] Downloading "
+              << updates.size() << " package(s)..." << Color::RESET << std::endl;
     DownloadBatchReport download_report = download_package_archives(
         updates,
         verbose,
@@ -97,7 +96,8 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
     );
     std::cout << Color::CYAN << "[*] Download summary: "
               << download_report.downloaded_count << " downloaded, "
-              << download_report.reused_count << " reused from cache."
+              << download_report.reused_count << " reused from cache, "
+              << format_total_bytes(download_report.downloaded_bytes) << " transferred."
               << Color::RESET << std::endl;
 
     size_t upgraded_count = 0;
@@ -123,7 +123,8 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
     std::cout << Color::CYAN << "Upgrade summary: "
               << upgraded_count << " upgraded, "
               << download_report.downloaded_count << " downloaded, "
-              << download_report.reused_count << " reused from cache."
+              << download_report.reused_count << " reused from cache, "
+              << format_total_bytes(download_report.downloaded_bytes) << " transferred."
               << Color::RESET << std::endl;
 
     if (!failures.empty()) {
@@ -188,9 +189,8 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
     if (!check_conflicts(install_queue, installed_cache, verbose)) return 1;
     if (!ask_confirmation("Do you want to continue?")) return 0;
 
-    std::cout << Color::CYAN << "[*] Downloading " << install_queue.size()
-              << " package(s) with up to " << std::min(MAX_PARALLEL_PACKAGE_DOWNLOADS, install_queue.size())
-              << " parallel workers..." << Color::RESET << std::endl;
+    std::cout << Color::CYAN << "[*] Downloading "
+              << install_queue.size() << " package(s)..." << Color::RESET << std::endl;
     DownloadBatchReport download_report = download_package_archives(
         install_queue,
         verbose,
@@ -198,7 +198,8 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
     );
     std::cout << Color::CYAN << "[*] Download summary: "
               << download_report.downloaded_count << " downloaded, "
-              << download_report.reused_count << " reused from cache."
+              << download_report.reused_count << " reused from cache, "
+              << format_total_bytes(download_report.downloaded_bytes) << " transferred."
               << Color::RESET << std::endl;
 
     std::vector<std::string> failed_downloads;
