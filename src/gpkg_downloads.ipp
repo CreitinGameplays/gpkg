@@ -12,6 +12,7 @@ struct DownloadBatchReport {
     size_t downloaded_count = 0;
     size_t reused_count = 0;
     size_t downloaded_bytes = 0;
+    size_t estimated_bytes = 0;
 };
 
 std::string format_batch_speed(double bytes_per_sec) {
@@ -47,6 +48,11 @@ std::string format_total_bytes(size_t bytes) {
         out << std::fixed << std::setprecision(1) << value << " " << units[unit_index];
     }
     return out.str();
+}
+
+std::string format_data_progress(size_t transferred, size_t estimated) {
+    if (estimated == 0) return format_total_bytes(transferred);
+    return format_total_bytes(transferred) + "/" + format_total_bytes(estimated);
 }
 
 bool verify_hash(
@@ -110,7 +116,8 @@ bool fetch_package_archive(
     bool verbose,
     bool* reused_out = nullptr,
     std::string* error_out = nullptr,
-    bool quiet = false
+    bool quiet = false,
+    const std::function<void(size_t, size_t, double)>& progress_callback = nullptr
 ) {
     if (reused_out) *reused_out = false;
     if (error_out) error_out->clear();
@@ -167,7 +174,7 @@ bool fetch_package_archive(
         std::string download_error;
         bool network_verbose = quiet ? false : verbose;
         bool network_progress = quiet ? false : true;
-        if (!DownloadFile(url, local_path, network_verbose, &download_error, network_progress)) {
+        if (!DownloadFile(url, local_path, network_verbose, &download_error, network_progress, progress_callback)) {
             remove(local_path.c_str());
             last_error = "failed to download from " + url;
             if (!download_error.empty()) last_error += " (" + download_error + ")";
@@ -200,6 +207,21 @@ bool fetch_package_archive(
     return fail("Failed to fetch a valid archive for " + meta.name + " from " + url + " (" + last_error + ")");
 }
 
+size_t estimate_package_archive_bytes(const PackageMetadata& meta) {
+    struct stat st;
+    std::string cached_path = get_cached_package_path(meta);
+    if (stat(cached_path.c_str(), &st) == 0 && st.st_size > 0) {
+        return static_cast<size_t>(st.st_size);
+    }
+
+    std::string url;
+    if (!resolve_download_url(meta, url)) return 0;
+
+    long remote_size = GetRemoteFileSize(url);
+    if (remote_size <= 0) return 0;
+    return static_cast<size_t>(remote_size);
+}
+
 DownloadBatchReport download_package_archives(
     const std::vector<PackageMetadata>& packages,
     bool verbose,
@@ -212,38 +234,100 @@ DownloadBatchReport download_package_archives(
     const size_t worker_count = std::max<size_t>(1, std::min(max_parallel_downloads, packages.size()));
     std::atomic<size_t> next_index{0};
     std::mutex output_mutex;
+    struct ActiveDownloadState {
+        bool active = false;
+        bool reused = false;
+        size_t transferred = 0;
+        size_t estimated = 0;
+        double speed = 0.0;
+        std::string name;
+    };
+    std::vector<ActiveDownloadState> active_downloads(packages.size());
     size_t completed_count = 0;
     size_t downloaded_count = 0;
     size_t downloaded_bytes = 0;
     size_t reused_count = 0;
     size_t failed_count = 0;
-    auto batch_start = std::chrono::steady_clock::now();
+    size_t last_render_width = 0;
+    {
+        const size_t estimate_worker_count = std::max<size_t>(1, std::min<size_t>(MAX_PARALLEL_PACKAGE_DOWNLOADS, packages.size()));
+        std::atomic<size_t> estimate_index{0};
+        std::mutex estimate_mutex;
+        std::vector<std::thread> estimate_workers;
+        estimate_workers.reserve(estimate_worker_count);
+
+        auto estimate_worker = [&]() {
+            while (true) {
+                size_t idx = estimate_index.fetch_add(1);
+                if (idx >= packages.size()) return;
+                size_t estimate = estimate_package_archive_bytes(packages[idx]);
+                if (estimate == 0) continue;
+                std::lock_guard<std::mutex> lock(estimate_mutex);
+                report.estimated_bytes += estimate;
+            }
+        };
+
+        for (size_t i = 0; i < estimate_worker_count; ++i) {
+            estimate_workers.emplace_back(estimate_worker);
+        }
+        for (auto& worker : estimate_workers) {
+            worker.join();
+        }
+    }
 
     auto render_progress = [&](const std::string& last_package) {
         const int bar_width = 32;
-        int percent = static_cast<int>((completed_count * 100) / packages.size());
-        int filled = static_cast<int>((completed_count * bar_width) / packages.size());
+        size_t live_bytes = downloaded_bytes;
+        double live_speed = 0.0;
+        size_t active_count = 0;
         std::string label = last_package;
-        if (label.size() > 24) label = label.substr(0, 21) + "...";
-        auto now = std::chrono::steady_clock::now();
-        double elapsed_seconds = std::chrono::duration_cast<std::chrono::milliseconds>(now - batch_start).count() / 1000.0;
-        double bytes_per_sec = elapsed_seconds > 0.0 ? static_cast<double>(downloaded_bytes) / elapsed_seconds : 0.0;
 
-        std::cout << "\r" << Color::CYAN << "[";
+        for (const auto& state : active_downloads) {
+            if (!state.active || state.reused) continue;
+            live_bytes += state.transferred;
+            live_speed += state.speed;
+            ++active_count;
+            if (label.empty()) label = state.name;
+        }
+
+        int percent = 0;
+        if (report.estimated_bytes > 0) {
+            percent = static_cast<int>((live_bytes * 100) / report.estimated_bytes);
+        } else {
+            percent = static_cast<int>((completed_count * 100) / packages.size());
+        }
+        if (percent > 100) percent = 100;
+        int filled = (percent * bar_width) / 100;
+
+        if (label.size() > 24) label = label.substr(0, 21) + "...";
+
+        std::ostringstream line;
+        line << "\r" << Color::CYAN << "[";
         for (int i = 0; i < bar_width; ++i) {
-            std::cout << (i < filled ? "#" : ".");
+            line << (i < filled ? "#" : ".");
         }
-        std::cout << "]" << Color::RESET
-                  << " " << std::setw(3) << percent << "% "
-                  << "(" << completed_count << "/" << packages.size() << ")"
-                  << "  net:" << downloaded_count
-                  << "  cache:" << reused_count
-                  << "  fail:" << failed_count
-                  << "  data:" << format_total_bytes(downloaded_bytes)
-                  << "  speed:" << format_batch_speed(bytes_per_sec);
+        line << "]" << Color::RESET
+             << " " << std::setw(3) << percent << "% "
+             << "(" << completed_count << "/" << packages.size() << ")"
+             << "  net:" << downloaded_count
+             << "  cache:" << reused_count
+             << "  fail:" << failed_count
+             << "  data:" << format_data_progress(live_bytes, report.estimated_bytes)
+             << "  speed:" << format_batch_speed(live_speed);
         if (!label.empty()) {
-            std::cout << "  last:" << label;
+            line << "  pkg:" << label;
         }
+        if (active_count > 1) {
+            line << "  +" << (active_count - 1) << " more";
+        }
+
+        std::string rendered = line.str();
+        size_t visible_width = rendered.size();
+        std::cout << rendered;
+        if (visible_width < last_render_width) {
+            std::cout << std::string(last_render_width - visible_width, ' ');
+        }
+        last_render_width = visible_width;
         std::cout << std::flush;
     };
 
@@ -257,6 +341,13 @@ DownloadBatchReport download_package_archives(
             size_t idx = next_index.fetch_add(1);
             if (idx >= packages.size()) return;
 
+            {
+                std::lock_guard<std::mutex> lock(output_mutex);
+                active_downloads[idx].active = true;
+                active_downloads[idx].name = packages[idx].name;
+                render_progress(packages[idx].name);
+            }
+
             bool reused = false;
             std::string error;
             bool ok = fetch_package_archive(
@@ -266,7 +357,17 @@ DownloadBatchReport download_package_archives(
                 verbose,
                 &reused,
                 &error,
-                true
+                true,
+                [&](size_t transferred, size_t estimated, double speed) {
+                    std::lock_guard<std::mutex> lock(output_mutex);
+                    active_downloads[idx].active = true;
+                    active_downloads[idx].reused = false;
+                    active_downloads[idx].name = packages[idx].name;
+                    active_downloads[idx].transferred = transferred;
+                    active_downloads[idx].estimated = estimated;
+                    active_downloads[idx].speed = speed;
+                    render_progress(packages[idx].name);
+                }
             );
 
             report.results[idx].success = ok;
@@ -280,6 +381,11 @@ DownloadBatchReport download_package_archives(
             }
 
             std::lock_guard<std::mutex> lock(output_mutex);
+            active_downloads[idx].active = false;
+            active_downloads[idx].reused = reused;
+            active_downloads[idx].transferred = 0;
+            active_downloads[idx].estimated = 0;
+            active_downloads[idx].speed = 0.0;
             ++completed_count;
             if (ok) {
                 if (reused) {

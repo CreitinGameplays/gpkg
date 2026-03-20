@@ -4,10 +4,22 @@ STRIP = /usr/bin/strip
 PROJECT_ROOT ?= $(abspath $(CURDIR)/..)
 GINIT_DIR = $(PROJECT_ROOT)/ginit
 GLOBAL_SRC_DIR = $(PROJECT_ROOT)/src
+ROOTFS ?=
+TARGET_CXX_VERSION := $(shell find $(ROOTFS)/usr/include/c++ -maxdepth 1 -mindepth 1 -type d -printf '%f\n' 2>/dev/null | grep -E '^[0-9]+$$' | sort -V | tail -n1)
 
 CXXFLAGS += -Wall -Wextra -O2 -I./src -I$(GINIT_DIR)/src -I$(GLOBAL_SRC_DIR)
+ifneq ($(strip $(TARGET_CXX_VERSION)),)
+CXXFLAGS += -nostdinc++
+CXXFLAGS += -isystem $(ROOTFS)/usr/include/c++/$(TARGET_CXX_VERSION)
+CXXFLAGS += -isystem $(ROOTFS)/usr/include/x86_64-linux-gnu/c++/$(TARGET_CXX_VERSION)
+CXXFLAGS += -isystem $(ROOTFS)/usr/include/c++/$(TARGET_CXX_VERSION)/backward
+endif
 GPKG_LDFLAGS = -L$(GINIT_DIR)/lib -lgemcore -lssl -lcrypto -lz -lzstd -ldl -lpthread -lcrypt
 WORKER_LDFLAGS = -lssl -lcrypto -lz -lzstd -ldl -lpthread
+ifneq ($(strip $(TARGET_CXX_VERSION)),)
+GPKG_LDFLAGS += $(ROOTFS)/lib64/ld-linux-x86-64.so.2
+WORKER_LDFLAGS += $(ROOTFS)/lib64/ld-linux-x86-64.so.2
+endif
 
 SRCDIR = src
 OBJDIR = obj
