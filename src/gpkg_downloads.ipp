@@ -345,7 +345,6 @@ DownloadBatchReport download_package_archives(
              << " " << std::setw(3) << percent << "% "
              << "(" << completed_count << "/" << packages.size() << ")"
              << "  net:" << downloaded_count
-             << "  cache:" << reused_count
              << "  fail:" << failed_count
              << "  data:" << format_data_progress(live_bytes, report.estimated_bytes)
              << "  speed:" << format_batch_speed(live_speed);
