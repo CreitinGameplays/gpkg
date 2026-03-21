@@ -4,10 +4,20 @@ STRIP = /usr/bin/strip
 PROJECT_ROOT ?= $(abspath $(CURDIR)/..)
 GINIT_DIR = $(PROJECT_ROOT)/ginit
 GLOBAL_SRC_DIR = $(PROJECT_ROOT)/src
+SYS_INFO_HEADER ?= $(GLOBAL_SRC_DIR)/sys_info.h
 ROOTFS ?=
 TARGET_CXX_VERSION := $(shell find $(ROOTFS)/usr/include/c++ -maxdepth 1 -mindepth 1 -type d -printf '%f\n' 2>/dev/null | grep -E '^[0-9]+$$' | sort -V | tail -n1)
+GPKG_VERSION ?=
+GPKG_CODENAME ?=
+ifeq ($(strip $(GPKG_VERSION)),)
+GPKG_VERSION := $(shell awk '$$2 == "OS_VERSION" { gsub(/"/, "", $$3); print $$3; exit }' $(SYS_INFO_HEADER))
+endif
+ifeq ($(strip $(GPKG_CODENAME)),)
+GPKG_CODENAME := $(shell awk '$$2 == "OS_CODENAME" { gsub(/"/, "", $$3); print $$3; exit }' $(SYS_INFO_HEADER))
+endif
 
 CXXFLAGS += -Wall -Wextra -O2 -I./src -I$(GINIT_DIR)/src -I$(GLOBAL_SRC_DIR)
+CXXFLAGS += -DGPKG_VERSION=\"$(GPKG_VERSION)\" -DGPKG_CODENAME=\"$(GPKG_CODENAME)\"
 ifneq ($(strip $(TARGET_CXX_VERSION)),)
 CXXFLAGS += -nostdinc++
 CXXFLAGS += -isystem $(ROOTFS)/usr/include/c++/$(TARGET_CXX_VERSION)

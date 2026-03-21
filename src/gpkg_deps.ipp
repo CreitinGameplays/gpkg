@@ -6,6 +6,21 @@ struct Dependency {
     std::string version;
 };
 
+bool get_installed_package_metadata(const std::string& pkg_name, PackageMetadata& out_meta) {
+    std::ifstream f(INFO_DIR + pkg_name + ".json");
+    if (!f) return false;
+
+    std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    out_meta = {};
+    out_meta.name = pkg_name;
+    get_json_value(content, "version", out_meta.version);
+    get_json_value(content, "description", out_meta.description);
+    get_json_array(content, "depends", out_meta.depends);
+    get_json_array(content, "conflicts", out_meta.conflicts);
+    get_json_array(content, "provides", out_meta.provides);
+    return !out_meta.version.empty() || !content.empty();
+}
+
 Dependency parse_dependency(const std::string& dep_str) {
     Dependency dep;
     size_t open_paren = dep_str.find('(');
@@ -68,6 +83,79 @@ bool is_system_provided(const std::string& pkg, const std::string& op = "", cons
     return false;
 }
 
+bool package_metadata_satisfies_dependency(
+    const std::string& package_name,
+    const PackageMetadata& meta,
+    const Dependency& dep
+) {
+    if (package_name == dep.name && version_satisfies(meta.version, dep.op, dep.version)) {
+        return true;
+    }
+
+    for (const auto& provided : meta.provides) {
+        Dependency provided_dep = parse_dependency(provided);
+        if (provided_dep.name != dep.name) continue;
+        if (dep.op.empty()) return true;
+        if (!provided_dep.version.empty() &&
+            version_satisfies(provided_dep.version, dep.op, dep.version)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool find_installed_dependency_provider(
+    const Dependency& dep,
+    const std::set<std::string>& installed_cache,
+    std::string* provider_out = nullptr
+) {
+    if (provider_out) provider_out->clear();
+
+    for (const auto& installed_name : installed_cache) {
+        PackageMetadata meta;
+        if (!get_installed_package_metadata(installed_name, meta)) continue;
+        if (!package_metadata_satisfies_dependency(installed_name, meta, dep)) continue;
+        if (provider_out) *provider_out = installed_name;
+        return true;
+    }
+
+    return false;
+}
+
+bool is_dependency_satisfied_locally(
+    const Dependency& dep,
+    const std::set<std::string>& installed_cache,
+    bool verbose,
+    std::string* provider_out = nullptr
+) {
+    if (provider_out) provider_out->clear();
+
+    if (is_system_provided(dep.name, dep.op, dep.version)) {
+        if (provider_out) *provider_out = SYSTEM_PROVIDES_PATH;
+        return true;
+    }
+
+    std::string installed_ver;
+    if (is_installed(dep.name, &installed_ver) && version_satisfies(installed_ver, dep.op, dep.version)) {
+        if (provider_out) *provider_out = dep.name;
+        return true;
+    }
+
+    std::string provider_name;
+    if (find_installed_dependency_provider(dep, installed_cache, &provider_name)) {
+        if (provider_out) *provider_out = provider_name;
+        return true;
+    }
+
+    if (verbose && !dep.op.empty() && is_installed(dep.name, &installed_ver)) {
+        VLOG(verbose, dep.name << " is installed as " << installed_ver
+             << " but does not satisfy " << dep.op << " " << dep.version);
+    }
+
+    return false;
+}
+
 std::string find_provider(const std::string& capability, const std::string& op, const std::string& req_version, bool verbose) {
     std::string result;
     foreach_json_object(REPO_CACHE_PATH + "Packages.json", [&](const std::string& obj) {
@@ -121,8 +209,18 @@ bool resolve_dependencies(
     VLOG(verbose, "Resolving dependencies for: " << pkg
          << (op.empty() ? "" : (" (" + op + " " + req_version + ")")));
 
-    if (is_system_provided(pkg, op, req_version)) {
-        VLOG(verbose, pkg << " is satisfied by " << SYSTEM_PROVIDES_PATH);
+    Dependency requested_dep{pkg, op, req_version};
+    std::string provider_name;
+    if (is_dependency_satisfied_locally(requested_dep, installed_cache, verbose, &provider_name)) {
+        if (provider_name == SYSTEM_PROVIDES_PATH) {
+            VLOG(verbose, pkg << " is satisfied by " << SYSTEM_PROVIDES_PATH);
+        } else if (provider_name == pkg) {
+            std::string installed_ver;
+            is_installed(pkg, &installed_ver);
+            VLOG(verbose, pkg << " " << installed_ver << " is installed and satisfies constraints.");
+        } else {
+            VLOG(verbose, pkg << " is provided by installed package " << provider_name);
+        }
         return true;
     }
 
@@ -136,25 +234,6 @@ bool resolve_dependencies(
         std::cerr << Color::YELLOW << "W: " << pkg << " " << installed_ver
                   << " is installed but does not meet requirements (" << op
                   << " " << req_version << ")." << Color::RESET << std::endl;
-    }
-
-    for (const auto& installed_name : installed_cache) {
-        std::ifstream f(INFO_DIR + installed_name + ".json");
-        if (!f) continue;
-
-        std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-        std::vector<std::string> installed_provides;
-        if (!get_json_array(content, "provides", installed_provides)) continue;
-
-        for (const auto& provided : installed_provides) {
-            std::string provided_name = provided;
-            size_t space = provided.find(' ');
-            if (space != std::string::npos) provided_name = provided.substr(0, space);
-            if (provided_name == pkg) {
-                VLOG(verbose, pkg << " is provided by installed package " << installed_name);
-                return true;
-            }
-        }
     }
 
     PackageMetadata meta;

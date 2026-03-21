@@ -72,17 +72,21 @@ bool get_repo_package_info(const std::string& pkg_name, PackageMetadata& out_met
     foreach_json_object(REPO_CACHE_PATH + "Packages.json", [&](const std::string& obj) {
         std::string name;
         if (get_json_value(obj, "package", name) && trim(name) == pkg_name) {
-            out_meta.name = trim(name);
-            get_json_value(obj, "version", out_meta.version);
-            get_json_value(obj, "description", out_meta.description);
-            get_json_value(obj, "filename", out_meta.filename);
-            get_json_value(obj, "sha512", out_meta.sha512);
-            get_json_value(obj, "repo_url", out_meta.source_url);
-            get_json_array(obj, "depends", out_meta.depends);
-            get_json_array(obj, "conflicts", out_meta.conflicts);
-            get_json_array(obj, "provides", out_meta.provides);
+            PackageMetadata candidate;
+            candidate.name = trim(name);
+            get_json_value(obj, "version", candidate.version);
+            get_json_value(obj, "description", candidate.description);
+            get_json_value(obj, "filename", candidate.filename);
+            get_json_value(obj, "sha512", candidate.sha512);
+            get_json_value(obj, "repo_url", candidate.source_url);
+            get_json_array(obj, "depends", candidate.depends);
+            get_json_array(obj, "conflicts", candidate.conflicts);
+            get_json_array(obj, "provides", candidate.provides);
+
+            if (!found || compare_versions(candidate.version, out_meta.version) > 0) {
+                out_meta = candidate;
+            }
             found = true;
-            return false;
         }
         return true;
     });

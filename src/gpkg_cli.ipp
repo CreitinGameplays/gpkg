@@ -1,13 +1,28 @@
 // CLI entrypoint and top-level command dispatch.
 
+#ifndef GPKG_VERSION
+#define GPKG_VERSION OS_VERSION
+#endif
+
+#ifndef GPKG_CODENAME
+#define GPKG_CODENAME OS_CODENAME
+#endif
+
+void print_version() {
+    std::cout << "gpkg " << GPKG_VERSION << " (" << GPKG_CODENAME << ")" << std::endl;
+}
+
 void print_help() {
-    std::cout << "Usage: gpkg <command> [args] [--verbose]\n"
-              << "GeminiOS Package Manager (v2.1 - Genesis)\n\n"
+    std::cout << "Usage: gpkg <command> [args] [options]\n"
+              << "GeminiOS Package Manager " << GPKG_VERSION << " (" << GPKG_CODENAME << ")\n\n"
               << "Options:\n"
-              << "  -v, --verbose   Show detailed logging information\n\n"
+              << "  -v, --verbose   Show detailed logging information\n"
+              << "  -r, --repair    Repair broken dependencies and damaged installs\n"
+              << "  -V, --version   Show version\n\n"
               << "Commands:\n"
               << "  install <pkg>   Download and install packages (up to 5 archives in parallel)\n"
               << "  remove <pkg>    Remove an installed package (--purge to remove unneeded deps)\n"
+              << "  repair          Repair broken dependencies and reinstall damaged packages\n"
               << "  upgrade         Upgrade all installed packages\n"
               << "  update          Update local package indices\n"
               << "  search <query>  Search for packages\n"
@@ -26,19 +41,43 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    std::string action = argv[1];
+    std::string action;
     bool verbose = false;
     bool purge = false;
+    bool repair = false;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "-v" || arg == "--verbose") verbose = true;
-        if (arg == "--purge") purge = true;
+        else if (arg == "--purge") purge = true;
+        else if (arg == "-r" || arg == "--repair") repair = true;
+        else if (arg == "-V" || arg == "--version") {
+            if (action.empty()) action = "version";
+        } else if (action.empty()) {
+            action = arg;
+        }
+    }
+
+    if (repair) {
+        if (!action.empty() && action != "repair") {
+            std::cerr << Color::RED
+                      << "E: --repair cannot be combined with the '" << action
+                      << "' command. Use 'gpkg repair' or 'gpkg --repair'."
+                      << Color::RESET << std::endl;
+            return 1;
+        }
+        action = "repair";
+    }
+
+    if (action.empty()) {
+        print_help();
+        return 1;
     }
 
 #ifndef DEV_MODE
     if (geteuid() != 0 &&
         (action == "install" || action == "remove" || action == "update" ||
-         action == "add-repo" || action == "clean" || action == "upgrade")) {
+         action == "add-repo" || action == "clean" || action == "upgrade" ||
+         action == "repair")) {
         std::cerr << Color::RED << "E: This command requires root privileges." << Color::RESET << std::endl;
         return 1;
     }
@@ -47,6 +86,7 @@ int main(int argc, char* argv[]) {
     bool needs_trans = (
         action == "install" ||
         action == "remove" ||
+        action == "repair" ||
         action == "upgrade" ||
         action == "update" ||
         action == "add-repo" ||
@@ -59,8 +99,13 @@ int main(int argc, char* argv[]) {
         installed_cache.insert(pkg);
     }
 
+    if (action == "version") {
+        print_version();
+        return 0;
+    }
     if (action == "update") return handle_update(verbose);
     if (action == "upgrade") return handle_upgrade(installed_cache, verbose);
+    if (action == "repair") return handle_repair(verbose);
     if (action == "install" && argc > 2) return handle_install(argc, argv, installed_cache, verbose);
     if (action == "remove" && argc > 2) return handle_remove(argc, argv, verbose, purge);
     if (action == "search" && argc > 2) return handle_search(argv[2], verbose);

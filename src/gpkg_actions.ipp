@@ -63,20 +63,6 @@ InstallCommandResult install_package_v2(const std::string& pkg_name, bool verbos
     return install_package_from_file(get_cached_package_path(meta), verbose);
 }
 
-bool get_installed_package_metadata(const std::string& pkg_name, PackageMetadata& out_meta) {
-    std::ifstream f(INFO_DIR + pkg_name + ".json");
-    if (!f) return false;
-
-    std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-    out_meta.name = pkg_name;
-    get_json_value(content, "version", out_meta.version);
-    get_json_value(content, "description", out_meta.description);
-    get_json_array(content, "depends", out_meta.depends);
-    get_json_array(content, "conflicts", out_meta.conflicts);
-    get_json_array(content, "provides", out_meta.provides);
-    return true;
-}
-
 bool is_required_by_others(const std::string& pkg, const std::set<std::string>& excluding, bool verbose) {
     auto all_installed = get_installed_packages();
     for (const auto& other : all_installed) {
@@ -105,6 +91,141 @@ bool is_required_by_others(const std::string& pkg, const std::set<std::string>& 
     }
 
     return false;
+}
+
+void append_unique_message(std::vector<std::string>& messages, const std::string& message) {
+    if (std::find(messages.begin(), messages.end(), message) == messages.end()) {
+        messages.push_back(message);
+    }
+}
+
+std::vector<std::string> get_registered_package_names() {
+    std::set<std::string> package_names;
+    for (const auto& pkg : get_installed_packages(".json")) {
+        package_names.insert(pkg);
+    }
+    for (const auto& pkg : get_installed_packages(".list")) {
+        package_names.insert(pkg);
+    }
+
+    return std::vector<std::string>(package_names.begin(), package_names.end());
+}
+
+bool verify_installed_package(const std::string& pkg_name, bool verbose, std::string* log_path = nullptr) {
+    std::string cmd = "gpkg-worker --verify " + shell_quote(pkg_name);
+    if (verbose) cmd += " --verbose";
+    if (!ROOT_PREFIX.empty()) cmd += " --root " + shell_quote(ROOT_PREFIX);
+    CommandCaptureResult result = run_command_captured(cmd, verbose, "gpkg-verify");
+    if (log_path) *log_path = result.log_path;
+    return result.exit_code == 0;
+}
+
+struct RepairInspection {
+    std::vector<std::string> detected_issues;
+    std::vector<std::string> unresolved_issues;
+    std::vector<PackageMetadata> install_queue;
+    std::vector<PackageMetadata> reinstall_queue;
+};
+
+RepairInspection inspect_repair_state(bool verbose) {
+    RepairInspection inspection;
+    std::vector<std::string> registered_packages = get_registered_package_names();
+    std::set<std::string> installed_cache(registered_packages.begin(), registered_packages.end());
+    std::set<std::string> reinstall_targets;
+    std::set<std::string> visited;
+
+    for (const auto& pkg : registered_packages) {
+        const bool has_json = access((INFO_DIR + pkg + ".json").c_str(), F_OK) == 0;
+        const bool has_list = access((INFO_DIR + pkg + ".list").c_str(), F_OK) == 0;
+        bool needs_reinstall = false;
+
+        if (!has_json || !has_list) {
+            std::string missing_parts;
+            if (!has_json) missing_parts += ".json";
+            if (!has_json && !has_list) missing_parts += " and ";
+            if (!has_list) missing_parts += ".list";
+            append_unique_message(
+                inspection.detected_issues,
+                pkg + ": incomplete local package metadata (" + missing_parts + " missing)"
+            );
+            needs_reinstall = true;
+        }
+
+        PackageMetadata installed_meta;
+        if (!has_json || !get_installed_package_metadata(pkg, installed_meta) || installed_meta.version.empty()) {
+            if (has_json) {
+                append_unique_message(
+                    inspection.detected_issues,
+                    pkg + ": installed metadata is unreadable or missing a version"
+                );
+            }
+            needs_reinstall = true;
+        } else {
+            for (const auto& dep_str : installed_meta.depends) {
+                Dependency dep = parse_dependency(dep_str);
+                std::string provider_name;
+                if (is_dependency_satisfied_locally(dep, installed_cache, verbose, &provider_name)) continue;
+
+                append_unique_message(
+                    inspection.detected_issues,
+                    pkg + ": unsatisfied dependency " + dep_str
+                );
+
+                if (!resolve_dependencies(
+                        dep.name,
+                        dep.op,
+                        dep.version,
+                        inspection.install_queue,
+                        visited,
+                        installed_cache,
+                        verbose
+                    )) {
+                    append_unique_message(
+                        inspection.unresolved_issues,
+                        pkg + ": unable to resolve dependency " + dep_str
+                    );
+                }
+            }
+        }
+
+        if (!needs_reinstall) {
+            std::string verify_log_path;
+            if (!verify_installed_package(pkg, verbose, &verify_log_path)) {
+                std::string issue = pkg + ": installed files are missing or inconsistent";
+                if (!verbose && !verify_log_path.empty()) {
+                    issue += " (see " + verify_log_path + ")";
+                }
+                append_unique_message(inspection.detected_issues, issue);
+                needs_reinstall = true;
+            }
+        }
+
+        if (needs_reinstall) {
+            reinstall_targets.insert(pkg);
+        }
+    }
+
+    std::set<std::string> queued_names;
+    for (const auto& meta : inspection.install_queue) {
+        queued_names.insert(meta.name);
+    }
+
+    for (const auto& pkg : reinstall_targets) {
+        if (queued_names.count(pkg)) continue;
+
+        PackageMetadata repo_meta;
+        if (!get_repo_package_info(pkg, repo_meta)) {
+            append_unique_message(
+                inspection.unresolved_issues,
+                pkg + ": automatic reinstall is not possible because no repository package is available"
+            );
+            continue;
+        }
+
+        inspection.reinstall_queue.push_back(repo_meta);
+    }
+
+    return inspection;
 }
 
 int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
@@ -198,6 +319,145 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
     }
 
     return 0;
+}
+
+int handle_repair(bool verbose) {
+    if (!ensure_repo_index_available()) return 1;
+
+    std::cout << "Inspecting installed packages..." << std::endl;
+    RepairInspection inspection = inspect_repair_state(verbose);
+
+    if (inspection.detected_issues.empty()) {
+        std::cout << "No broken packages found." << std::endl;
+        return 0;
+    }
+
+    std::cout << "Detected issues:" << std::endl;
+    for (const auto& issue : inspection.detected_issues) {
+        std::cout << "  " << Color::YELLOW << issue << Color::RESET << std::endl;
+    }
+
+    std::vector<PackageMetadata> repair_queue = inspection.install_queue;
+    repair_queue.insert(
+        repair_queue.end(),
+        inspection.reinstall_queue.begin(),
+        inspection.reinstall_queue.end()
+    );
+
+    if (repair_queue.empty()) {
+        std::cerr << Color::RED
+                  << "E: Broken packages were detected, but gpkg could not build an automatic repair plan."
+                  << Color::RESET << std::endl;
+        for (const auto& issue : inspection.unresolved_issues) {
+            std::cerr << Color::RED << "  " << issue << Color::RESET << std::endl;
+        }
+        return 1;
+    }
+
+    if (!inspection.install_queue.empty()) {
+        std::cout << "The following packages will be installed to satisfy dependencies:" << std::endl;
+        for (const auto& pkg : inspection.install_queue) {
+            std::cout << "  " << Color::GREEN << pkg.name << Color::RESET
+                      << " (" << pkg.version << ")" << std::endl;
+        }
+    }
+
+    if (!inspection.reinstall_queue.empty()) {
+        std::cout << "The following installed packages will be reinstalled:" << std::endl;
+        for (const auto& pkg : inspection.reinstall_queue) {
+            std::cout << "  " << Color::BLUE << pkg.name << Color::RESET
+                      << " (" << pkg.version << ")" << std::endl;
+        }
+    }
+
+    if (!inspection.unresolved_issues.empty()) {
+        std::cout << Color::YELLOW
+                  << "W: Some issues may remain after this repair attempt:"
+                  << Color::RESET << std::endl;
+        for (const auto& issue : inspection.unresolved_issues) {
+            std::cout << "  " << Color::YELLOW << issue << Color::RESET << std::endl;
+        }
+    }
+
+    std::vector<std::string> registered_packages = get_registered_package_names();
+    std::set<std::string> installed_set(registered_packages.begin(), registered_packages.end());
+    if (!check_conflicts(repair_queue, installed_set, verbose)) {
+        return 1;
+    }
+    if (!ask_confirmation("Do you want to continue with the repair?")) return 0;
+
+    std::cout << Color::CYAN << "[*] Downloading "
+              << repair_queue.size() << " package(s)..." << Color::RESET << std::endl;
+    DownloadBatchReport download_report = download_package_archives(
+        repair_queue,
+        verbose,
+        MAX_PARALLEL_PACKAGE_DOWNLOADS
+    );
+    std::cout << Color::CYAN << "[*] Download summary: "
+              << download_report.downloaded_count << " downloaded, "
+              << download_report.reused_count << " reused from cache, "
+              << format_total_bytes(download_report.downloaded_bytes) << " transferred."
+              << Color::RESET << std::endl;
+
+    std::vector<std::string> failed_downloads;
+    for (size_t i = 0; i < repair_queue.size(); ++i) {
+        if (!download_report.results[i].success) {
+            failed_downloads.push_back(repair_queue[i].name);
+        }
+    }
+    if (!failed_downloads.empty()) {
+        std::cerr << Color::RED << "E: Aborting repair because these packages could not be fetched safely: "
+                  << join_strings(failed_downloads) << Color::RESET << std::endl;
+        return 1;
+    }
+
+    std::cout << Color::CYAN << "[*] Applying repair plan..." << Color::RESET << std::endl;
+    size_t repaired_count = 0;
+    size_t install_progress_width = 0;
+    std::vector<std::string> failures;
+    for (size_t i = 0; i < repair_queue.size(); ++i) {
+        if (!verbose) render_install_progress(i, repair_queue.size(), repair_queue[i].name, &install_progress_width);
+        InstallCommandResult result = install_package_v2(repair_queue[i].name, verbose);
+        if (!result.success) {
+            if (!verbose) finish_install_progress_line(&install_progress_width);
+            std::cerr << Color::RED << "E: Repair stopped at " << repair_queue[i].name
+                      << Color::RESET;
+            if (!verbose && !result.log_path.empty()) {
+                std::cerr << " (see " << result.log_path << ")";
+            }
+            std::cerr << std::endl;
+            failures.push_back(repair_queue[i].name);
+            break;
+        }
+        ++repaired_count;
+        if (!verbose) render_install_progress(i + 1, repair_queue.size(), repair_queue[i].name, &install_progress_width);
+    }
+    if (!verbose) finish_install_progress_line(&install_progress_width);
+
+    if (!failures.empty()) {
+        return 1;
+    }
+
+    std::cout << Color::GREEN << "✓ Applied repair plan to " << repaired_count
+              << " package(s)." << Color::RESET << std::endl;
+
+    std::cout << "Rechecking package state..." << std::endl;
+    RepairInspection after_repair = inspect_repair_state(false);
+    if (after_repair.detected_issues.empty()) {
+        std::cout << Color::GREEN << "✓ Repair completed successfully." << Color::RESET << std::endl;
+        return 0;
+    }
+
+    std::cerr << Color::YELLOW
+              << "W: Repair completed, but some issues remain:"
+              << Color::RESET << std::endl;
+    for (const auto& issue : after_repair.detected_issues) {
+        std::cerr << Color::YELLOW << "  " << issue << Color::RESET << std::endl;
+    }
+    for (const auto& issue : after_repair.unresolved_issues) {
+        std::cerr << Color::RED << "  " << issue << Color::RESET << std::endl;
+    }
+    return 1;
 }
 
 int handle_install(int argc, char* argv[], const std::set<std::string>& installed_cache, bool verbose) {
