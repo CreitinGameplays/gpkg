@@ -109,17 +109,31 @@ std::string get_cached_package_path(const PackageMetadata& meta) {
     return REPO_CACHE_PATH + meta.name + EXTENSION;
 }
 
+std::string get_partial_package_path(const PackageMetadata& meta) {
+    return get_cached_package_path(meta) + ".part";
+}
+
+size_t get_partial_package_bytes(const PackageMetadata& meta) {
+    struct stat st;
+    if (stat(get_partial_package_path(meta).c_str(), &st) == 0 && st.st_size > 0) {
+        return static_cast<size_t>(st.st_size);
+    }
+    return 0;
+}
+
 bool fetch_package_archive(
     const PackageMetadata& meta,
     size_t index,
     size_t total,
     bool verbose,
     bool* reused_out = nullptr,
+    size_t* transferred_out = nullptr,
     std::string* error_out = nullptr,
     bool quiet = false,
     const std::function<void(size_t, size_t, double)>& progress_callback = nullptr
 ) {
     if (reused_out) *reused_out = false;
+    if (transferred_out) *transferred_out = 0;
     if (error_out) error_out->clear();
 
     auto fail = [&](const std::string& message) {
@@ -172,9 +186,18 @@ bool fetch_package_archive(
         }
 
         std::string download_error;
+        size_t transferred = 0;
         bool network_verbose = quiet ? false : verbose;
         bool network_progress = quiet ? false : true;
-        if (!DownloadFile(url, local_path, network_verbose, &download_error, network_progress, progress_callback)) {
+        if (!DownloadFile(
+                url,
+                local_path,
+                network_verbose,
+                &download_error,
+                network_progress,
+                progress_callback,
+                &transferred
+            )) {
             remove(local_path.c_str());
             last_error = "failed to download from " + url;
             if (!download_error.empty()) last_error += " (" + download_error + ")";
@@ -189,6 +212,7 @@ bool fetch_package_archive(
 
         std::string verify_error;
         if (verify_hash(local_path, meta.sha512, verify_label, &verify_error, quiet)) {
+            if (transferred_out) *transferred_out = transferred;
             return true;
         }
 
@@ -345,10 +369,13 @@ DownloadBatchReport download_package_archives(
                 std::lock_guard<std::mutex> lock(output_mutex);
                 active_downloads[idx].active = true;
                 active_downloads[idx].name = packages[idx].name;
+                active_downloads[idx].transferred = get_partial_package_bytes(packages[idx]);
+                active_downloads[idx].estimated = estimate_package_archive_bytes(packages[idx]);
                 render_progress(packages[idx].name);
             }
 
             bool reused = false;
+            size_t transferred = 0;
             std::string error;
             bool ok = fetch_package_archive(
                 packages[idx],
@@ -356,6 +383,7 @@ DownloadBatchReport download_package_archives(
                 packages.size(),
                 verbose,
                 &reused,
+                &transferred,
                 &error,
                 true,
                 [&](size_t transferred, size_t estimated, double speed) {
@@ -374,10 +402,7 @@ DownloadBatchReport download_package_archives(
             report.results[idx].reused = reused;
             report.results[idx].error = error;
             if (ok && !reused) {
-                struct stat st;
-                if (stat(get_cached_package_path(packages[idx]).c_str(), &st) == 0 && st.st_size > 0) {
-                    report.results[idx].bytes_downloaded = static_cast<size_t>(st.st_size);
-                }
+                report.results[idx].bytes_downloaded = transferred;
             }
 
             std::lock_guard<std::mutex> lock(output_mutex);
