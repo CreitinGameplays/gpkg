@@ -34,6 +34,18 @@ std::string trim(const std::string& str) {
     return str.substr(first, (last - first + 1));
 }
 
+std::string shell_quote(const std::string& value) {
+    if (value.empty()) return "''";
+
+    std::string quoted = "'";
+    for (char c : value) {
+        if (c == '\'') quoted += "'\\''";
+        else quoted += c;
+    }
+    quoted += "'";
+    return quoted;
+}
+
 int run_command(const std::string& cmd) {
     VLOG("Exec: " << cmd);
     return system(cmd.c_str());
@@ -94,6 +106,129 @@ std::vector<std::string> get_installed_packages(const std::string& extension = "
     }
     closedir(d);
     return pkgs;
+}
+
+bool is_etc_config_path(const std::string& path) {
+    return path.size() > 5 && path.rfind("/etc/", 0) == 0;
+}
+
+std::string find_file_owner(const std::string& pkg_name, const std::string& file_path) {
+    for (const auto& other : get_installed_packages()) {
+        if (other == pkg_name) continue;
+        auto other_files = read_list_file(other);
+        for (const auto& owned_path : other_files) {
+            if (owned_path == file_path) return other;
+        }
+    }
+    return "";
+}
+
+struct PreservedConfigFile {
+    std::string path;
+    std::string backup_path;
+    std::string staged_path;
+};
+
+bool should_preserve_local_config_file(
+    const std::string& pkg_name,
+    const std::string& file_path
+) {
+    if (!is_etc_config_path(file_path)) return false;
+
+    std::string full_path = g_root_prefix + file_path;
+    struct stat st;
+    if (lstat(full_path.c_str(), &st) != 0) return false;
+    if (S_ISDIR(st.st_mode)) return false;
+
+    return find_file_owner(pkg_name, file_path).empty();
+}
+
+std::vector<PreservedConfigFile> collect_preserved_config_files(
+    const std::string& pkg_name,
+    const std::vector<std::string>& new_files
+) {
+    std::vector<PreservedConfigFile> preserved;
+    size_t preserve_index = 0;
+
+    for (const auto& file : new_files) {
+        if (!should_preserve_local_config_file(pkg_name, file)) continue;
+
+        PreservedConfigFile entry;
+        entry.path = file;
+        entry.backup_path = TMP_EXTRACT_PATH + "preserve/" + std::to_string(preserve_index++) + ".orig";
+        preserved.push_back(entry);
+    }
+
+    return preserved;
+}
+
+bool backup_preserved_config_files(const std::vector<PreservedConfigFile>& preserved) {
+    if (preserved.empty()) return true;
+    if (!mkdir_p(TMP_EXTRACT_PATH + "preserve")) return false;
+
+    for (const auto& entry : preserved) {
+        std::string source_path = g_root_prefix + entry.path;
+        std::string cmd = "cp -a " + shell_quote(source_path) + " " + shell_quote(entry.backup_path);
+        if (run_command(cmd) != 0) {
+            std::cerr << "E: Failed to back up local config " << entry.path << std::endl;
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool paths_are_identical(const std::string& left, const std::string& right) {
+    return run_command("cmp -s " + shell_quote(left) + " " + shell_quote(right)) == 0;
+}
+
+void apply_preserved_config_metadata(
+    std::vector<std::string>& installed_files,
+    const std::vector<PreservedConfigFile>& preserved
+) {
+    for (const auto& entry : preserved) {
+        auto it = std::find(installed_files.begin(), installed_files.end(), entry.path);
+        if (it == installed_files.end()) continue;
+
+        if (entry.staged_path.empty()) installed_files.erase(it);
+        else *it = entry.staged_path;
+    }
+}
+
+bool finalize_preserved_config_files(std::vector<PreservedConfigFile>& preserved) {
+    for (auto& entry : preserved) {
+        std::string live_path = g_root_prefix + entry.path;
+        std::string staged_live_path = live_path + ".gpkg-new";
+
+        if (access(live_path.c_str(), F_OK) != 0) {
+            std::cerr << "E: Expected package config file was not installed: " << entry.path << std::endl;
+            return false;
+        }
+
+        if (paths_are_identical(entry.backup_path, live_path)) {
+            if (run_command("rm -f " + shell_quote(live_path)) != 0) {
+                std::cerr << "E: Failed to discard duplicate package config " << entry.path << std::endl;
+                return false;
+            }
+            entry.staged_path.clear();
+            VLOG("Keeping existing config " << entry.path << " (package copy was identical).");
+        } else {
+            if (run_command("mv -f " + shell_quote(live_path) + " " + shell_quote(staged_live_path)) != 0) {
+                std::cerr << "E: Failed to stage package config as " << entry.path << ".gpkg-new" << std::endl;
+                return false;
+            }
+            entry.staged_path = entry.path + ".gpkg-new";
+            std::cout << "W: Preserving local config " << entry.path
+                      << "; package version saved as " << entry.staged_path << std::endl;
+        }
+
+        if (run_command("cp -a " + shell_quote(entry.backup_path) + " " + shell_quote(live_path)) != 0) {
+            std::cerr << "E: Failed to restore preserved config " << entry.path << std::endl;
+            return false;
+        }
+    }
+
+    return true;
 }
 
 // --- Removal Logic ---
@@ -333,6 +468,7 @@ bool check_collisions(const std::string& pkg_name, const std::vector<std::string
         if (access(full_path.c_str(), F_OK) == 0) {
              struct stat st;
              if (stat(full_path.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) continue;
+             if (should_preserve_local_config_file(pkg_name, file)) continue;
              if (owned_by_me.count(file)) continue;
              
              // Special case: Ignore /usr/share/info/dir as it's a shared directory index
@@ -464,6 +600,12 @@ bool action_install(const std::string& pkg_file) {
         }
     }
 
+    std::vector<PreservedConfigFile> preserved_configs =
+        collect_preserved_config_files(pkg_name, new_files);
+    if (!backup_preserved_config_files(preserved_configs)) {
+        return false;
+    }
+
     // 5. Extract to Root (Actual Install)
     std::string dest = g_root_prefix.empty() ? "/" : g_root_prefix;
     // CRITICAL FIX: --keep-directory-symlink prevents tar from replacing existing 
@@ -476,12 +618,19 @@ bool action_install(const std::string& pkg_file) {
         return false;
     }
 
+    if (!finalize_preserved_config_files(preserved_configs)) {
+        return false;
+    }
+
+    std::vector<std::string> installed_files = new_files;
+    apply_preserved_config_metadata(installed_files, preserved_configs);
+
     // 6. Register in Database
     run_command("mkdir -p " + get_info_dir());
 
     std::string list_path = get_info_dir() + pkg_name + ".list";
     std::ofstream list_out(list_path);
-    for (const auto& f : new_files) {
+    for (const auto& f : installed_files) {
         list_out << f << "\n";
     }
     list_out.close();
@@ -506,9 +655,14 @@ bool action_install(const std::string& pkg_file) {
 
     // 8. Cleanup Orphans (Upgrade only)
     if (is_upgrade) {
-        std::set<std::string> new_files_set(new_files.begin(), new_files.end());
+        std::set<std::string> new_files_set(installed_files.begin(), installed_files.end());
+        std::set<std::string> preserved_original_paths;
+        for (const auto& entry : preserved_configs) {
+            preserved_original_paths.insert(entry.path);
+        }
         std::vector<std::string> orphans;
         for (const auto& old : old_files_set) {
+            if (preserved_original_paths.count(old)) continue;
             if (new_files_set.find(old) == new_files_set.end()) {
                 orphans.push_back(old);
             }
