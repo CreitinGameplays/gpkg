@@ -4,6 +4,7 @@ struct ArchiveFetchResult {
     bool success = false;
     bool reused = false;
     size_t bytes_downloaded = 0;
+    size_t archive_bytes = 0;
     std::string error;
 };
 
@@ -12,6 +13,7 @@ struct DownloadBatchReport {
     size_t downloaded_count = 0;
     size_t reused_count = 0;
     size_t downloaded_bytes = 0;
+    size_t reused_bytes = 0;
     size_t estimated_bytes = 0;
 };
 
@@ -116,6 +118,14 @@ std::string get_partial_package_path(const PackageMetadata& meta) {
 size_t get_partial_package_bytes(const PackageMetadata& meta) {
     struct stat st;
     if (stat(get_partial_package_path(meta).c_str(), &st) == 0 && st.st_size > 0) {
+        return static_cast<size_t>(st.st_size);
+    }
+    return 0;
+}
+
+size_t get_cached_package_bytes(const PackageMetadata& meta) {
+    struct stat st;
+    if (stat(get_cached_package_path(meta).c_str(), &st) == 0 && st.st_size > 0) {
         return static_cast<size_t>(st.st_size);
     }
     return 0;
@@ -270,6 +280,7 @@ DownloadBatchReport download_package_archives(
     size_t completed_count = 0;
     size_t downloaded_count = 0;
     size_t downloaded_bytes = 0;
+    size_t completed_archive_bytes = 0;
     size_t reused_count = 0;
     size_t failed_count = 0;
     size_t last_render_width = 0;
@@ -301,7 +312,7 @@ DownloadBatchReport download_package_archives(
 
     auto render_progress = [&](const std::string& last_package) {
         const int bar_width = 32;
-        size_t live_bytes = downloaded_bytes;
+        size_t live_bytes = completed_archive_bytes;
         double live_speed = 0.0;
         size_t active_count = 0;
         std::string label = last_package;
@@ -401,8 +412,11 @@ DownloadBatchReport download_package_archives(
             report.results[idx].success = ok;
             report.results[idx].reused = reused;
             report.results[idx].error = error;
-            if (ok && !reused) {
-                report.results[idx].bytes_downloaded = transferred;
+            if (ok) {
+                report.results[idx].archive_bytes = get_cached_package_bytes(packages[idx]);
+                if (!reused) {
+                    report.results[idx].bytes_downloaded = transferred;
+                }
             }
 
             std::lock_guard<std::mutex> lock(output_mutex);
@@ -413,6 +427,7 @@ DownloadBatchReport download_package_archives(
             active_downloads[idx].speed = 0.0;
             ++completed_count;
             if (ok) {
+                completed_archive_bytes += report.results[idx].archive_bytes;
                 if (reused) {
                     ++reused_count;
                 } else {
@@ -444,6 +459,7 @@ DownloadBatchReport download_package_archives(
         if (!result.success) continue;
         if (result.reused) {
             ++report.reused_count;
+            report.reused_bytes += result.archive_bytes;
         } else {
             ++report.downloaded_count;
             report.downloaded_bytes += result.bytes_downloaded;
