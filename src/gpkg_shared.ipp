@@ -52,6 +52,7 @@ const std::string SOURCES_LIST_PATH = ROOT_PREFIX + "/etc/gpkg/sources.list";
 const std::string SOURCES_DIR = ROOT_PREFIX + "/etc/gpkg/sources.list.d/";
 const std::string SYSTEM_PROVIDES_PATH = ROOT_PREFIX + "/etc/gpkg/system-provides.list";
 const std::string UPGRADEABLE_SYSTEM_PATH = ROOT_PREFIX + "/etc/gpkg/upgradeable-system.list";
+const std::string UPGRADE_COMPANIONS_PATH = ROOT_PREFIX + "/etc/gpkg/upgrade-companions.conf";
 const std::string STATUS_FILE = ROOT_PREFIX + "/var/lib/gpkg/status";
 const std::string INFO_DIR = ROOT_PREFIX + "/var/lib/gpkg/info/";
 const std::string EXTENSION = ".gpkg";

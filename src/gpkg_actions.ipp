@@ -127,6 +127,178 @@ struct RepairInspection {
     std::vector<PackageMetadata> reinstall_queue;
 };
 
+struct UpgradePlanEntry {
+    PackageMetadata meta;
+    std::string current_version;
+    bool was_installed = false;
+};
+
+std::vector<std::string> parse_companion_tokens(const std::string& raw_value) {
+    std::string normalized = raw_value;
+    for (char& ch : normalized) {
+        if (ch == ',' || ch == '\t') ch = ' ';
+    }
+
+    std::vector<std::string> tokens;
+    std::set<std::string> seen;
+    std::istringstream iss(normalized);
+    std::string token;
+    while (iss >> token) {
+        if (seen.insert(token).second) tokens.push_back(token);
+    }
+    return tokens;
+}
+
+std::map<std::string, std::vector<std::string>> load_upgrade_companions() {
+    std::map<std::string, std::vector<std::string>> companions;
+    std::ifstream f(UPGRADE_COMPANIONS_PATH);
+    if (!f) return companions;
+
+    std::string line;
+    while (std::getline(f, line)) {
+        size_t comment = line.find('#');
+        if (comment != std::string::npos) line = line.substr(0, comment);
+        line = trim(line);
+        if (line.empty()) continue;
+
+        size_t sep = line.find(':');
+        if (sep == std::string::npos) sep = line.find('=');
+        if (sep == std::string::npos) continue;
+
+        std::string trigger = trim(line.substr(0, sep));
+        std::string raw_companions = trim(line.substr(sep + 1));
+        if (trigger.empty() || raw_companions.empty()) continue;
+
+        auto parsed = parse_companion_tokens(raw_companions);
+        auto& entry = companions[trigger];
+        std::set<std::string> seen(entry.begin(), entry.end());
+        for (const auto& pkg : parsed) {
+            if (seen.insert(pkg).second) entry.push_back(pkg);
+        }
+    }
+
+    return companions;
+}
+
+void append_companion_targets(
+    std::vector<std::string>& out,
+    const std::map<std::string, std::vector<std::string>>& companion_map,
+    const std::string& key
+) {
+    auto it = companion_map.find(key);
+    if (it == companion_map.end()) return;
+
+    std::set<std::string> seen(out.begin(), out.end());
+    for (const auto& pkg : it->second) {
+        if (seen.insert(pkg).second) out.push_back(pkg);
+    }
+}
+
+bool resolve_upgrade_target_metadata(
+    const Dependency& requested_dep,
+    PackageMetadata& out_meta,
+    bool verbose
+) {
+    PackageMetadata exact_meta;
+    if (get_repo_package_info(requested_dep.name, exact_meta) &&
+        version_satisfies(exact_meta.version, requested_dep.op, requested_dep.version)) {
+        out_meta = exact_meta;
+        return true;
+    }
+
+    std::string provider = find_provider(
+        requested_dep.name,
+        requested_dep.op,
+        requested_dep.version,
+        verbose
+    );
+    if (provider.empty()) return false;
+
+    return get_repo_package_info(provider, out_meta);
+}
+
+bool queue_upgrade_target(
+    const Dependency& requested_dep,
+    const std::map<std::string, std::vector<std::string>>& companion_map,
+    std::vector<PackageMetadata>& install_queue,
+    std::vector<UpgradePlanEntry>& explicit_targets,
+    std::set<std::string>& queued_packages,
+    std::set<std::string>& explicit_target_names,
+    std::set<std::string>& target_walk,
+    std::set<std::string>& dependency_visited,
+    const std::set<std::string>& installed_cache,
+    bool verbose
+) {
+    PackageMetadata meta;
+    if (!resolve_upgrade_target_metadata(requested_dep, meta, verbose)) {
+        VLOG(verbose, "No repository candidate available for upgrade target " << requested_dep.name);
+        return true;
+    }
+
+    std::string current_version;
+    bool was_installed = is_installed(meta.name, &current_version);
+    if (was_installed && compare_versions(meta.version, current_version) <= 0) {
+        VLOG(verbose, meta.name << " is already up to date (" << current_version << ").");
+        return true;
+    }
+
+    if (!target_walk.insert(meta.name).second) {
+        VLOG(verbose, "Skipping recursive upgrade companion cycle for " << meta.name);
+        return true;
+    }
+
+    std::vector<std::string> companions;
+    append_companion_targets(companions, companion_map, requested_dep.name);
+    if (meta.name != requested_dep.name) {
+        append_companion_targets(companions, companion_map, meta.name);
+    }
+    for (const auto& companion_name : companions) {
+        Dependency companion_dep = parse_dependency(companion_name);
+        if (!queue_upgrade_target(
+                companion_dep,
+                companion_map,
+                install_queue,
+                explicit_targets,
+                queued_packages,
+                explicit_target_names,
+                target_walk,
+                dependency_visited,
+                installed_cache,
+                verbose
+            )) {
+            target_walk.erase(meta.name);
+            return false;
+        }
+    }
+
+    for (const auto& dep_str : meta.depends) {
+        Dependency dep = parse_dependency(dep_str);
+        if (!resolve_dependencies(
+                dep.name,
+                dep.op,
+                dep.version,
+                install_queue,
+                dependency_visited,
+                installed_cache,
+                verbose
+            )) {
+            target_walk.erase(meta.name);
+            return false;
+        }
+    }
+
+    if (queued_packages.insert(meta.name).second) {
+        install_queue.push_back(meta);
+    }
+
+    if (explicit_target_names.insert(meta.name).second) {
+        explicit_targets.push_back({meta, current_version, was_installed});
+    }
+
+    target_walk.erase(meta.name);
+    return true;
+}
+
 RepairInspection inspect_repair_state(bool verbose) {
     RepairInspection inspection;
     std::vector<std::string> registered_packages = get_registered_package_names();
@@ -232,36 +404,108 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
     if (!ensure_repo_index_available()) return 1;
 
     std::cout << "Reading package lists..." << std::endl;
-    VLOG(verbose, "Checking " << installed_cache.size() << " installed packages for updates.");
+    VLOG(verbose, "Checking " << installed_cache.size() << " installed packages and upgradeable base runtimes.");
 
-    std::vector<PackageMetadata> updates;
+    std::vector<PackageMetadata> upgrade_queue;
+    std::vector<UpgradePlanEntry> explicit_targets;
+    std::set<std::string> queued_packages;
+    std::set<std::string> explicit_target_names;
+    std::set<std::string> target_walk;
+    std::set<std::string> dependency_visited;
+    auto upgradeable_system = load_upgradeable_system_packages();
+    auto companion_map = load_upgrade_companions();
+
+    for (const auto& entry : upgradeable_system) {
+        Dependency dep = parse_dependency(entry);
+        if (!queue_upgrade_target(
+                dep,
+                companion_map,
+                upgrade_queue,
+                explicit_targets,
+                queued_packages,
+                explicit_target_names,
+                target_walk,
+                dependency_visited,
+                installed_cache,
+                verbose
+            )) {
+            return 1;
+        }
+    }
+
     for (const auto& pkg : installed_cache) {
         std::string current_ver;
         if (!is_installed(pkg, &current_ver)) continue;
 
         PackageMetadata repo_meta;
-        if (get_repo_package_info(pkg, repo_meta) && compare_versions(repo_meta.version, current_ver) > 0) {
-            VLOG(verbose, "Update found for " << pkg << ": " << current_ver << " -> " << repo_meta.version);
-            updates.push_back(repo_meta);
+        if (!get_repo_package_info(pkg, repo_meta)) continue;
+        if (compare_versions(repo_meta.version, current_ver) <= 0) continue;
+
+        VLOG(verbose, "Update found for " << pkg << ": " << current_ver << " -> " << repo_meta.version);
+        Dependency dep{pkg, "", ""};
+        if (!queue_upgrade_target(
+                dep,
+                companion_map,
+                upgrade_queue,
+                explicit_targets,
+                queued_packages,
+                explicit_target_names,
+                target_walk,
+                dependency_visited,
+                installed_cache,
+                verbose
+            )) {
+            return 1;
         }
     }
 
-    if (updates.empty()) {
+    if (upgrade_queue.empty()) {
         std::cout << "All packages are up to date." << std::endl;
         return 0;
     }
 
-    std::cout << "The following packages will be upgraded:" << std::endl;
-    for (const auto& update : updates) {
-        std::cout << "  " << Color::GREEN << update.name << Color::RESET
-                  << " (" << update.version << ")" << std::endl;
+    std::vector<UpgradePlanEntry> installed_upgrades;
+    std::vector<UpgradePlanEntry> base_bootstraps;
+    for (const auto& entry : explicit_targets) {
+        if (entry.was_installed) installed_upgrades.push_back(entry);
+        else base_bootstraps.push_back(entry);
     }
+
+    if (!installed_upgrades.empty()) {
+        std::cout << "The following packages will be upgraded:" << std::endl;
+        for (const auto& entry : installed_upgrades) {
+            std::cout << "  " << Color::GREEN << entry.meta.name << Color::RESET
+                      << " (" << entry.current_version << " -> " << entry.meta.version << ")" << std::endl;
+        }
+    }
+
+    if (!base_bootstraps.empty()) {
+        std::cout << "The following base packages will be imported into gpkg and upgraded:" << std::endl;
+        for (const auto& entry : base_bootstraps) {
+            std::cout << "  " << Color::GREEN << entry.meta.name << Color::RESET
+                      << " (" << entry.meta.version << ")" << std::endl;
+        }
+    }
+
+    std::vector<PackageMetadata> dependency_installs;
+    for (const auto& pkg : upgrade_queue) {
+        if (!explicit_target_names.count(pkg.name)) dependency_installs.push_back(pkg);
+    }
+    if (!dependency_installs.empty()) {
+        std::cout << "Additional dependency packages will be installed:" << std::endl;
+        for (const auto& pkg : dependency_installs) {
+            std::cout << "  " << Color::GREEN << pkg.name << Color::RESET
+                      << " (" << pkg.version << ")" << std::endl;
+        }
+    }
+
+    if (!check_conflicts(upgrade_queue, installed_cache, verbose)) return 1;
     if (!ask_confirmation("Do you want to continue?")) return 0;
 
     std::cout << Color::CYAN << "[*] Downloading "
-              << updates.size() << " package(s)..." << Color::RESET << std::endl;
+              << upgrade_queue.size() << " package(s)..." << Color::RESET << std::endl;
     DownloadBatchReport download_report = download_package_archives(
-        updates,
+        upgrade_queue,
         verbose,
         MAX_PARALLEL_PACKAGE_DOWNLOADS
     );
@@ -271,42 +515,44 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
               << format_total_bytes(download_report.downloaded_bytes) << " transferred."
               << Color::RESET << std::endl;
 
-    size_t upgraded_count = 0;
+    size_t installed_count = 0;
     std::vector<std::string> failures;
     size_t install_progress_width = 0;
-    std::cout << Color::CYAN << "[*] Installing " << updates.size()
+    std::cout << Color::CYAN << "[*] Installing " << upgrade_queue.size()
               << " package(s)..." << Color::RESET << std::endl;
-    for (size_t i = 0; i < updates.size(); ++i) {
+    for (size_t i = 0; i < upgrade_queue.size(); ++i) {
         if (!download_report.results[i].success) {
-            failures.push_back(updates[i].name);
+            failures.push_back(upgrade_queue[i].name);
             continue;
         }
 
-        if (!verbose) render_install_progress(i, updates.size(), updates[i].name, &install_progress_width);
-        InstallCommandResult result = install_package_v2(updates[i].name, verbose);
+        if (!verbose) render_install_progress(i, upgrade_queue.size(), upgrade_queue[i].name, &install_progress_width);
+        InstallCommandResult result = install_package_v2(upgrade_queue[i].name, verbose);
         if (!result.success) {
             if (!verbose) finish_install_progress_line(&install_progress_width);
-            std::cerr << Color::RED << "E: Failed to upgrade " << updates[i].name
+            std::cerr << Color::RED << "E: Failed to install " << upgrade_queue[i].name
                       << Color::RESET;
             if (!verbose && !result.log_path.empty()) {
                 std::cerr << " (see " << result.log_path << ")";
             }
             std::cerr << std::endl;
-            failures.push_back(updates[i].name);
+            failures.push_back(upgrade_queue[i].name);
             continue;
         }
 
-        ++upgraded_count;
-        if (!verbose) render_install_progress(i + 1, updates.size(), updates[i].name, &install_progress_width);
+        ++installed_count;
+        if (!verbose) render_install_progress(i + 1, upgrade_queue.size(), upgrade_queue[i].name, &install_progress_width);
     }
     if (!verbose) {
         finish_install_progress_line(&install_progress_width);
-        std::cout << Color::GREEN << "✓ Installed " << upgraded_count << "/" << updates.size()
+        std::cout << Color::GREEN << "✓ Installed " << installed_count << "/" << upgrade_queue.size()
                   << " package(s)." << Color::RESET << std::endl;
     }
 
     std::cout << Color::CYAN << "Upgrade summary: "
-              << upgraded_count << " upgraded, "
+              << installed_upgrades.size() << " upgraded, "
+              << base_bootstraps.size() << " imported from base image, "
+              << dependency_installs.size() << " dependency installs, "
               << download_report.downloaded_count << " downloaded, "
               << download_report.reused_count << " reused from cache, "
               << format_total_bytes(download_report.downloaded_bytes) << " transferred."
