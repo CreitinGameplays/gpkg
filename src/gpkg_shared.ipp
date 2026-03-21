@@ -58,6 +58,14 @@ const std::string LOCK_FILE = ROOT_PREFIX + "/var/lib/gpkg/lock";
 constexpr size_t MAX_PARALLEL_PACKAGE_DOWNLOADS = 5;
 
 int run_command(const std::string& cmd, bool verbose);
+std::string shell_quote(const std::string& value);
+
+struct CommandCaptureResult {
+    int exit_code = 0;
+    std::string log_path;
+};
+
+CommandCaptureResult run_command_captured(const std::string& cmd, bool verbose, const std::string& log_prefix);
 
 bool mkdir_p(const std::string& path) {
     if (path.empty()) return false;

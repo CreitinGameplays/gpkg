@@ -456,3 +456,36 @@ int run_command(const std::string& cmd, bool verbose) {
     if (verbose) std::cout << "[DEBUG] Executing: " << cmd << std::endl;
     return system(cmd.c_str());
 }
+
+std::string shell_quote(const std::string& value) {
+    std::string quoted = "'";
+    for (char c : value) {
+        if (c == '\'') {
+            quoted += "'\\''";
+        } else {
+            quoted += c;
+        }
+    }
+    quoted += "'";
+    return quoted;
+}
+
+CommandCaptureResult run_command_captured(const std::string& cmd, bool verbose, const std::string& log_prefix) {
+    if (verbose) {
+        return {run_command(cmd, true), ""};
+    }
+
+    std::string prefix = "/tmp/" + log_prefix + "-XXXXXX.log";
+    std::vector<char> tmpl(prefix.begin(), prefix.end());
+    tmpl.push_back('\0');
+
+    int fd = mkstemps(tmpl.data(), 4);
+    if (fd < 0) {
+        return {run_command(cmd, false), ""};
+    }
+    close(fd);
+
+    std::string log_path(tmpl.data());
+    std::string wrapped = cmd + " >" + shell_quote(log_path) + " 2>&1";
+    return {run_command(wrapped, false), log_path};
+}
