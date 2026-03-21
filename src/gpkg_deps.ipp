@@ -62,9 +62,9 @@ bool version_satisfies(const std::string& current_ver, const std::string& op, co
     return false;
 }
 
-std::vector<std::string> load_system_provides() {
+std::vector<std::string> load_dependency_entries(const std::string& path) {
     std::vector<std::string> entries;
-    std::ifstream f(SYSTEM_PROVIDES_PATH);
+    std::ifstream f(path);
     std::string line;
     while (std::getline(f, line)) {
         line = trim(line);
@@ -72,22 +72,23 @@ std::vector<std::string> load_system_provides() {
         entries.push_back(line);
     }
     return entries;
+}
+
+std::vector<std::string> load_system_provides() {
+    return load_dependency_entries(SYSTEM_PROVIDES_PATH);
 }
 
 std::vector<std::string> load_upgradeable_system_packages() {
-    std::vector<std::string> entries;
-    std::ifstream f(UPGRADEABLE_SYSTEM_PATH);
-    std::string line;
-    while (std::getline(f, line)) {
-        line = trim(line);
-        if (line.empty() || line[0] == '#') continue;
-        entries.push_back(line);
-    }
-    return entries;
+    return load_dependency_entries(UPGRADEABLE_SYSTEM_PATH);
 }
 
-bool is_system_provided(const std::string& pkg, const std::string& op = "", const std::string& req_version = "") {
-    for (const auto& entry : load_system_provides()) {
+bool dependency_list_matches(
+    const std::vector<std::string>& entries,
+    const std::string& pkg,
+    const std::string& op = "",
+    const std::string& req_version = ""
+) {
+    for (const auto& entry : entries) {
         Dependency dep = parse_dependency(entry);
         if (dep.name != pkg) continue;
         if (op.empty() || dep.version.empty() || version_satisfies(dep.version, op, req_version)) {
@@ -97,12 +98,13 @@ bool is_system_provided(const std::string& pkg, const std::string& op = "", cons
     return false;
 }
 
+bool is_system_provided(const std::string& pkg, const std::string& op = "", const std::string& req_version = "") {
+    if (dependency_list_matches(load_system_provides(), pkg, op, req_version)) return true;
+    return dependency_list_matches(load_upgradeable_system_packages(), pkg, op, req_version);
+}
+
 bool is_upgradeable_system_package(const std::string& pkg) {
-    for (const auto& entry : load_upgradeable_system_packages()) {
-        Dependency dep = parse_dependency(entry);
-        if (dep.name == pkg) return true;
-    }
-    return false;
+    return dependency_list_matches(load_upgradeable_system_packages(), pkg);
 }
 
 bool repo_has_satisfying_dependency(const Dependency& dep, bool verbose) {
