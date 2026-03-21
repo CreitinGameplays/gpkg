@@ -6,6 +6,8 @@ struct Dependency {
     std::string version;
 };
 
+std::string find_provider(const std::string& capability, const std::string& op, const std::string& req_version, bool verbose);
+
 bool get_installed_package_metadata(const std::string& pkg_name, PackageMetadata& out_meta) {
     std::ifstream f(INFO_DIR + pkg_name + ".json");
     if (!f) return false;
@@ -72,6 +74,18 @@ std::vector<std::string> load_system_provides() {
     return entries;
 }
 
+std::vector<std::string> load_upgradeable_system_packages() {
+    std::vector<std::string> entries;
+    std::ifstream f(UPGRADEABLE_SYSTEM_PATH);
+    std::string line;
+    while (std::getline(f, line)) {
+        line = trim(line);
+        if (line.empty() || line[0] == '#') continue;
+        entries.push_back(line);
+    }
+    return entries;
+}
+
 bool is_system_provided(const std::string& pkg, const std::string& op = "", const std::string& req_version = "") {
     for (const auto& entry : load_system_provides()) {
         Dependency dep = parse_dependency(entry);
@@ -80,6 +94,33 @@ bool is_system_provided(const std::string& pkg, const std::string& op = "", cons
             return true;
         }
     }
+    return false;
+}
+
+bool is_upgradeable_system_package(const std::string& pkg) {
+    for (const auto& entry : load_upgradeable_system_packages()) {
+        Dependency dep = parse_dependency(entry);
+        if (dep.name == pkg) return true;
+    }
+    return false;
+}
+
+bool repo_has_satisfying_dependency(const Dependency& dep, bool verbose) {
+    PackageMetadata repo_meta;
+    if (get_repo_package_info(dep.name, repo_meta) &&
+        version_satisfies(repo_meta.version, dep.op, dep.version)) {
+        VLOG(verbose, dep.name << " is available from the repository as "
+             << repo_meta.version << " and can replace the base runtime.");
+        return true;
+    }
+
+    std::string provider = find_provider(dep.name, dep.op, dep.version, verbose);
+    if (!provider.empty()) {
+        VLOG(verbose, dep.name << " can be satisfied by repository provider " << provider
+             << " instead of the base runtime.");
+        return true;
+    }
+
     return false;
 }
 
@@ -131,11 +172,6 @@ bool is_dependency_satisfied_locally(
 ) {
     if (provider_out) provider_out->clear();
 
-    if (is_system_provided(dep.name, dep.op, dep.version)) {
-        if (provider_out) *provider_out = SYSTEM_PROVIDES_PATH;
-        return true;
-    }
-
     std::string installed_ver;
     if (is_installed(dep.name, &installed_ver) && version_satisfies(installed_ver, dep.op, dep.version)) {
         if (provider_out) *provider_out = dep.name;
@@ -145,6 +181,15 @@ bool is_dependency_satisfied_locally(
     std::string provider_name;
     if (find_installed_dependency_provider(dep, installed_cache, &provider_name)) {
         if (provider_out) *provider_out = provider_name;
+        return true;
+    }
+
+    if (is_system_provided(dep.name, dep.op, dep.version)) {
+        if (is_upgradeable_system_package(dep.name) && repo_has_satisfying_dependency(dep, verbose)) {
+            VLOG(verbose, dep.name << " is base-provided but marked upgradeable; preferring repository candidate.");
+            return false;
+        }
+        if (provider_out) *provider_out = SYSTEM_PROVIDES_PATH;
         return true;
     }
 

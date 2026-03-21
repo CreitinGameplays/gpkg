@@ -129,6 +129,19 @@ struct PreservedConfigFile {
     std::string staged_path;
 };
 
+struct ReplacedSystemFile {
+    std::string path;
+    std::string backup_path;
+};
+
+std::string get_replaced_system_dir(const std::string& pkg_name) {
+    return get_info_dir() + pkg_name + ".system-backup";
+}
+
+std::string get_replaced_system_manifest(const std::string& pkg_name) {
+    return get_info_dir() + pkg_name + ".system-backup.list";
+}
+
 bool should_preserve_local_config_file(
     const std::string& pkg_name,
     const std::string& file_path
@@ -228,6 +241,134 @@ bool finalize_preserved_config_files(std::vector<PreservedConfigFile>& preserved
         }
     }
 
+    return true;
+}
+
+std::vector<ReplacedSystemFile> load_replaced_system_files(const std::string& pkg_name) {
+    std::vector<ReplacedSystemFile> entries;
+    std::ifstream in(get_replaced_system_manifest(pkg_name));
+    if (!in) return entries;
+
+    std::string line;
+    while (std::getline(in, line)) {
+        line = trim(line);
+        if (line.empty()) continue;
+        size_t tab = line.find('\t');
+        if (tab == std::string::npos) continue;
+        ReplacedSystemFile entry;
+        entry.path = line.substr(0, tab);
+        entry.backup_path = line.substr(tab + 1);
+        if (!entry.path.empty() && !entry.backup_path.empty()) {
+            entries.push_back(entry);
+        }
+    }
+    return entries;
+}
+
+bool write_replaced_system_files(
+    const std::string& pkg_name,
+    const std::vector<ReplacedSystemFile>& entries
+) {
+    if (entries.empty()) return true;
+
+    std::ofstream out(get_replaced_system_manifest(pkg_name));
+    if (!out) {
+        std::cerr << "E: Failed to write system backup manifest for " << pkg_name << std::endl;
+        return false;
+    }
+
+    for (const auto& entry : entries) {
+        out << entry.path << "\t" << entry.backup_path << "\n";
+    }
+    return true;
+}
+
+bool should_backup_replaced_system_file(
+    const std::string& pkg_name,
+    const std::string& file_path,
+    const std::set<std::string>& owned_by_me
+) {
+    std::string full_path = g_root_prefix + file_path;
+    struct stat st;
+    if (lstat(full_path.c_str(), &st) != 0) return false;
+    if (S_ISDIR(st.st_mode)) return false;
+    if (should_preserve_local_config_file(pkg_name, file_path)) return false;
+    if (owned_by_me.count(file_path)) return false;
+    return find_file_owner(pkg_name, file_path).empty();
+}
+
+std::vector<ReplacedSystemFile> collect_replaced_system_files(
+    const std::string& pkg_name,
+    const std::vector<std::string>& new_files,
+    const std::set<std::string>& owned_by_me
+) {
+    std::vector<ReplacedSystemFile> entries = load_replaced_system_files(pkg_name);
+    std::set<std::string> tracked_paths;
+    for (const auto& entry : entries) tracked_paths.insert(entry.path);
+
+    size_t next_index = entries.size();
+    for (const auto& file : new_files) {
+        if (tracked_paths.count(file)) continue;
+        if (!should_backup_replaced_system_file(pkg_name, file, owned_by_me)) continue;
+
+        ReplacedSystemFile entry;
+        entry.path = file;
+        entry.backup_path = get_replaced_system_dir(pkg_name) + "/" + std::to_string(next_index++);
+        entries.push_back(entry);
+        tracked_paths.insert(file);
+    }
+
+    return entries;
+}
+
+bool backup_replaced_system_files(const std::vector<ReplacedSystemFile>& entries) {
+    if (entries.empty()) return true;
+    if (!mkdir_p(entries.front().backup_path.substr(0, entries.front().backup_path.find_last_of('/')))) {
+        return false;
+    }
+
+    for (const auto& entry : entries) {
+        if (access(entry.backup_path.c_str(), F_OK) == 0) continue;
+
+        std::string source_path = g_root_prefix + entry.path;
+        std::string parent_dir = entry.backup_path.substr(0, entry.backup_path.find_last_of('/'));
+        if (!mkdir_p(parent_dir)) {
+            std::cerr << "E: Failed to create system backup directory " << parent_dir << std::endl;
+            return false;
+        }
+
+        std::string cmd = "cp -a " + shell_quote(source_path) + " " + shell_quote(entry.backup_path);
+        if (run_command(cmd) != 0) {
+            std::cerr << "E: Failed to back up replaced base file " << entry.path << std::endl;
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool restore_replaced_system_files(const std::string& pkg_name) {
+    std::vector<ReplacedSystemFile> entries = load_replaced_system_files(pkg_name);
+    for (const auto& entry : entries) {
+        std::string destination_path = g_root_prefix + entry.path;
+        size_t slash = destination_path.find_last_of('/');
+        if (slash != std::string::npos) {
+            if (!mkdir_p(destination_path.substr(0, slash))) {
+                std::cerr << "E: Failed to recreate directory for restored base file "
+                          << entry.path << std::endl;
+                return false;
+            }
+        }
+
+        std::string cmd = "cp -a " + shell_quote(entry.backup_path) + " " + shell_quote(destination_path);
+        if (run_command(cmd) != 0) {
+            std::cerr << "E: Failed to restore original base file " << entry.path << std::endl;
+            return false;
+        }
+    }
+
+    run_command("rm -f " + shell_quote(get_replaced_system_manifest(pkg_name)));
+    run_command("rm -rf " + shell_quote(get_replaced_system_dir(pkg_name)));
     return true;
 }
 
@@ -390,6 +531,10 @@ bool action_remove_safe(const std::string& pkg_name) {
     // Remove files
     for (auto it = owned_files.rbegin(); it != owned_files.rend(); ++it) {
         remove_path(*it);
+    }
+
+    if (!restore_replaced_system_files(pkg_name)) {
+        return false;
     }
 
     // postrm
@@ -589,6 +734,8 @@ bool action_install(const std::string& pkg_file) {
         auto old_files_vec = read_list_file(pkg_name);
         for(const auto& f : old_files_vec) old_files_set.insert(f);
     }
+    std::vector<ReplacedSystemFile> replaced_system_files =
+        collect_replaced_system_files(pkg_name, new_files, old_files_set);
 
     // 4. Preinst
     std::string preinst = TMP_EXTRACT_PATH + "scripts/preinst";
@@ -603,6 +750,9 @@ bool action_install(const std::string& pkg_file) {
     std::vector<PreservedConfigFile> preserved_configs =
         collect_preserved_config_files(pkg_name, new_files);
     if (!backup_preserved_config_files(preserved_configs)) {
+        return false;
+    }
+    if (!backup_replaced_system_files(replaced_system_files)) {
         return false;
     }
 
@@ -636,6 +786,9 @@ bool action_install(const std::string& pkg_file) {
     list_out.close();
     
     run_command("cp " + TMP_EXTRACT_PATH + "control.json " + get_info_dir() + pkg_name + ".json");
+    if (!write_replaced_system_files(pkg_name, replaced_system_files)) {
+        return false;
+    }
     
     // Copy scripts
     std::vector<std::string> scripts = {"preinst", "postinst", "prerm", "postrm"};
