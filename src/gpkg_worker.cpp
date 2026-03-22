@@ -12,6 +12,7 @@
 #include <set>
 #include <map>
 #include <iomanip>
+#include <elf.h>
 
 // Configuration
 std::string g_root_prefix = "";
@@ -106,11 +107,125 @@ std::vector<std::string> get_installed_packages(const std::string& extension = "
         std::string fname = dir->d_name;
         if (fname.size() > extension.size() && 
             fname.substr(fname.size() - extension.size()) == extension) {
-            pkgs.push_back(fname.substr(0, fname.size() - extension.size()));
+            std::string pkg_name = fname.substr(0, fname.size() - extension.size());
+            if (pkg_name.size() >= 14 &&
+                pkg_name.substr(pkg_name.size() - 14) == ".system-backup") {
+                continue;
+            }
+            pkgs.push_back(pkg_name);
         }
     }
     closedir(d);
     return pkgs;
+}
+
+bool read_file_prefix(const std::string& path, unsigned char* buffer, size_t count) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;
+    in.read(reinterpret_cast<char*>(buffer), static_cast<std::streamsize>(count));
+    return static_cast<size_t>(in.gcount()) == count;
+}
+
+bool looks_like_linker_script_prefix(const std::string& prefix) {
+    return prefix.rfind("/*", 0) == 0 ||
+           prefix.rfind("INPUT(", 0) == 0 ||
+           prefix.rfind("GROUP(", 0) == 0 ||
+           prefix.rfind("OUTPUT_FORMAT(", 0) == 0;
+}
+
+bool looks_like_shared_object_path(const std::string& path) {
+    return path.find(".so") != std::string::npos;
+}
+
+bool validate_elf_file(const std::string& path, off_t size, std::string* error) {
+    if (size < static_cast<off_t>(EI_NIDENT)) {
+        if (error) *error = "file is too small to contain an ELF header";
+        return false;
+    }
+
+    unsigned char ident[EI_NIDENT];
+    if (!read_file_prefix(path, ident, sizeof(ident))) {
+        if (error) *error = "unable to read ELF identification bytes";
+        return false;
+    }
+
+    if (!(ident[EI_MAG0] == ELFMAG0 &&
+          ident[EI_MAG1] == ELFMAG1 &&
+          ident[EI_MAG2] == ELFMAG2 &&
+          ident[EI_MAG3] == ELFMAG3)) {
+        if (looks_like_shared_object_path(path)) {
+            char text_prefix[16] = {0};
+            std::ifstream in(path, std::ios::binary);
+            if (in) {
+                in.read(text_prefix, sizeof(text_prefix) - 1);
+            }
+            if (looks_like_linker_script_prefix(text_prefix)) return true;
+        }
+        return true;
+    }
+
+    if (ident[EI_CLASS] == ELFCLASS64) {
+        if (size < static_cast<off_t>(sizeof(Elf64_Ehdr))) {
+            if (error) *error = "ELF64 header is truncated";
+            return false;
+        }
+
+        Elf64_Ehdr ehdr {};
+        std::ifstream in(path, std::ios::binary);
+        if (!in || !in.read(reinterpret_cast<char*>(&ehdr), sizeof(ehdr))) {
+            if (error) *error = "unable to read ELF64 header";
+            return false;
+        }
+
+        if (ehdr.e_phoff > 0 &&
+            (static_cast<unsigned long long>(ehdr.e_phoff) +
+             static_cast<unsigned long long>(ehdr.e_phentsize) * ehdr.e_phnum) >
+                static_cast<unsigned long long>(size)) {
+            if (error) *error = "ELF64 program header table extends past end of file";
+            return false;
+        }
+        if (ehdr.e_shoff > 0 &&
+            (static_cast<unsigned long long>(ehdr.e_shoff) +
+             static_cast<unsigned long long>(ehdr.e_shentsize) * ehdr.e_shnum) >
+                static_cast<unsigned long long>(size)) {
+            if (error) *error = "ELF64 section header table extends past end of file";
+            return false;
+        }
+        return true;
+    }
+
+    if (ident[EI_CLASS] == ELFCLASS32) {
+        if (size < static_cast<off_t>(sizeof(Elf32_Ehdr))) {
+            if (error) *error = "ELF32 header is truncated";
+            return false;
+        }
+
+        Elf32_Ehdr ehdr {};
+        std::ifstream in(path, std::ios::binary);
+        if (!in || !in.read(reinterpret_cast<char*>(&ehdr), sizeof(ehdr))) {
+            if (error) *error = "unable to read ELF32 header";
+            return false;
+        }
+
+        if (ehdr.e_phoff > 0 &&
+            (static_cast<unsigned long long>(ehdr.e_phoff) +
+             static_cast<unsigned long long>(ehdr.e_phentsize) * ehdr.e_phnum) >
+                static_cast<unsigned long long>(size)) {
+            if (error) *error = "ELF32 program header table extends past end of file";
+            return false;
+        }
+        if (ehdr.e_shoff > 0 &&
+            (static_cast<unsigned long long>(ehdr.e_shoff) +
+             static_cast<unsigned long long>(ehdr.e_shentsize) * ehdr.e_shnum) >
+                static_cast<unsigned long long>(size)) {
+            if (error) *error = "ELF32 section header table extends past end of file";
+            return false;
+        }
+        return true;
+    }
+
+    if (error) *error = "ELF file has an unknown class";
+    return false;
 }
 
 bool is_etc_config_path(const std::string& path) {
@@ -874,11 +989,23 @@ bool action_verify(const std::string& pkg_name) {
                      std::cerr << "TYPE MISMATCH (Expected Dir): " << f << std::endl;
                      passed = false;
                  }
+             } else if (S_ISLNK(st.st_mode)) {
+                 struct stat target_st;
+                 if (stat(full_path.c_str(), &target_st) != 0) {
+                     std::cerr << "DANGLING SYMLINK: " << f << std::endl;
+                     passed = false;
+                 }
              } else {
                  // We expect a file or symlink
                  if (S_ISDIR(st.st_mode)) {
                      std::cerr << "TYPE MISMATCH (Expected File): " << f << std::endl;
                      passed = false;
+                 } else if (S_ISREG(st.st_mode)) {
+                     std::string elf_error;
+                     if (!validate_elf_file(full_path, st.st_size, &elf_error)) {
+                         std::cerr << "CORRUPT ELF: " << f << " (" << elf_error << ")" << std::endl;
+                         passed = false;
+                     }
                  }
              }
         }

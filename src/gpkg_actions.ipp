@@ -55,10 +55,49 @@ InstallCommandResult install_package_from_file(const std::string& pkg_file, bool
     return {result.exit_code == 0, result.log_path};
 }
 
-InstallCommandResult install_package_v2(const std::string& pkg_name, bool verbose) {
-    PackageMetadata meta;
-    meta.name = pkg_name;
-    return install_package_from_file(get_cached_package_path(meta), verbose);
+std::string get_install_archive_path(const PackageMetadata& meta) {
+    if (package_is_debian_source(meta)) return get_imported_gpkg_path(meta);
+    return get_cached_package_path(meta);
+}
+
+bool ensure_install_archive_ready(const PackageMetadata& meta, bool verbose, std::string* error_out = nullptr) {
+    if (error_out) error_out->clear();
+
+    if (package_is_debian_source(meta)) {
+        std::string output_path;
+        if (!convert_debian_archive_to_gpkg(meta, verbose, &output_path)) {
+            if (error_out) *error_out = "failed to convert Debian archive to gpkg";
+            return false;
+        }
+        return true;
+    }
+
+    if (access(get_cached_package_path(meta).c_str(), F_OK) == 0) return true;
+    if (error_out) *error_out = "cached gpkg archive is missing";
+    return false;
+}
+
+bool prepare_install_archives(
+    const std::vector<PackageMetadata>& packages,
+    const DownloadBatchReport& download_report,
+    bool verbose,
+    std::vector<std::string>& failures
+) {
+    failures.clear();
+    for (size_t i = 0; i < packages.size(); ++i) {
+        if (!download_report.results[i].success) continue;
+        std::string error;
+        if (ensure_install_archive_ready(packages[i], verbose, &error)) continue;
+
+        std::string message = packages[i].name;
+        if (!error.empty()) message += " (" + error + ")";
+        failures.push_back(message);
+    }
+    return failures.empty();
+}
+
+InstallCommandResult install_package_v2(const PackageMetadata& meta, bool verbose) {
+    return install_package_from_file(get_install_archive_path(meta), verbose);
 }
 
 std::string read_package_name_from_archive(const std::string& pkg_file) {
@@ -132,9 +171,35 @@ bool verify_installed_package(const std::string& pkg_name, bool verbose, std::st
 struct RepairInspection {
     std::vector<std::string> detected_issues;
     std::vector<std::string> unresolved_issues;
+    std::vector<std::string> missing_repo_packages;
+    std::vector<std::string> missing_upgradeable_base_packages;
+    std::vector<std::string> missing_provided_base_packages;
     std::vector<PackageMetadata> install_queue;
     std::vector<PackageMetadata> reinstall_queue;
 };
+
+void append_unique_name(std::vector<std::string>& names, const std::string& name) {
+    if (std::find(names.begin(), names.end(), name) == names.end()) {
+        names.push_back(name);
+    }
+}
+
+std::string describe_missing_repair_candidate(const std::string& pkg_name) {
+    if (is_upgradeable_system_package(pkg_name)) {
+        return pkg_name + ": automatic reinstall is not possible because no repository package is available"
+            " (this is an upgradeable base runtime; make it available from Debian sid or an S2 repo,"
+            " then rerun 'gpkg repair' or 'gpkg upgrade')";
+    }
+
+    if (is_system_provided(pkg_name)) {
+        return pkg_name + ": automatic reinstall is not possible because no repository package is available"
+            " (GeminiOS considers this base-provided; recover it from the base image or make it available"
+            " from Debian sid or an S2 repo if you want repo-driven repair)";
+    }
+
+    return pkg_name + ": automatic reinstall is not possible because no repository package is available"
+        " (make it available from Debian sid or an S2 repo, then rerun 'gpkg repair')";
+}
 
 struct UpgradePlanEntry {
     PackageMetadata meta;
@@ -396,10 +461,13 @@ RepairInspection inspect_repair_state(bool verbose) {
 
         PackageMetadata repo_meta;
         if (!get_repo_package_info(pkg, repo_meta)) {
-            append_unique_message(
-                inspection.unresolved_issues,
-                pkg + ": automatic reinstall is not possible because no repository package is available"
-            );
+            append_unique_message(inspection.unresolved_issues, describe_missing_repair_candidate(pkg));
+            append_unique_name(inspection.missing_repo_packages, pkg);
+            if (is_upgradeable_system_package(pkg)) {
+                append_unique_name(inspection.missing_upgradeable_base_packages, pkg);
+            } else if (is_system_provided(pkg)) {
+                append_unique_name(inspection.missing_provided_base_packages, pkg);
+            }
             continue;
         }
 
@@ -524,6 +592,13 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
               << format_total_bytes(download_report.downloaded_bytes) << " transferred."
               << Color::RESET << std::endl;
 
+    std::vector<std::string> failed_preparation;
+    if (!prepare_install_archives(upgrade_queue, download_report, verbose, failed_preparation)) {
+        std::cerr << Color::RED << "E: Aborting upgrade because these packages could not be prepared safely: "
+                  << join_strings(failed_preparation) << Color::RESET << std::endl;
+        return 1;
+    }
+
     size_t installed_count = 0;
     std::vector<std::string> failures;
     size_t install_progress_width = 0;
@@ -536,7 +611,7 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
         }
 
         if (!verbose) render_package_progress("current", i, upgrade_queue.size(), upgrade_queue[i].name, &install_progress_width);
-        InstallCommandResult result = install_package_v2(upgrade_queue[i].name, verbose);
+        InstallCommandResult result = install_package_v2(upgrade_queue[i], verbose);
         if (!result.success) {
             if (!verbose) finish_progress_line(&install_progress_width);
             std::cerr << Color::RED << "E: Failed to install " << upgrade_queue[i].name
@@ -607,6 +682,23 @@ int handle_repair(bool verbose) {
         for (const auto& issue : inspection.unresolved_issues) {
             std::cerr << Color::RED << "  " << issue << Color::RESET << std::endl;
         }
+        if (!inspection.missing_repo_packages.empty()) {
+            std::cerr << Color::YELLOW
+                      << "  Missing repo candidates: " << join_strings(inspection.missing_repo_packages)
+                      << Color::RESET << std::endl;
+        }
+        if (!inspection.missing_upgradeable_base_packages.empty()) {
+            std::cerr << Color::YELLOW
+                      << "  Upgradeable base runtimes to republish: "
+                      << join_strings(inspection.missing_upgradeable_base_packages)
+                      << Color::RESET << std::endl;
+        }
+        if (!inspection.missing_provided_base_packages.empty()) {
+            std::cerr << Color::YELLOW
+                      << "  Base-provided runtimes needing manual/base recovery: "
+                      << join_strings(inspection.missing_provided_base_packages)
+                      << Color::RESET << std::endl;
+        }
         return 1;
     }
 
@@ -667,13 +759,20 @@ int handle_repair(bool verbose) {
         return 1;
     }
 
+    std::vector<std::string> failed_preparation;
+    if (!prepare_install_archives(repair_queue, download_report, verbose, failed_preparation)) {
+        std::cerr << Color::RED << "E: Aborting repair because these packages could not be prepared safely: "
+                  << join_strings(failed_preparation) << Color::RESET << std::endl;
+        return 1;
+    }
+
     std::cout << Color::CYAN << "[*] Applying repair plan..." << Color::RESET << std::endl;
     size_t repaired_count = 0;
     size_t install_progress_width = 0;
     std::vector<std::string> failures;
     for (size_t i = 0; i < repair_queue.size(); ++i) {
         if (!verbose) render_package_progress("current", i, repair_queue.size(), repair_queue[i].name, &install_progress_width);
-        InstallCommandResult result = install_package_v2(repair_queue[i].name, verbose);
+        InstallCommandResult result = install_package_v2(repair_queue[i], verbose);
         if (!result.success) {
             if (!verbose) finish_progress_line(&install_progress_width);
             std::cerr << Color::RED << "E: Repair stopped at " << repair_queue[i].name
@@ -807,13 +906,20 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
         return 1;
     }
 
+    std::vector<std::string> failed_preparation;
+    if (!prepare_install_archives(install_queue, download_report, verbose, failed_preparation)) {
+        std::cerr << Color::RED << "E: Aborting install because these packages could not be prepared safely: "
+                  << join_strings(failed_preparation) << Color::RESET << std::endl;
+        return 1;
+    }
+
     std::cout << Color::CYAN << "[*] Installing " << install_queue.size()
               << " package(s)..." << Color::RESET << std::endl;
     size_t installed_count = 0;
     size_t install_progress_width = 0;
     for (size_t i = 0; i < install_queue.size(); ++i) {
         if (!verbose) render_package_progress("current", i, install_queue.size(), install_queue[i].name, &install_progress_width);
-        InstallCommandResult result = install_package_v2(install_queue[i].name, verbose);
+        InstallCommandResult result = install_package_v2(install_queue[i], verbose);
         if (!result.success) {
             if (!verbose) finish_progress_line(&install_progress_width);
             std::cerr << Color::RED << "E: Installation stopped at " << install_queue[i].name

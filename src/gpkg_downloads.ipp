@@ -61,6 +61,7 @@ std::string format_data_progress(size_t transferred, size_t estimated, bool esti
 bool verify_hash(
     const std::string& file,
     const std::string& expected_hash,
+    const std::string& algorithm,
     const std::string& label = "",
     std::string* error_out = nullptr,
     bool quiet = false
@@ -81,22 +82,35 @@ bool verify_hash(
         return false;
     }
 
-    SHA512_CTX sha512;
-    SHA512_Init(&sha512);
     char buffer[32768];
-    while (f.read(buffer, sizeof(buffer)) || f.gcount() > 0) {
-        SHA512_Update(&sha512, buffer, f.gcount());
+    std::string calculated;
+    if (algorithm == "sha256") {
+        SHA256_CTX sha256;
+        SHA256_Init(&sha256);
+        while (f.read(buffer, sizeof(buffer)) || f.gcount() > 0) {
+            SHA256_Update(&sha256, buffer, f.gcount());
+        }
+        unsigned char hash[SHA256_DIGEST_LENGTH];
+        SHA256_Final(hash, &sha256);
+        std::stringstream ss;
+        for (int i = 0; i < SHA256_DIGEST_LENGTH; ++i) {
+            ss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(hash[i]);
+        }
+        calculated = ss.str();
+    } else {
+        SHA512_CTX sha512;
+        SHA512_Init(&sha512);
+        while (f.read(buffer, sizeof(buffer)) || f.gcount() > 0) {
+            SHA512_Update(&sha512, buffer, f.gcount());
+        }
+        unsigned char hash[SHA512_DIGEST_LENGTH];
+        SHA512_Final(hash, &sha512);
+        std::stringstream ss;
+        for (int i = 0; i < SHA512_DIGEST_LENGTH; ++i) {
+            ss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(hash[i]);
+        }
+        calculated = ss.str();
     }
-
-    unsigned char hash[SHA512_DIGEST_LENGTH];
-    SHA512_Final(hash, &sha512);
-
-    std::stringstream ss;
-    for (int i = 0; i < SHA512_DIGEST_LENGTH; ++i) {
-        ss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(hash[i]);
-    }
-
-    std::string calculated = ss.str();
     if (calculated == expected_hash) return true;
 
     if (error_out) *error_out = "hash mismatch";
@@ -109,7 +123,15 @@ bool verify_hash(
 }
 
 std::string get_cached_package_path(const PackageMetadata& meta) {
-    return REPO_CACHE_PATH + meta.name + EXTENSION;
+    if (package_is_debian_source(meta)) return get_cached_debian_archive_path(meta);
+
+    std::string repo_component = cache_safe_component(meta.source_url.empty() ? "default" : meta.source_url);
+    std::string base = REPO_CACHE_PATH + "gpkg/" + repo_component + "/";
+    std::string filename = cache_safe_component(meta.name)
+        + "_" + safe_repo_filename_component(meta.version)
+        + "_" + cache_safe_component(meta.arch.empty() ? std::string(OS_ARCH) : meta.arch)
+        + EXTENSION;
+    return base + filename;
 }
 
 std::string get_partial_package_path(const PackageMetadata& meta) {
@@ -155,12 +177,17 @@ bool fetch_package_archive(
         return false;
     };
 
-    if (!mkdir_p(REPO_CACHE_PATH)) {
-        return fail("Failed to create cache directory " + REPO_CACHE_PATH);
+    if (!mkdir_parent(get_cached_package_path(meta))) {
+        return fail("Failed to create cache directory for " + meta.name);
     }
 
     std::string local_path = get_cached_package_path(meta);
     std::string verify_label = "package archive " + meta.name;
+    std::string hash_value = package_is_debian_source(meta) ? meta.sha256 : meta.sha512;
+    std::string hash_algorithm = package_is_debian_source(meta) ? "sha256" : "sha512";
+    if (hash_value.empty()) {
+        return fail("Missing archive checksum for " + meta.name);
+    }
 
     if (access(local_path.c_str(), F_OK) == 0) {
         if (!quiet) {
@@ -169,7 +196,7 @@ bool fetch_package_archive(
         }
 
         std::string verify_error;
-        if (verify_hash(local_path, meta.sha512, "cached " + verify_label, &verify_error, quiet)) {
+        if (verify_hash(local_path, hash_value, hash_algorithm, "cached " + verify_label, &verify_error, quiet)) {
             if (reused_out) *reused_out = true;
             return true;
         }
@@ -222,7 +249,7 @@ bool fetch_package_archive(
         }
 
         std::string verify_error;
-        if (verify_hash(local_path, meta.sha512, verify_label, &verify_error, quiet)) {
+        if (verify_hash(local_path, hash_value, hash_algorithm, verify_label, &verify_error, quiet)) {
             if (transferred_out) *transferred_out = transferred;
             return true;
         }
@@ -245,6 +272,12 @@ bool fetch_package_archive(
 size_t estimate_package_archive_bytes(const PackageMetadata& meta) {
     size_t cached_bytes = get_cached_package_bytes(meta);
     if (cached_bytes > 0) return cached_bytes;
+
+    if (!meta.size.empty()) {
+        char* end = nullptr;
+        unsigned long parsed = std::strtoul(meta.size.c_str(), &end, 10);
+        if (end != meta.size.c_str() && parsed > 0) return static_cast<size_t>(parsed);
+    }
 
     std::string url;
     if (!resolve_download_url(meta, url)) return 0;

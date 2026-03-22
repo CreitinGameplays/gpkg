@@ -1,5 +1,8 @@
 #include "gpkg_shared.ipp"
 #include "gpkg_core.ipp"
+#include "gpkg_json.ipp"
+#include "gpkg_policy.ipp"
+#include "gpkg_debian.ipp"
 #include "gpkg_repository.ipp"
 #include "gpkg_deps.ipp"
 #include "gpkg_downloads.ipp"

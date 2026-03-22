@@ -243,7 +243,11 @@ std::string json_escape(const std::string& input) {
 std::string inject_repo_url(const std::string& obj, const std::string& repo_url) {
     size_t end = obj.rfind('}');
     if (end == std::string::npos) return obj;
-    return obj.substr(0, end) + ",\"repo_url\":\"" + json_escape(normalize_repo_base_url(repo_url)) + "\"}";
+    std::string normalized = normalize_repo_base_url(repo_url);
+    return obj.substr(0, end)
+        + ",\"repo_url\":\"" + json_escape(normalized) + "\""
+        + ",\"source_url\":\"" + json_escape(normalized) + "\""
+        + ",\"source_kind\":\"gpkg_repo\"}";
 }
 
 bool extract_json_object(const std::string& content, size_t& pos, std::string& out_obj) {

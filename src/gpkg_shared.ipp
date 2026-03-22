@@ -54,6 +54,8 @@ const std::string SOURCES_DIR = ROOT_PREFIX + "/etc/gpkg/sources.list.d/";
 const std::string SYSTEM_PROVIDES_PATH = ROOT_PREFIX + "/etc/gpkg/system-provides.list";
 const std::string UPGRADEABLE_SYSTEM_PATH = ROOT_PREFIX + "/etc/gpkg/upgradeable-system.list";
 const std::string UPGRADE_COMPANIONS_PATH = ROOT_PREFIX + "/etc/gpkg/upgrade-companions.conf";
+const std::string DEBIAN_CONFIG_PATH = ROOT_PREFIX + "/etc/gpkg/debian.conf";
+const std::string IMPORT_POLICY_PATH = ROOT_PREFIX + "/etc/gpkg/import-policy.json";
 const std::string STATUS_FILE = ROOT_PREFIX + "/var/lib/gpkg/status";
 const std::string INFO_DIR = ROOT_PREFIX + "/var/lib/gpkg/info/";
 const std::string EXTENSION = ".gpkg";
@@ -341,12 +343,72 @@ struct PackageMetadata {
     std::string version;
     std::string arch;
     std::string description;
+    std::string maintainer;
+    std::string section;
+    std::string priority;
     std::string filename;
+    std::string sha256;
     std::string sha512;
     std::string source_url;
+    std::string source_kind;
+    std::string debian_package;
+    std::string debian_version;
+    std::string package_scope;
+    std::string installed_from;
+    std::string size;
     std::vector<std::string> depends;
+    std::vector<std::string> recommends;
+    std::vector<std::string> suggests;
     std::vector<std::string> conflicts;
     std::vector<std::string> provides;
 };
+
+std::string cache_safe_component(const std::string& value) {
+    std::string safe;
+    safe.reserve(value.size());
+    for (char c : value) {
+        if (std::isalnum(static_cast<unsigned char>(c)) || c == '.' || c == '_' || c == '-') {
+            safe += c;
+        } else {
+            safe += '_';
+        }
+    }
+    if (safe.empty()) return "unknown";
+    return safe;
+}
+
+std::string path_dirname(const std::string& path) {
+    size_t pos = path.find_last_of('/');
+    if (pos == std::string::npos) return ".";
+    if (pos == 0) return "/";
+    return path.substr(0, pos);
+}
+
+std::string path_basename(const std::string& path) {
+    size_t pos = path.find_last_of('/');
+    if (pos == std::string::npos) return path;
+    return path.substr(pos + 1);
+}
+
+bool mkdir_parent(const std::string& path) {
+    return mkdir_p(path_dirname(path));
+}
+
+std::string join_url_path(const std::string& base, const std::string& relative) {
+    if (base.empty()) return relative;
+    if (relative.empty()) return base;
+
+    std::string normalized_base = base;
+    while (normalized_base.size() > 1 && normalized_base.back() == '/') {
+        normalized_base.pop_back();
+    }
+
+    if (relative[0] == '/') return normalized_base + relative;
+    return normalized_base + "/" + relative;
+}
+
+bool package_is_debian_source(const PackageMetadata& meta) {
+    return meta.source_kind == "debian";
+}
 
 #define VLOG(v, msg) do { if (v) std::cout << "[DEBUG] " << msg << std::endl; } while(0)

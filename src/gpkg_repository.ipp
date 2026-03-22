@@ -55,8 +55,57 @@ bool ensure_repo_index_available() {
     return false;
 }
 
+int package_source_rank(const PackageMetadata& meta) {
+    if (meta.source_kind == "debian") return 0;
+    if (meta.source_kind == "gpkg_repo") return 1;
+    return 2;
+}
+
+bool should_prefer_repo_candidate(const PackageMetadata& candidate, const PackageMetadata& current) {
+    int candidate_rank = package_source_rank(candidate);
+    int current_rank = package_source_rank(current);
+    if (candidate_rank != current_rank) return candidate_rank < current_rank;
+    return compare_versions(candidate.version, current.version) > 0;
+}
+
+void populate_package_metadata_from_json(const std::string& obj, PackageMetadata& meta) {
+    get_json_value(obj, "package", meta.name);
+    get_json_value(obj, "version", meta.version);
+    get_json_value(obj, "architecture", meta.arch);
+    get_json_value(obj, "maintainer", meta.maintainer);
+    get_json_value(obj, "description", meta.description);
+    get_json_value(obj, "section", meta.section);
+    get_json_value(obj, "priority", meta.priority);
+    get_json_value(obj, "filename", meta.filename);
+    get_json_value(obj, "sha256", meta.sha256);
+    get_json_value(obj, "sha512", meta.sha512);
+    get_json_value(obj, "repo_url", meta.source_url);
+    if (meta.source_url.empty()) get_json_value(obj, "source_url", meta.source_url);
+    get_json_value(obj, "source_kind", meta.source_kind);
+    get_json_value(obj, "debian_package", meta.debian_package);
+    get_json_value(obj, "debian_version", meta.debian_version);
+    get_json_value(obj, "package_scope", meta.package_scope);
+    get_json_value(obj, "installed_from", meta.installed_from);
+    get_json_value(obj, "size", meta.size);
+    get_json_array(obj, "depends", meta.depends);
+    get_json_array(obj, "recommends", meta.recommends);
+    get_json_array(obj, "suggests", meta.suggests);
+    get_json_array(obj, "conflicts", meta.conflicts);
+    get_json_array(obj, "provides", meta.provides);
+}
+
+std::string format_package_origin(const PackageMetadata& meta) {
+    std::string label = meta.source_kind.empty() ? "unknown" : meta.source_kind;
+    if (!meta.source_url.empty()) label += ": " + meta.source_url;
+    return label;
+}
+
 bool resolve_download_url(const PackageMetadata& meta, std::string& out_url) {
     if (!meta.source_url.empty()) {
+        if (meta.source_kind == "debian") {
+            out_url = get_debian_package_url(meta);
+            return true;
+        }
         out_url = build_repo_package_url(meta.source_url, meta.filename);
         return true;
     }
@@ -73,17 +122,10 @@ bool get_repo_package_info(const std::string& pkg_name, PackageMetadata& out_met
         std::string name;
         if (get_json_value(obj, "package", name) && trim(name) == pkg_name) {
             PackageMetadata candidate;
+            populate_package_metadata_from_json(obj, candidate);
             candidate.name = trim(name);
-            get_json_value(obj, "version", candidate.version);
-            get_json_value(obj, "description", candidate.description);
-            get_json_value(obj, "filename", candidate.filename);
-            get_json_value(obj, "sha512", candidate.sha512);
-            get_json_value(obj, "repo_url", candidate.source_url);
-            get_json_array(obj, "depends", candidate.depends);
-            get_json_array(obj, "conflicts", candidate.conflicts);
-            get_json_array(obj, "provides", candidate.provides);
 
-            if (!found || compare_versions(candidate.version, out_meta.version) > 0) {
+            if (!found || should_prefer_repo_candidate(candidate, out_meta)) {
                 out_meta = candidate;
             }
             found = true;
@@ -95,22 +137,22 @@ bool get_repo_package_info(const std::string& pkg_name, PackageMetadata& out_met
 
 int handle_list_repos() {
     auto urls = get_repo_urls();
+    DebianBackendConfig debian = load_debian_backend_config(false);
+    std::cout << "Configured package sources:" << std::endl;
+    std::cout << "  1. Debian sid (" << debian.packages_url << ")" << std::endl;
     if (urls.empty()) {
-        std::cout << "No repositories configured." << std::endl;
+        std::cout << "  2. No additional S2 repositories configured." << std::endl;
         return 0;
     }
 
-    std::cout << "Configured repositories:" << std::endl;
     for (size_t i = 0; i < urls.size(); ++i) {
-        std::cout << "  " << (i + 1) << ". " << normalize_repo_base_url(urls[i]) << std::endl;
+        std::cout << "  " << (i + 2) << ". " << normalize_repo_base_url(urls[i]) << std::endl;
     }
     return 0;
 }
 
 int handle_update(bool verbose) {
     auto urls = get_repo_urls();
-    if (!ensure_repo_urls(urls)) return 1;
-
     VLOG(verbose, "Found " << urls.size() << " repository URLs.");
     std::cout << Color::BLUE << "Updating package indices..." << Color::RESET << std::endl;
     run_command("mkdir -p " + REPO_CACHE_PATH, verbose);
@@ -168,6 +210,10 @@ int handle_update(bool verbose) {
                   << " (" << repo_package_count << " packages)" << Color::RESET << std::endl;
     }
 
+    if (update_debian_backend_index(merged, first_object, total_packages, verbose)) {
+        ++success_count;
+    }
+
     merged << "\n]\n";
     merged.close();
 
@@ -183,7 +229,7 @@ int handle_update(bool verbose) {
     }
 
     std::cout << Color::GREEN << "✓ Merged " << total_packages << " packages from "
-              << success_count << " repositories." << Color::RESET << std::endl;
+              << success_count << " sources." << Color::RESET << std::endl;
     return 0;
 }
 
@@ -194,14 +240,11 @@ int handle_search(const std::string& query, bool verbose) {
     std::map<std::string, PackageMetadata> matches;
     foreach_json_object(REPO_CACHE_PATH + "Packages.json", [&](const std::string& obj) {
         PackageMetadata meta;
-        get_json_value(obj, "package", meta.name);
-        get_json_value(obj, "description", meta.description);
-        get_json_value(obj, "version", meta.version);
-        get_json_value(obj, "repo_url", meta.source_url);
+        populate_package_metadata_from_json(obj, meta);
 
         if (meta.name.find(query) != std::string::npos || meta.description.find(query) != std::string::npos) {
             auto it = matches.find(meta.name);
-            if (it == matches.end() || compare_versions(meta.version, it->second.version) > 0) {
+            if (it == matches.end() || should_prefer_repo_candidate(meta, it->second)) {
                 matches[meta.name] = meta;
             }
         }
@@ -217,8 +260,8 @@ int handle_search(const std::string& query, bool verbose) {
         const auto& meta = entry.second;
         std::string installed_ver;
         std::string status_str;
-        std::string repo_str = meta.source_url.empty() ? ""
-            : (Color::CYAN + " [repo: " + meta.source_url + "]" + Color::RESET);
+        std::string repo_str = format_package_origin(meta).empty() ? ""
+            : (Color::CYAN + " [source: " + format_package_origin(meta) + "]" + Color::RESET);
 
         if (is_installed(meta.name, &installed_ver)) {
             if (compare_versions(installed_ver, meta.version) == 0) {
@@ -254,10 +297,13 @@ int handle_show(const std::string& pkg_name, bool verbose) {
 
     std::cout << Color::GREEN << meta.name << Color::RESET << std::endl;
     std::cout << "  Version:     " << meta.version << std::endl;
-    std::cout << "  Repository:  " << (meta.source_url.empty() ? "(unknown)" : meta.source_url) << std::endl;
+    std::cout << "  Source:      " << format_package_origin(meta) << std::endl;
     std::cout << "  Filename:    " << meta.filename << std::endl;
+    if (!meta.debian_package.empty()) std::cout << "  Debian Pkg:  " << meta.debian_package << std::endl;
+    if (!meta.debian_version.empty()) std::cout << "  Debian Ver:  " << meta.debian_version << std::endl;
     if (!meta.description.empty()) print_description_block("Description", meta.description);
     if (!meta.depends.empty()) print_wrapped_block("  Depends:     ", join_strings(meta.depends));
+    if (!meta.suggests.empty()) print_wrapped_block("  Suggests:    ", join_strings(meta.suggests));
     if (!meta.conflicts.empty()) print_wrapped_block("  Conflicts:   ", join_strings(meta.conflicts));
     if (!meta.provides.empty()) print_wrapped_block("  Provides:    ", join_strings(meta.provides));
 

@@ -16,8 +16,25 @@ bool get_installed_package_metadata(const std::string& pkg_name, PackageMetadata
     out_meta = {};
     out_meta.name = pkg_name;
     get_json_value(content, "version", out_meta.version);
+    get_json_value(content, "architecture", out_meta.arch);
+    get_json_value(content, "maintainer", out_meta.maintainer);
     get_json_value(content, "description", out_meta.description);
+    get_json_value(content, "section", out_meta.section);
+    get_json_value(content, "priority", out_meta.priority);
+    get_json_value(content, "filename", out_meta.filename);
+    get_json_value(content, "sha256", out_meta.sha256);
+    get_json_value(content, "sha512", out_meta.sha512);
+    get_json_value(content, "source_kind", out_meta.source_kind);
+    get_json_value(content, "source_url", out_meta.source_url);
+    if (out_meta.source_url.empty()) get_json_value(content, "repo_url", out_meta.source_url);
+    get_json_value(content, "debian_package", out_meta.debian_package);
+    get_json_value(content, "debian_version", out_meta.debian_version);
+    get_json_value(content, "package_scope", out_meta.package_scope);
+    get_json_value(content, "installed_from", out_meta.installed_from);
+    get_json_value(content, "size", out_meta.size);
     get_json_array(content, "depends", out_meta.depends);
+    get_json_array(content, "recommends", out_meta.recommends);
+    get_json_array(content, "suggests", out_meta.suggests);
     get_json_array(content, "conflicts", out_meta.conflicts);
     get_json_array(content, "provides", out_meta.provides);
     return !out_meta.version.empty() || !content.empty();
@@ -205,6 +222,8 @@ bool is_dependency_satisfied_locally(
 
 std::string find_provider(const std::string& capability, const std::string& op, const std::string& req_version, bool verbose) {
     std::string result;
+    PackageMetadata best_meta;
+    bool found = false;
     foreach_json_object(REPO_CACHE_PATH + "Packages.json", [&](const std::string& obj) {
         std::vector<std::string> provides;
         if (!get_json_array(obj, "provides", provides)) return true;
@@ -217,16 +236,24 @@ std::string find_provider(const std::string& capability, const std::string& op, 
                 (!prov_dep.version.empty() && version_satisfies(prov_dep.version, op, req_version));
             if (!satisfies) continue;
 
-            get_json_value(obj, "package", result);
-            result = trim(result);
-            VLOG(verbose, "Found provider for " << capability
-                 << (op.empty() ? "" : (" (" + op + " " + req_version + ")"))
-                 << ": " << result);
-            return false;
+            PackageMetadata candidate;
+            populate_package_metadata_from_json(obj, candidate);
+            candidate.name = trim(candidate.name);
+            if (!found || should_prefer_repo_candidate(candidate, best_meta)) {
+                best_meta = candidate;
+                result = candidate.name;
+                found = true;
+            }
+            break;
         }
 
         return true;
     });
+    if (found) {
+        VLOG(verbose, "Found provider for " << capability
+             << (op.empty() ? "" : (" (" + op + " " + req_version + ")"))
+             << ": " << result);
+    }
     return result;
 }
 
@@ -281,6 +308,12 @@ bool resolve_dependencies(
         std::cerr << Color::YELLOW << "W: " << pkg << " " << installed_ver
                   << " is installed but does not meet requirements (" << op
                   << " " << req_version << ")." << Color::RESET << std::endl;
+    }
+
+    if (is_blocked_import_package(pkg, verbose)) {
+        std::cerr << Color::RED << "E: Package " << pkg
+                  << " is blocked by GeminiOS import policy." << Color::RESET << std::endl;
+        return false;
     }
 
     PackageMetadata meta;
