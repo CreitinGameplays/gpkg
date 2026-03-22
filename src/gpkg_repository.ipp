@@ -1,5 +1,20 @@
 // Repository configuration, index management, and repo-backed commands.
 
+std::map<std::string, PackageMetadata> g_repo_package_cache;
+std::map<std::string, std::vector<std::string>> g_repo_provider_cache;
+bool g_repo_package_cache_loaded = false;
+
+std::string relation_name_from_text(const std::string& relation) {
+    size_t open_paren = relation.find('(');
+    return trim(open_paren == std::string::npos ? relation : relation.substr(0, open_paren));
+}
+
+void invalidate_repo_package_cache() {
+    g_repo_package_cache.clear();
+    g_repo_provider_cache.clear();
+    g_repo_package_cache_loaded = false;
+}
+
 std::vector<std::string> get_repo_urls() {
     std::vector<std::string> urls;
     std::set<std::string> seen_urls;
@@ -94,6 +109,52 @@ void populate_package_metadata_from_json(const std::string& obj, PackageMetadata
     get_json_array(obj, "provides", meta.provides);
 }
 
+bool ensure_repo_package_cache_loaded(bool verbose) {
+    if (g_repo_package_cache_loaded) return true;
+    if (!ensure_repo_index_available()) return false;
+
+    std::string index_path = REPO_CACHE_PATH + "Packages.json";
+    std::map<std::string, PackageMetadata> packages;
+    foreach_json_object(index_path, [&](const std::string& obj) {
+        PackageMetadata candidate;
+        populate_package_metadata_from_json(obj, candidate);
+        candidate.name = trim(candidate.name);
+        if (candidate.name.empty()) return true;
+
+        auto it = packages.find(candidate.name);
+        if (it == packages.end() || should_prefer_repo_candidate(candidate, it->second)) {
+            packages[candidate.name] = candidate;
+        }
+        return true;
+    });
+
+    std::map<std::string, std::vector<std::string>> providers;
+    for (const auto& entry : packages) {
+        for (const auto& capability : entry.second.provides) {
+            std::string relation_name = relation_name_from_text(capability);
+            if (relation_name.empty()) continue;
+
+            auto& provider_names = providers[relation_name];
+            if (std::find(provider_names.begin(), provider_names.end(), entry.first) == provider_names.end()) {
+                provider_names.push_back(entry.first);
+            }
+        }
+    }
+
+    g_repo_package_cache = std::move(packages);
+    g_repo_provider_cache = std::move(providers);
+    g_repo_package_cache_loaded = true;
+    VLOG(verbose, "Loaded " << g_repo_package_cache.size() << " repository package records into memory.");
+    return true;
+}
+
+const std::vector<std::string>* get_repo_provider_candidates(const std::string& capability, bool verbose) {
+    if (!ensure_repo_package_cache_loaded(verbose)) return nullptr;
+    auto it = g_repo_provider_cache.find(capability);
+    if (it == g_repo_provider_cache.end()) return nullptr;
+    return &it->second;
+}
+
 std::string format_package_origin(const PackageMetadata& meta) {
     std::string label = meta.source_kind.empty() ? "unknown" : meta.source_kind;
     if (!meta.source_url.empty()) label += ": " + meta.source_url;
@@ -117,22 +178,11 @@ bool resolve_download_url(const PackageMetadata& meta, std::string& out_url) {
 }
 
 bool get_repo_package_info(const std::string& pkg_name, PackageMetadata& out_meta) {
-    bool found = false;
-    foreach_json_object(REPO_CACHE_PATH + "Packages.json", [&](const std::string& obj) {
-        std::string name;
-        if (get_json_value(obj, "package", name) && trim(name) == pkg_name) {
-            PackageMetadata candidate;
-            populate_package_metadata_from_json(obj, candidate);
-            candidate.name = trim(name);
-
-            if (!found || should_prefer_repo_candidate(candidate, out_meta)) {
-                out_meta = candidate;
-            }
-            found = true;
-        }
-        return true;
-    });
-    return found;
+    if (!ensure_repo_package_cache_loaded(false)) return false;
+    auto it = g_repo_package_cache.find(pkg_name);
+    if (it == g_repo_package_cache.end()) return false;
+    out_meta = it->second;
+    return true;
 }
 
 int handle_list_repos() {
@@ -228,28 +278,26 @@ int handle_update(bool verbose) {
         return 1;
     }
 
+    invalidate_repo_package_cache();
     std::cout << Color::GREEN << "✓ Merged " << total_packages << " packages from "
               << success_count << " sources." << Color::RESET << std::endl;
     return 0;
 }
 
 int handle_search(const std::string& query, bool verbose) {
-    if (!ensure_repo_index_available()) return 1;
+    if (!ensure_repo_package_cache_loaded(verbose)) return 1;
 
     VLOG(verbose, "Searching for '" << query << "' in " << REPO_CACHE_PATH << "Packages.json");
     std::map<std::string, PackageMetadata> matches;
-    foreach_json_object(REPO_CACHE_PATH + "Packages.json", [&](const std::string& obj) {
-        PackageMetadata meta;
-        populate_package_metadata_from_json(obj, meta);
-
+    for (const auto& entry : g_repo_package_cache) {
+        const PackageMetadata& meta = entry.second;
         if (meta.name.find(query) != std::string::npos || meta.description.find(query) != std::string::npos) {
             auto it = matches.find(meta.name);
             if (it == matches.end() || should_prefer_repo_candidate(meta, it->second)) {
                 matches[meta.name] = meta;
             }
         }
-        return true;
-    });
+    }
 
     if (matches.empty()) {
         std::cout << "No matches found for '" << query << "'" << std::endl;
@@ -368,6 +416,7 @@ int handle_add_repo(const std::string& url, bool verbose) {
 
 int handle_clean(bool verbose) {
     std::cout << "Cleaning package cache..." << std::endl;
+    invalidate_repo_package_cache();
     run_command("rm -rf " + REPO_CACHE_PATH + "*", verbose);
     return 0;
 }

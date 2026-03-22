@@ -541,6 +541,7 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
     if (!ensure_repo_index_available()) return 1;
 
     std::cout << "Reading package lists..." << std::endl;
+    if (!ensure_repo_package_cache_loaded(verbose)) return 1;
     std::cout << "Optional dependency policy: " << describe_optional_dependency_policy() << std::endl;
     VLOG(verbose, "Checking " << installed_cache.size() << " installed packages and upgradeable base runtimes.");
 
@@ -682,7 +683,7 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
             }
             std::cerr << std::endl;
             failures.push_back(upgrade_queue[i].name);
-            continue;
+            break;
         }
 
         queue_triggers_for_package(upgrade_queue[i].name);
@@ -695,6 +696,20 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
                   << " package(s)." << Color::RESET << std::endl;
     }
 
+    if (!failures.empty()) {
+        std::cout << Color::CYAN << "Upgrade summary: "
+                  << installed_upgrades.size() << " upgraded, "
+                  << base_bootstraps.size() << " imported from base image, "
+                  << dependency_installs.size() << " dependency installs, "
+                  << download_report.downloaded_count << " downloaded, "
+                  << download_report.reused_count << " reused from cache, "
+                  << format_total_bytes(download_report.downloaded_bytes) << " transferred."
+                  << Color::RESET << std::endl;
+        std::cerr << Color::RED << "E: Upgrade completed with failures: "
+                  << join_strings(failures) << Color::RESET << std::endl;
+        return 1;
+    }
+
     std::cout << Color::CYAN << "Upgrade summary: "
               << installed_upgrades.size() << " upgraded, "
               << base_bootstraps.size() << " imported from base image, "
@@ -703,12 +718,6 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
               << download_report.reused_count << " reused from cache, "
               << format_total_bytes(download_report.downloaded_bytes) << " transferred."
               << Color::RESET << std::endl;
-
-    if (!failures.empty()) {
-        std::cerr << Color::RED << "E: Upgrade completed with failures: "
-                  << join_strings(failures) << Color::RESET << std::endl;
-        return 1;
-    }
 
     return 0;
 }

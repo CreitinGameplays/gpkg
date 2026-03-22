@@ -585,6 +585,22 @@ bool decompress_xz_file(
 ) {
     if (error_out) error_out->clear();
 
+    if (is_executable_command_available("xz")) {
+        std::string cmd = "xz -T0 -d -c " + shell_quote(input_path)
+            + " > " + shell_quote(output_path);
+        CommandCaptureResult result = run_command_captured(cmd, false, "gpkg-xz-decompress");
+        if (result.exit_code == 0) {
+            if (!result.log_path.empty()) unlink(result.log_path.c_str());
+            return true;
+        }
+        if (error_out) {
+            *error_out = result.log_path.empty()
+                ? "xz failed to decompress Debian payload"
+                : ("xz failed to decompress Debian payload (see " + result.log_path + ")");
+        }
+        return false;
+    }
+
     std::ifstream input(input_path, std::ios::binary);
     if (!input) {
         if (error_out) *error_out = "could not open compressed archive";

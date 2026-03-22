@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <sstream>
 #include <sys/stat.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <dirent.h>
 #include <cerrno>
@@ -22,6 +23,10 @@ std::string get_info_dir() {
 }
 
 const std::string TMP_EXTRACT_PATH = "/tmp/gpkg_worker_extract/";
+
+std::string path_parent_dir(const std::string& full_path);
+bool write_text_file_atomic(const std::string& target_path, const std::string& content, mode_t mode = 0644);
+bool copy_file_atomic(const std::string& source_path, const std::string& target_path);
 
 // Logging
 bool g_verbose = false;
@@ -391,14 +396,13 @@ bool write_replaced_system_files(
 ) {
     if (entries.empty()) return true;
 
-    std::ofstream out(get_replaced_system_manifest(pkg_name));
-    if (!out) {
-        std::cerr << "E: Failed to write system backup manifest for " << pkg_name << std::endl;
-        return false;
-    }
-
+    std::ostringstream out;
     for (const auto& entry : entries) {
         out << entry.path << "\t" << entry.backup_path << "\n";
+    }
+    if (!write_text_file_atomic(get_replaced_system_manifest(pkg_name), out.str(), 0644)) {
+        std::cerr << "E: Failed to write system backup manifest for " << pkg_name << std::endl;
+        return false;
     }
     return true;
 }
@@ -464,31 +468,6 @@ bool backup_replaced_system_files(const std::vector<ReplacedSystemFile>& entries
         }
     }
 
-    return true;
-}
-
-bool restore_replaced_system_files(const std::string& pkg_name) {
-    std::vector<ReplacedSystemFile> entries = load_replaced_system_files(pkg_name);
-    for (const auto& entry : entries) {
-        std::string destination_path = g_root_prefix + entry.path;
-        size_t slash = destination_path.find_last_of('/');
-        if (slash != std::string::npos) {
-            if (!mkdir_p(destination_path.substr(0, slash))) {
-                std::cerr << "E: Failed to recreate directory for restored base file "
-                          << entry.path << std::endl;
-                return false;
-            }
-        }
-
-        std::string cmd = "cp -a " + shell_quote(entry.backup_path) + " " + shell_quote(destination_path);
-        if (run_command(cmd) != 0) {
-            std::cerr << "E: Failed to restore original base file " << entry.path << std::endl;
-            return false;
-        }
-    }
-
-    run_command("rm -f " + shell_quote(get_replaced_system_manifest(pkg_name)));
-    run_command("rm -rf " + shell_quote(get_replaced_system_dir(pkg_name)));
     return true;
 }
 
@@ -616,61 +595,6 @@ bool remove_path(const std::string& abs_path) {
     }
 }
 
-bool action_remove_safe(const std::string& pkg_name) {
-    std::cout << "Removing " << pkg_name << "..." << std::endl;
-    
-    // prerm
-    std::string prerm = get_info_dir() + pkg_name + ".prerm";
-    if (access(prerm.c_str(), X_OK) == 0) {
-        if (run_command(prerm) != 0) {
-            std::cerr << "E: prerm script failed." << std::endl;
-            return false;
-        }
-    }
-
-    // Run registered undo commands (in reverse order)
-    std::string undo_path = get_info_dir() + pkg_name + ".undo";
-    std::vector<std::string> undo_cmds;
-    std::ifstream undo_f(undo_path);
-    if (undo_f) {
-        std::string line;
-        while (std::getline(undo_f, line)) {
-            line = trim(line);
-            if (!line.empty()) undo_cmds.push_back(line);
-        }
-        undo_f.close();
-    }
-    if (!undo_cmds.empty()) {
-        VLOG("Executing " << undo_cmds.size() << " registered undo commands...");
-        for (auto it = undo_cmds.rbegin(); it != undo_cmds.rend(); ++it) {
-            run_command(*it);
-        }
-    }
-
-    std::vector<std::string> owned_files = read_list_file(pkg_name);
-    // Remove files
-    for (auto it = owned_files.rbegin(); it != owned_files.rend(); ++it) {
-        remove_path(*it);
-    }
-
-    if (!restore_replaced_system_files(pkg_name)) {
-        return false;
-    }
-
-    // postrm
-    std::string postrm = get_info_dir() + pkg_name + ".postrm";
-    if (access(postrm.c_str(), X_OK) == 0) {
-        run_command(postrm);
-    }
-
-    // Cleanup metadata
-    run_command("rm -f " + get_info_dir() + pkg_name + ".*");
-    refresh_linker_cache_if_available();
-    
-    std::cout << "✓ Removed " << pkg_name << std::endl;
-    return true;
-}
-
 // --- Installation Logic ---
 
 // Helper to detect if archive has data/ prefix
@@ -718,6 +642,713 @@ std::vector<std::string> get_tar_contents(const std::string& tar_path, bool stri
     }
     pclose(pipe);
     return list;
+}
+
+std::string normalize_tar_member_path(const std::string& raw_line, bool strip_data) {
+    std::string line = trim(raw_line);
+    if (line.empty() || line == "." || line == "./") return "";
+
+    if (line.find("./") == 0) line = line.substr(2);
+
+    if (strip_data) {
+        if (line.find("data/") == 0) {
+            line = line.substr(5);
+        } else {
+            return "";
+        }
+    }
+
+    if (!line.empty() && line.back() == '/') line.pop_back();
+    if (line.empty()) return "";
+    return "/" + line;
+}
+
+bool is_existing_symlink_directory(const std::string& full_path) {
+    struct stat link_st;
+    if (lstat(full_path.c_str(), &link_st) != 0 || !S_ISLNK(link_st.st_mode)) return false;
+
+    struct stat target_st;
+    return stat(full_path.c_str(), &target_st) == 0 && S_ISDIR(target_st.st_mode);
+}
+
+struct StagedInstallEntry {
+    std::string path;
+    std::string staged_path;
+    bool is_directory = false;
+    bool is_symlink = false;
+    mode_t mode = 0644;
+    std::string symlink_target;
+    size_t depth = 0;
+};
+
+struct InstallRollbackEntry {
+    std::string path;
+    std::string live_full_path;
+    std::string backup_full_path;
+    bool created_only = false;
+};
+
+void rollback_install_changes(const std::vector<InstallRollbackEntry>& rollback_entries);
+void discard_install_backups(const std::vector<InstallRollbackEntry>& rollback_entries);
+
+size_t path_depth(const std::string& path) {
+    return static_cast<size_t>(std::count(path.begin(), path.end(), '/'));
+}
+
+std::string path_parent_dir(const std::string& full_path) {
+    size_t slash = full_path.find_last_of('/');
+    if (slash == std::string::npos) return ".";
+    if (slash == 0) return "/";
+    return full_path.substr(0, slash);
+}
+
+std::string path_basename_component(const std::string& full_path) {
+    size_t slash = full_path.find_last_of('/');
+    if (slash == std::string::npos) return full_path;
+    return full_path.substr(slash + 1);
+}
+
+std::string allocate_sibling_temp_path(const std::string& live_full_path, const std::string& tag, int* fd_out = nullptr) {
+    if (fd_out) *fd_out = -1;
+
+    std::string parent = path_parent_dir(live_full_path);
+    std::string base = path_basename_component(live_full_path);
+    if (base.empty()) base = "entry";
+    std::string pattern = parent + "/." + base + "." + tag + "-XXXXXX";
+
+    std::vector<char> buffer(pattern.begin(), pattern.end());
+    buffer.push_back('\0');
+    int fd = mkstemp(buffer.data());
+    if (fd < 0) return "";
+
+    if (fd_out) {
+        *fd_out = fd;
+    } else {
+        close(fd);
+        unlink(buffer.data());
+    }
+    return std::string(buffer.data());
+}
+
+bool remove_live_path_exact(const std::string& live_full_path) {
+    struct stat st;
+    if (lstat(live_full_path.c_str(), &st) != 0) {
+        return errno == ENOENT;
+    }
+
+    if (S_ISDIR(st.st_mode)) {
+        return rmdir(live_full_path.c_str()) == 0 || errno == ENOENT;
+    }
+    return unlink(live_full_path.c_str()) == 0 || errno == ENOENT;
+}
+
+bool backup_live_path_if_present(
+    const std::string& live_full_path,
+    const std::string& path,
+    std::vector<InstallRollbackEntry>& rollback_entries,
+    bool* had_existing = nullptr
+) {
+    if (had_existing) *had_existing = false;
+
+    struct stat st;
+    if (lstat(live_full_path.c_str(), &st) != 0) {
+        if (errno == ENOENT) return true;
+        std::cerr << "E: Failed to inspect existing path " << live_full_path << ": "
+                  << strerror(errno) << std::endl;
+        return false;
+    }
+
+    std::string backup_full_path = allocate_sibling_temp_path(live_full_path, "gpkg-backup");
+    if (backup_full_path.empty()) {
+        std::cerr << "E: Failed to reserve backup path for " << live_full_path << std::endl;
+        return false;
+    }
+
+    if (rename(live_full_path.c_str(), backup_full_path.c_str()) != 0) {
+        std::cerr << "E: Failed to move existing path aside for " << live_full_path << ": "
+                  << strerror(errno) << std::endl;
+        unlink(backup_full_path.c_str());
+        return false;
+    }
+
+    if (had_existing) *had_existing = true;
+    rollback_entries.push_back({path, live_full_path, backup_full_path, false});
+    return true;
+}
+
+bool copy_regular_file_contents(const std::string& source_path, int dest_fd) {
+    int source_fd = open(source_path.c_str(), O_RDONLY);
+    if (source_fd < 0) {
+        std::cerr << "E: Failed to open staged file " << source_path << ": "
+                  << strerror(errno) << std::endl;
+        return false;
+    }
+
+    char buffer[65536];
+    while (true) {
+        ssize_t bytes_read = read(source_fd, buffer, sizeof(buffer));
+        if (bytes_read == 0) break;
+        if (bytes_read < 0) {
+            std::cerr << "E: Failed to read staged file " << source_path << ": "
+                      << strerror(errno) << std::endl;
+            close(source_fd);
+            return false;
+        }
+
+        ssize_t offset = 0;
+        while (offset < bytes_read) {
+            ssize_t bytes_written = write(dest_fd, buffer + offset, static_cast<size_t>(bytes_read - offset));
+            if (bytes_written < 0) {
+                std::cerr << "E: Failed while writing staged file " << source_path << ": "
+                          << strerror(errno) << std::endl;
+                close(source_fd);
+                return false;
+            }
+            offset += bytes_written;
+        }
+    }
+
+    if (fsync(dest_fd) != 0) {
+        std::cerr << "E: Failed to flush staged file " << source_path << ": "
+                  << strerror(errno) << std::endl;
+        close(source_fd);
+        return false;
+    }
+
+    close(source_fd);
+    return true;
+}
+
+bool write_text_file_atomic(const std::string& target_path, const std::string& content, mode_t mode) {
+    if (!mkdir_p(path_parent_dir(target_path))) return false;
+
+    int temp_fd = -1;
+    std::string temp_path = allocate_sibling_temp_path(target_path, "gpkg-write", &temp_fd);
+    if (temp_path.empty() || temp_fd < 0) return false;
+
+    bool ok = true;
+    ssize_t remaining = static_cast<ssize_t>(content.size());
+    const char* cursor = content.data();
+    while (remaining > 0) {
+        ssize_t written = write(temp_fd, cursor, static_cast<size_t>(remaining));
+        if (written < 0) {
+            ok = false;
+            break;
+        }
+        remaining -= written;
+        cursor += written;
+    }
+
+    if (ok && fchmod(temp_fd, mode) != 0) ok = false;
+    if (ok && fsync(temp_fd) != 0) ok = false;
+    close(temp_fd);
+
+    if (!ok) {
+        unlink(temp_path.c_str());
+        return false;
+    }
+    if (rename(temp_path.c_str(), target_path.c_str()) != 0) {
+        unlink(temp_path.c_str());
+        return false;
+    }
+    return true;
+}
+
+bool copy_file_atomic(const std::string& source_path, const std::string& target_path) {
+    struct stat st;
+    if (stat(source_path.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) return false;
+    if (!mkdir_p(path_parent_dir(target_path))) return false;
+
+    int temp_fd = -1;
+    std::string temp_path = allocate_sibling_temp_path(target_path, "gpkg-copy", &temp_fd);
+    if (temp_path.empty() || temp_fd < 0) return false;
+
+    bool ok = copy_regular_file_contents(source_path, temp_fd);
+    if (ok && fchmod(temp_fd, st.st_mode & 07777) != 0) ok = false;
+    if (ok && fsync(temp_fd) != 0) ok = false;
+    close(temp_fd);
+
+    if (!ok) {
+        unlink(temp_path.c_str());
+        return false;
+    }
+    if (rename(temp_path.c_str(), target_path.c_str()) != 0) {
+        unlink(temp_path.c_str());
+        return false;
+    }
+    return true;
+}
+
+bool activate_live_path_from_source(
+    const std::string& source_path,
+    const std::string& live_full_path,
+    const std::string& logical_path,
+    std::vector<InstallRollbackEntry>& rollback_entries
+) {
+    struct stat st;
+    if (lstat(source_path.c_str(), &st) != 0) {
+        std::cerr << "E: Failed to inspect source path " << source_path << ": "
+                  << strerror(errno) << std::endl;
+        return false;
+    }
+
+    if (!mkdir_p(path_parent_dir(live_full_path))) {
+        std::cerr << "E: Failed to create parent directory for " << live_full_path << std::endl;
+        return false;
+    }
+
+    bool had_existing = false;
+    if (!backup_live_path_if_present(live_full_path, logical_path, rollback_entries, &had_existing)) {
+        return false;
+    }
+
+    if (S_ISDIR(st.st_mode)) {
+        if (mkdir(live_full_path.c_str(), st.st_mode & 07777) != 0 && errno != EEXIST) {
+            std::cerr << "E: Failed to restore directory " << live_full_path << ": "
+                      << strerror(errno) << std::endl;
+            return false;
+        }
+        chmod(live_full_path.c_str(), st.st_mode & 07777);
+        if (!had_existing) {
+            rollback_entries.push_back({logical_path, live_full_path, "", true});
+        }
+        return true;
+    }
+
+    if (S_ISLNK(st.st_mode)) {
+        std::vector<char> target(static_cast<size_t>(st.st_size) + 2, '\0');
+        ssize_t len = readlink(source_path.c_str(), target.data(), target.size() - 1);
+        if (len < 0) {
+            std::cerr << "E: Failed to read source symlink " << source_path << ": "
+                      << strerror(errno) << std::endl;
+            return false;
+        }
+        target[static_cast<size_t>(len)] = '\0';
+
+        std::string temp_path = allocate_sibling_temp_path(live_full_path, "gpkg-restore");
+        if (temp_path.empty()) {
+            std::cerr << "E: Failed to reserve temporary restore path for " << logical_path << std::endl;
+            return false;
+        }
+
+        if (symlink(target.data(), temp_path.c_str()) != 0) {
+            std::cerr << "E: Failed to stage restored symlink " << logical_path << ": "
+                      << strerror(errno) << std::endl;
+            unlink(temp_path.c_str());
+            return false;
+        }
+        if (rename(temp_path.c_str(), live_full_path.c_str()) != 0) {
+            std::cerr << "E: Failed to activate restored symlink " << logical_path << ": "
+                      << strerror(errno) << std::endl;
+            unlink(temp_path.c_str());
+            return false;
+        }
+        if (!had_existing) {
+            rollback_entries.push_back({logical_path, live_full_path, "", true});
+        }
+        return true;
+    }
+
+    if (!S_ISREG(st.st_mode)) {
+        std::cerr << "E: Unsupported restore source type for " << source_path << std::endl;
+        return false;
+    }
+
+    int temp_fd = -1;
+    std::string temp_path = allocate_sibling_temp_path(live_full_path, "gpkg-restore", &temp_fd);
+    if (temp_path.empty() || temp_fd < 0) {
+        std::cerr << "E: Failed to reserve temporary restore path for " << logical_path << std::endl;
+        return false;
+    }
+
+    bool ok = copy_regular_file_contents(source_path, temp_fd);
+    if (ok && fchmod(temp_fd, st.st_mode & 07777) != 0) {
+        std::cerr << "E: Failed to restore file permissions for " << logical_path << ": "
+                  << strerror(errno) << std::endl;
+        ok = false;
+    }
+    close(temp_fd);
+
+    if (!ok) {
+        unlink(temp_path.c_str());
+        return false;
+    }
+    if (rename(temp_path.c_str(), live_full_path.c_str()) != 0) {
+        std::cerr << "E: Failed to activate restored file " << logical_path << ": "
+                  << strerror(errno) << std::endl;
+        unlink(temp_path.c_str());
+        return false;
+    }
+    if (!had_existing) {
+        rollback_entries.push_back({logical_path, live_full_path, "", true});
+    }
+    return true;
+}
+
+void sort_paths_for_removal(std::vector<std::string>& paths) {
+    std::sort(paths.begin(), paths.end(), [](const std::string& left, const std::string& right) {
+        size_t left_depth = path_depth(left);
+        size_t right_depth = path_depth(right);
+        if (left_depth != right_depth) return left_depth > right_depth;
+        if (left.size() != right.size()) return left.size() > right.size();
+        return left > right;
+    });
+    paths.erase(std::unique(paths.begin(), paths.end()), paths.end());
+}
+
+bool stage_owned_path_removal(
+    const std::string& abs_path,
+    std::vector<InstallRollbackEntry>& rollback_entries
+) {
+    std::string safe_abs = (!abs_path.empty() && abs_path[0] != '/') ? "/" + abs_path : abs_path;
+    std::string live_full_path = g_root_prefix + safe_abs;
+
+    struct stat st;
+    if (lstat(live_full_path.c_str(), &st) != 0) {
+        if (errno == ENOENT) return true;
+        std::cerr << "W: Failed to stat " << live_full_path << ": " << strerror(errno) << std::endl;
+        return false;
+    }
+
+    if (S_ISDIR(st.st_mode)) {
+        errno = 0;
+        DIR* d = opendir(live_full_path.c_str());
+        if (!d) {
+            std::cerr << "W: Could not inspect directory for safe removal: " << live_full_path
+                      << " (" << strerror(errno) << ")" << std::endl;
+            return true;
+        }
+
+        bool has_entries = false;
+        struct dirent* dir;
+        while ((dir = readdir(d)) != NULL) {
+            if (strcmp(dir->d_name, ".") == 0 || strcmp(dir->d_name, "..") == 0) continue;
+            has_entries = true;
+            break;
+        }
+        int readdir_errno = errno;
+        closedir(d);
+
+        if (readdir_errno != 0) {
+            std::cerr << "W: Failed while reading directory " << live_full_path
+                      << ": " << strerror(readdir_errno) << std::endl;
+            return true;
+        }
+        if (has_entries) {
+            VLOG("Skipping removal of non-empty directory: " << live_full_path);
+            return true;
+        }
+    } else if (S_ISLNK(st.st_mode)) {
+        struct stat target_st;
+        if (stat(live_full_path.c_str(), &target_st) == 0 && S_ISDIR(target_st.st_mode)) {
+            VLOG("Skipping removal of directory symlink: " << live_full_path);
+            return true;
+        }
+    }
+
+    return backup_live_path_if_present(live_full_path, safe_abs, rollback_entries);
+}
+
+bool stage_replaced_system_restore(
+    const std::string& pkg_name,
+    std::vector<InstallRollbackEntry>& rollback_entries
+) {
+    std::vector<ReplacedSystemFile> entries = load_replaced_system_files(pkg_name);
+    for (const auto& entry : entries) {
+        if (!path_exists_no_follow(entry.backup_path)) {
+            std::cerr << "E: Missing saved base file backup for " << entry.path << std::endl;
+            return false;
+        }
+        if (!activate_live_path_from_source(
+                entry.backup_path,
+                g_root_prefix + entry.path,
+                entry.path,
+                rollback_entries)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool stage_package_metadata_removal(
+    const std::string& pkg_name,
+    std::vector<InstallRollbackEntry>& rollback_entries
+) {
+    std::vector<std::string> metadata_paths = {
+        get_info_dir() + pkg_name + ".list",
+        get_info_dir() + pkg_name + ".json",
+        get_info_dir() + pkg_name + ".undo",
+        get_info_dir() + pkg_name + ".preinst",
+        get_info_dir() + pkg_name + ".postinst",
+        get_info_dir() + pkg_name + ".prerm",
+        get_info_dir() + pkg_name + ".postrm",
+        get_replaced_system_manifest(pkg_name),
+        get_replaced_system_dir(pkg_name)
+    };
+
+    for (const auto& full_path : metadata_paths) {
+        if (!backup_live_path_if_present(full_path, full_path, rollback_entries)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool action_remove_safe(const std::string& pkg_name) {
+    std::cout << "Removing " << pkg_name << "..." << std::endl;
+
+    std::string prerm = get_info_dir() + pkg_name + ".prerm";
+    if (access(prerm.c_str(), X_OK) == 0) {
+        if (run_command(prerm) != 0) {
+            std::cerr << "E: prerm script failed." << std::endl;
+            return false;
+        }
+    }
+
+    std::string undo_path = get_info_dir() + pkg_name + ".undo";
+    std::vector<std::string> undo_cmds;
+    std::ifstream undo_f(undo_path);
+    if (undo_f) {
+        std::string line;
+        while (std::getline(undo_f, line)) {
+            line = trim(line);
+            if (!line.empty()) undo_cmds.push_back(line);
+        }
+    }
+
+    std::vector<std::string> owned_files = read_list_file(pkg_name);
+    sort_paths_for_removal(owned_files);
+
+    std::vector<InstallRollbackEntry> removal_rollback_entries;
+    for (const auto& path : owned_files) {
+        if (!stage_owned_path_removal(path, removal_rollback_entries)) {
+            rollback_install_changes(removal_rollback_entries);
+            std::cerr << "E: Failed while staging removal of " << path << std::endl;
+            return false;
+        }
+    }
+
+    if (!stage_replaced_system_restore(pkg_name, removal_rollback_entries)) {
+        rollback_install_changes(removal_rollback_entries);
+        std::cerr << "E: Failed to restore replaced system files safely." << std::endl;
+        return false;
+    }
+
+    if (!undo_cmds.empty()) {
+        VLOG("Executing " << undo_cmds.size() << " registered undo commands...");
+        for (auto it = undo_cmds.rbegin(); it != undo_cmds.rend(); ++it) {
+            if (run_command(*it) != 0) {
+                rollback_install_changes(removal_rollback_entries);
+                std::cerr << "E: Undo command failed during removal." << std::endl;
+                return false;
+            }
+        }
+    }
+
+    std::string postrm = get_info_dir() + pkg_name + ".postrm";
+    if (access(postrm.c_str(), X_OK) == 0) {
+        if (run_command(postrm) != 0) {
+            rollback_install_changes(removal_rollback_entries);
+            std::cerr << "E: postrm script failed." << std::endl;
+            return false;
+        }
+    }
+
+    if (!stage_package_metadata_removal(pkg_name, removal_rollback_entries)) {
+        rollback_install_changes(removal_rollback_entries);
+        std::cerr << "E: Failed to remove package metadata safely." << std::endl;
+        return false;
+    }
+
+    refresh_linker_cache_if_available();
+    discard_install_backups(removal_rollback_entries);
+
+    std::cout << "✓ Removed " << pkg_name << std::endl;
+    return true;
+}
+
+bool build_staged_install_entries(
+    const std::vector<std::string>& new_files,
+    const std::string& payload_root,
+    std::vector<StagedInstallEntry>& entries
+) {
+    entries.clear();
+
+    for (const auto& path : new_files) {
+        std::string staged_path = payload_root + path;
+        struct stat st;
+        if (lstat(staged_path.c_str(), &st) != 0) {
+            if (errno == ENOENT) continue;
+            std::cerr << "E: Failed to inspect staged payload entry " << staged_path
+                      << ": " << strerror(errno) << std::endl;
+            return false;
+        }
+
+        StagedInstallEntry entry;
+        entry.path = path;
+        entry.staged_path = staged_path;
+        entry.is_directory = S_ISDIR(st.st_mode);
+        entry.is_symlink = S_ISLNK(st.st_mode);
+        entry.mode = st.st_mode;
+        entry.depth = path_depth(path);
+
+        if (entry.is_symlink) {
+            std::vector<char> target(static_cast<size_t>(st.st_size) + 2, '\0');
+            ssize_t len = readlink(staged_path.c_str(), target.data(), target.size() - 1);
+            if (len < 0) {
+                std::cerr << "E: Failed to read staged symlink " << staged_path << ": "
+                          << strerror(errno) << std::endl;
+                return false;
+            }
+            target[static_cast<size_t>(len)] = '\0';
+            entry.symlink_target.assign(target.data(), static_cast<size_t>(len));
+        }
+
+        if (!entry.is_directory && !entry.is_symlink && !S_ISREG(st.st_mode)) {
+            std::cerr << "E: Unsupported staged payload entry type for " << path << std::endl;
+            return false;
+        }
+
+        entries.push_back(entry);
+    }
+
+    std::sort(entries.begin(), entries.end(), [](const StagedInstallEntry& left, const StagedInstallEntry& right) {
+        if (left.depth != right.depth) return left.depth < right.depth;
+        if (left.is_directory != right.is_directory) return left.is_directory && !right.is_directory;
+        return left.path < right.path;
+    });
+
+    return true;
+}
+
+void rollback_install_changes(const std::vector<InstallRollbackEntry>& rollback_entries) {
+    for (auto it = rollback_entries.rbegin(); it != rollback_entries.rend(); ++it) {
+        remove_live_path_exact(it->live_full_path);
+        if (!it->backup_full_path.empty()) {
+            rename(it->backup_full_path.c_str(), it->live_full_path.c_str());
+        }
+    }
+}
+
+void discard_install_backups(const std::vector<InstallRollbackEntry>& rollback_entries) {
+    for (const auto& entry : rollback_entries) {
+        if (entry.backup_full_path.empty()) continue;
+        run_command("rm -rf " + shell_quote(entry.backup_full_path));
+    }
+}
+
+bool apply_staged_install_entries(
+    const std::vector<StagedInstallEntry>& entries,
+    std::vector<InstallRollbackEntry>& rollback_entries
+) {
+    rollback_entries.clear();
+
+    for (const auto& entry : entries) {
+        std::string live_full_path = g_root_prefix + entry.path;
+
+        if (entry.is_directory) {
+            struct stat existing_st;
+            if (lstat(live_full_path.c_str(), &existing_st) == 0) {
+                if (S_ISDIR(existing_st.st_mode)) {
+                    chmod(live_full_path.c_str(), entry.mode & 07777);
+                    continue;
+                }
+                if (S_ISLNK(existing_st.st_mode)) {
+                    struct stat target_st;
+                    if (stat(live_full_path.c_str(), &target_st) == 0 && S_ISDIR(target_st.st_mode)) {
+                        continue;
+                    }
+                }
+            }
+
+            if (!mkdir_p(path_parent_dir(live_full_path))) {
+                std::cerr << "E: Failed to create parent directory for " << entry.path << std::endl;
+                return false;
+            }
+
+            bool had_existing = false;
+            if (!backup_live_path_if_present(live_full_path, entry.path, rollback_entries, &had_existing)) {
+                return false;
+            }
+
+            if (mkdir(live_full_path.c_str(), entry.mode & 07777) != 0 && errno != EEXIST) {
+                std::cerr << "E: Failed to create directory " << live_full_path << ": "
+                          << strerror(errno) << std::endl;
+                return false;
+            }
+            chmod(live_full_path.c_str(), entry.mode & 07777);
+            if (!had_existing) {
+                rollback_entries.push_back({entry.path, live_full_path, "", true});
+            }
+            continue;
+        }
+
+        if (!mkdir_p(path_parent_dir(live_full_path))) {
+            std::cerr << "E: Failed to create parent directory for " << entry.path << std::endl;
+            return false;
+        }
+
+        bool had_existing = false;
+        if (!backup_live_path_if_present(live_full_path, entry.path, rollback_entries, &had_existing)) {
+            return false;
+        }
+
+        if (entry.is_symlink) {
+            std::string temp_path = allocate_sibling_temp_path(live_full_path, "gpkg-install");
+            if (temp_path.empty()) {
+                std::cerr << "E: Failed to reserve temporary symlink path for " << entry.path << std::endl;
+                return false;
+            }
+
+            if (symlink(entry.symlink_target.c_str(), temp_path.c_str()) != 0) {
+                std::cerr << "E: Failed to stage symlink " << entry.path << ": "
+                          << strerror(errno) << std::endl;
+                unlink(temp_path.c_str());
+                return false;
+            }
+
+            if (rename(temp_path.c_str(), live_full_path.c_str()) != 0) {
+                std::cerr << "E: Failed to activate symlink " << entry.path << ": "
+                          << strerror(errno) << std::endl;
+                unlink(temp_path.c_str());
+                return false;
+            }
+        } else {
+            int temp_fd = -1;
+            std::string temp_path = allocate_sibling_temp_path(live_full_path, "gpkg-install", &temp_fd);
+            if (temp_path.empty() || temp_fd < 0) {
+                std::cerr << "E: Failed to reserve temporary file path for " << entry.path << std::endl;
+                return false;
+            }
+
+            bool copied = copy_regular_file_contents(entry.staged_path, temp_fd);
+            if (copied && fchmod(temp_fd, entry.mode & 07777) != 0) {
+                std::cerr << "E: Failed to set file mode for " << entry.path << ": "
+                          << strerror(errno) << std::endl;
+                copied = false;
+            }
+            close(temp_fd);
+
+            if (!copied) {
+                unlink(temp_path.c_str());
+                return false;
+            }
+
+            if (rename(temp_path.c_str(), live_full_path.c_str()) != 0) {
+                std::cerr << "E: Failed to activate file " << entry.path << ": "
+                          << strerror(errno) << std::endl;
+                unlink(temp_path.c_str());
+                return false;
+            }
+        }
+
+        if (!had_existing) {
+            rollback_entries.push_back({entry.path, live_full_path, "", true});
+        }
+    }
+
+    return true;
 }
 
 bool check_collisions(const std::string& pkg_name, const std::vector<std::string>& new_files) {
@@ -876,11 +1507,15 @@ bool action_install(const std::string& pkg_file) {
         return false;
     }
 
-    // 5. Extract to Root (Actual Install)
-    std::string dest = g_root_prefix.empty() ? "/" : g_root_prefix;
-    // CRITICAL FIX: --keep-directory-symlink prevents tar from replacing existing 
-    // symlinks (like /usr/lib -> lib64) with directories from the package.
-    std::string extract_cmd = "tar --keep-directory-symlink -xf " + data_tar + " -C " + dest;
+    // 5. Extract into a staging tree first, then apply entries atomically.
+    std::string payload_root = TMP_EXTRACT_PATH + "payload";
+    run_command("rm -rf " + shell_quote(payload_root));
+    if (!mkdir_p(payload_root)) {
+        std::cerr << "E: Failed to create payload staging directory." << std::endl;
+        return false;
+    }
+
+    std::string extract_cmd = "tar -xf " + data_tar + " -C " + payload_root;
     if (strip_data) extract_cmd += " --strip-components=1";
     
     if (run_command(extract_cmd) != 0) {
@@ -888,7 +1523,20 @@ bool action_install(const std::string& pkg_file) {
         return false;
     }
 
+    std::vector<StagedInstallEntry> staged_entries;
+    if (!build_staged_install_entries(new_files, payload_root, staged_entries)) {
+        return false;
+    }
+
+    std::vector<InstallRollbackEntry> install_rollback_entries;
+    if (!apply_staged_install_entries(staged_entries, install_rollback_entries)) {
+        rollback_install_changes(install_rollback_entries);
+        std::cerr << "E: Failed to apply staged filesystem changes safely." << std::endl;
+        return false;
+    }
+
     if (!finalize_preserved_config_files(preserved_configs)) {
+        rollback_install_changes(install_rollback_entries);
         return false;
     }
 
@@ -898,15 +1546,23 @@ bool action_install(const std::string& pkg_file) {
     // 6. Register in Database
     run_command("mkdir -p " + get_info_dir());
 
-    std::string list_path = get_info_dir() + pkg_name + ".list";
-    std::ofstream list_out(list_path);
+    std::ostringstream list_buffer;
     for (const auto& f : installed_files) {
-        list_out << f << "\n";
+        list_buffer << f << "\n";
     }
-    list_out.close();
+    if (!write_text_file_atomic(get_info_dir() + pkg_name + ".list", list_buffer.str(), 0644)) {
+        rollback_install_changes(install_rollback_entries);
+        std::cerr << "E: Failed to write package file manifest." << std::endl;
+        return false;
+    }
     
-    run_command("cp " + TMP_EXTRACT_PATH + "control.json " + get_info_dir() + pkg_name + ".json");
+    if (!copy_file_atomic(TMP_EXTRACT_PATH + "control.json", get_info_dir() + pkg_name + ".json")) {
+        rollback_install_changes(install_rollback_entries);
+        std::cerr << "E: Failed to write installed package metadata." << std::endl;
+        return false;
+    }
     if (!write_replaced_system_files(pkg_name, replaced_system_files)) {
+        rollback_install_changes(install_rollback_entries);
         return false;
     }
     
@@ -915,7 +1571,11 @@ bool action_install(const std::string& pkg_file) {
     for(const auto& s : scripts) {
         std::string src = TMP_EXTRACT_PATH + "scripts/" + s;
         if(access(src.c_str(), F_OK) == 0) {
-             run_command("cp " + src + " " + get_info_dir() + pkg_name + "." + s);
+             if (!copy_file_atomic(src, get_info_dir() + pkg_name + "." + s)) {
+                 rollback_install_changes(install_rollback_entries);
+                 std::cerr << "E: Failed to install maintainer script " << s << "." << std::endl;
+                 return false;
+             }
         }
     }
 
@@ -953,6 +1613,7 @@ bool action_install(const std::string& pkg_file) {
     }
 
     refresh_linker_cache_if_available();
+    discard_install_backups(install_rollback_entries);
 
     std::cout << "✓ Installed " << pkg_name << " (" << new_version << ")" << std::endl;
     

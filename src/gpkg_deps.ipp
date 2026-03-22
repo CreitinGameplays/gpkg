@@ -231,31 +231,21 @@ std::string find_provider(const std::string& capability, const std::string& op, 
     std::string result;
     PackageMetadata best_meta;
     bool found = false;
-    foreach_json_object(REPO_CACHE_PATH + "Packages.json", [&](const std::string& obj) {
-        std::vector<std::string> provides;
-        if (!get_json_array(obj, "provides", provides)) return true;
+    const auto* providers = get_repo_provider_candidates(capability, verbose);
+    if (!providers) return result;
 
-        for (const auto& provided : provides) {
-            Dependency prov_dep = parse_dependency(provided);
-            if (prov_dep.name != capability) continue;
+    Dependency requested_dep{capability, op, req_version};
+    for (const auto& provider_name : *providers) {
+        PackageMetadata candidate;
+        if (!get_repo_package_info(provider_name, candidate)) continue;
+        if (!package_metadata_satisfies_dependency(provider_name, candidate, requested_dep)) continue;
 
-            bool satisfies = op.empty() ||
-                (!prov_dep.version.empty() && version_satisfies(prov_dep.version, op, req_version));
-            if (!satisfies) continue;
-
-            PackageMetadata candidate;
-            populate_package_metadata_from_json(obj, candidate);
-            candidate.name = trim(candidate.name);
-            if (!found || should_prefer_repo_candidate(candidate, best_meta)) {
-                best_meta = candidate;
-                result = candidate.name;
-                found = true;
-            }
-            break;
+        if (!found || should_prefer_repo_candidate(candidate, best_meta)) {
+            best_meta = candidate;
+            result = candidate.name;
+            found = true;
         }
-
-        return true;
-    });
+    }
     if (found) {
         VLOG(verbose, "Found provider for " << capability
              << (op.empty() ? "" : (" (" + op + " " + req_version + ")"))
