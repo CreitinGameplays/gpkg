@@ -92,6 +92,36 @@ bool mkdir_p(const std::string& path) {
     return true;
 }
 
+std::string first_command_token(const std::string& cmd) {
+    size_t start = cmd.find_first_not_of(" \t\n\r");
+    if (start == std::string::npos) return "";
+
+    size_t end = cmd.find_first_of(" \t\n\r", start);
+    if (end == std::string::npos) return cmd.substr(start);
+    return cmd.substr(start, end - start);
+}
+
+bool is_executable_command_available(const std::string& cmd) {
+    std::string token = first_command_token(cmd);
+    if (token.empty()) return false;
+
+    if (token.find('/') != std::string::npos) {
+        return access(token.c_str(), X_OK) == 0;
+    }
+
+    const char* path_env = getenv("PATH");
+    std::string path = path_env ? path_env : "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+    std::stringstream ss(path);
+    std::string segment;
+    while (std::getline(ss, segment, ':')) {
+        if (segment.empty()) continue;
+        std::string candidate = segment + "/" + token;
+        if (access(candidate.c_str(), X_OK) == 0) return true;
+    }
+
+    return false;
+}
+
 std::set<std::string> g_pending_triggers;
 
 std::vector<std::string> read_installed_file_list(const std::string& pkg_name) {
@@ -176,6 +206,13 @@ void run_triggers(bool verbose) {
 
     std::vector<std::string> failed_triggers;
     for (const auto& cmd : g_pending_triggers) {
+        if (!is_executable_command_available(cmd)) {
+            if (verbose) {
+                std::cout << "[DEBUG] Skipping trigger because its command is unavailable: "
+                          << cmd << std::endl;
+            }
+            continue;
+        }
         if (verbose) std::cout << "[DEBUG] Running trigger: " << cmd << std::endl;
         if (run_command(cmd, verbose) != 0) {
             failed_triggers.push_back(cmd);

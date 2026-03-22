@@ -70,8 +70,13 @@ void refresh_linker_cache_if_available() {
 }
 
 bool mkdir_p(const std::string& path) {
-    std::string cmd = "mkdir -p " + path;
+    std::string cmd = "mkdir -p " + shell_quote(path);
     return run_command(cmd) == 0;
+}
+
+bool path_exists_no_follow(const std::string& path) {
+    struct stat st;
+    return lstat(path.c_str(), &st) == 0;
 }
 
 // --- Database (List File) Management ---
@@ -328,7 +333,7 @@ bool backup_replaced_system_files(const std::vector<ReplacedSystemFile>& entries
     }
 
     for (const auto& entry : entries) {
-        if (access(entry.backup_path.c_str(), F_OK) == 0) continue;
+        if (path_exists_no_follow(entry.backup_path)) continue;
 
         std::string source_path = g_root_prefix + entry.path;
         std::string parent_dir = entry.backup_path.substr(0, entry.backup_path.find_last_of('/'));
