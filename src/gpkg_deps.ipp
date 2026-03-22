@@ -165,6 +165,13 @@ bool package_metadata_satisfies_dependency(
     return false;
 }
 
+bool queued_candidate_satisfies_dependency(
+    const PackageMetadata& meta,
+    const Dependency& dep
+) {
+    return package_metadata_satisfies_dependency(meta.name, meta, dep);
+}
+
 bool find_installed_dependency_provider(
     const Dependency& dep,
     const std::set<std::string>& installed_cache,
@@ -266,10 +273,12 @@ bool resolve_dependencies(
     const std::set<std::string>& installed_cache,
     bool verbose
 ) {
+    Dependency requested_dep{pkg, op, req_version};
+
     if (visited.count(pkg)) {
         for (const auto& queued : install_queue) {
             if (queued.name != pkg) continue;
-            if (!version_satisfies(queued.version, op, req_version)) {
+            if (!queued_candidate_satisfies_dependency(queued, requested_dep)) {
                 std::cerr << Color::RED << "E: Dependency conflict! " << pkg << " " << queued.version
                           << " is queued, but " << op << " " << req_version
                           << " is required." << Color::RESET << std::endl;
@@ -283,7 +292,6 @@ bool resolve_dependencies(
     VLOG(verbose, "Resolving dependencies for: " << pkg
          << (op.empty() ? "" : (" (" + op + " " + req_version + ")")));
 
-    Dependency requested_dep{pkg, op, req_version};
     std::string provider_name;
     if (is_dependency_satisfied_locally(requested_dep, installed_cache, verbose, &provider_name)) {
         if (provider_name == SYSTEM_PROVIDES_PATH) {
@@ -330,7 +338,7 @@ bool resolve_dependencies(
         return false;
     }
 
-    if (!version_satisfies(meta.version, op, req_version)) {
+    if (!queued_candidate_satisfies_dependency(meta, requested_dep)) {
         std::cerr << Color::RED << "E: Package " << pkg << " found (v" << meta.version
                   << ") but does not meet requirements (" << op << " " << req_version
                   << ")" << Color::RESET << std::endl;

@@ -186,7 +186,7 @@ int handle_update(bool verbose) {
             continue;
         }
 
-        if (run_command("zstd -df " + dest_zst + " -o " + dest_json, verbose) != 0) {
+        if (run_command("zstd -T0 -df " + dest_zst + " -o " + dest_json, verbose) != 0) {
             std::cerr << Color::YELLOW << "W: Failed to decompress index from " << url << Color::RESET << std::endl;
             remove(dest_zst.c_str());
             continue;

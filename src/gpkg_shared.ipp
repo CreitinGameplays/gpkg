@@ -176,6 +176,17 @@ std::string truncate_progress_label(const std::string& value, size_t max_len) {
     return value.substr(0, max_len - 3) + "...";
 }
 
+size_t detected_cpu_worker_count() {
+    unsigned int count = std::thread::hardware_concurrency();
+    if (count == 0) return 1;
+    return static_cast<size_t>(count);
+}
+
+size_t recommended_parallel_worker_count(size_t task_count) {
+    if (task_count == 0) return 1;
+    return std::max<size_t>(1, std::min(task_count, detected_cpu_worker_count()));
+}
+
 std::set<std::string> g_pending_triggers;
 bool g_assume_yes = false;
 OptionalDependencyPolicy g_optional_dependency_policy;

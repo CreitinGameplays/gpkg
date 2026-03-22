@@ -361,6 +361,10 @@ std::vector<std::string> normalize_dependency_relation_value(
                 return std::string();
             }
             parsed.name = rewritten_name;
+            if (parsed.name != original_name) {
+                parsed.op.clear();
+                parsed.version.clear();
+            }
             parsed.normalized = parsed.op.empty()
                 ? parsed.name
                 : parsed.name + " (" + parsed.op + " " + parsed.version + ")";
@@ -371,13 +375,17 @@ std::vector<std::string> normalize_dependency_relation_value(
                 provider_map,
                 available_packages
             );
-            std::string effective_name = provider_name.empty() ? parsed.name : provider_name;
+            bool keep_virtual_relation = !provider_name.empty() && !parsed.op.empty();
+            std::string effective_name = keep_virtual_relation
+                ? parsed.name
+                : (provider_name.empty() ? parsed.name : provider_name);
             std::string effective_normalized = parsed.op.empty()
                 ? effective_name
                 : effective_name + " (" + parsed.op + " " + parsed.version + ")";
 
             if (matches_any_pattern(original_name, system_drop_patterns) ||
                 matches_any_pattern(parsed.name, system_drop_patterns) ||
+                matches_any_pattern(provider_name, system_drop_patterns) ||
                 matches_any_pattern(effective_name, system_drop_patterns)) {
                 dropped_as_system = true;
                 return std::string();
@@ -385,11 +393,14 @@ std::vector<std::string> normalize_dependency_relation_value(
 
             if (matches_any_pattern(original_name, dependency_skip_patterns) ||
                 matches_any_pattern(parsed.name, dependency_skip_patterns) ||
+                matches_any_pattern(provider_name, dependency_skip_patterns) ||
                 matches_any_pattern(effective_name, dependency_skip_patterns)) {
                 return std::string();
             }
 
-            if (require_exists && !available_packages.count(effective_name)) {
+            bool relation_exists = available_packages.count(effective_name) > 0 ||
+                (!provider_name.empty() && available_packages.count(provider_name) > 0);
+            if (require_exists && !relation_exists) {
                 return std::string();
             }
 

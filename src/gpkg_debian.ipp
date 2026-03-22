@@ -392,30 +392,75 @@ std::vector<PackageMetadata> load_debian_index_entries(
     std::vector<std::string> system_drop_patterns = build_system_drop_patterns(available_packages);
     auto provider_map = build_debian_provider_map(records, config.apt_arch);
 
+    const size_t worker_count = recommended_parallel_worker_count(records.size());
+    if (verbose) {
+        std::cout << "[DEBUG] Importing Debian metadata with "
+                  << worker_count << " worker(s)." << std::endl;
+    }
+
+    std::atomic<size_t> next_record{0};
+    std::vector<std::map<std::string, PackageMetadata>> worker_selected(worker_count);
+    std::vector<std::vector<std::string>> worker_skipped(worker_count);
+
+    auto worker = [&](size_t worker_index) {
+        auto& selected = worker_selected[worker_index];
+        auto& skipped = worker_skipped[worker_index];
+
+        while (true) {
+            size_t record_index = next_record.fetch_add(1);
+            if (record_index >= records.size()) return;
+
+            const auto& record = records[record_index];
+            if (record.filename.empty() || record.sha256.empty()) continue;
+            if (record.essential) {
+                if (skipped_policy) skipped.push_back(record.package + ": Essential: yes");
+                continue;
+            }
+            if (matches_any_pattern(record.package, policy.skip_packages)) {
+                if (skipped_policy) skipped.push_back(record.package + ": blocked by policy");
+                continue;
+            }
+
+            PackageMetadata meta = build_debian_package_metadata(
+                record,
+                config,
+                policy,
+                available_packages,
+                provider_map,
+                system_drop_patterns
+            );
+
+            auto it = selected.find(meta.name);
+            if (it == selected.end() || compare_versions(meta.version, it->second.version) > 0) {
+                selected[meta.name] = meta;
+            }
+        }
+    };
+
+    std::vector<std::thread> workers;
+    workers.reserve(worker_count > 0 ? worker_count - 1 : 0);
+    for (size_t worker_index = 1; worker_index < worker_count; ++worker_index) {
+        workers.emplace_back(worker, worker_index);
+    }
+    worker(0);
+    for (auto& thread : workers) {
+        thread.join();
+    }
+
     std::map<std::string, PackageMetadata> selected;
-    for (const auto& record : records) {
-        if (record.filename.empty() || record.sha256.empty()) continue;
-        if (record.essential) {
-            if (skipped_policy) skipped_policy->push_back(record.package + ": Essential: yes");
-            continue;
+    for (size_t worker_index = 0; worker_index < worker_count; ++worker_index) {
+        for (const auto& entry : worker_selected[worker_index]) {
+            auto it = selected.find(entry.first);
+            if (it == selected.end() || compare_versions(entry.second.version, it->second.version) > 0) {
+                selected[entry.first] = entry.second;
+            }
         }
-        if (matches_any_pattern(record.package, policy.skip_packages)) {
-            if (skipped_policy) skipped_policy->push_back(record.package + ": blocked by policy");
-            continue;
-        }
-
-        PackageMetadata meta = build_debian_package_metadata(
-            record,
-            config,
-            policy,
-            available_packages,
-            provider_map,
-            system_drop_patterns
-        );
-
-        auto it = selected.find(meta.name);
-        if (it == selected.end() || compare_versions(meta.version, it->second.version) > 0) {
-            selected[meta.name] = meta;
+        if (skipped_policy) {
+            skipped_policy->insert(
+                skipped_policy->end(),
+                worker_skipped[worker_index].begin(),
+                worker_skipped[worker_index].end()
+            );
         }
     }
 

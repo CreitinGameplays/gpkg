@@ -100,32 +100,56 @@ bool prepare_install_archives(
 
     std::cout << Color::CYAN << "[*] Preparing " << packages.size()
               << " package(s)..." << Color::RESET << std::endl;
-    size_t prepare_progress_width = 0;
-
-    for (size_t i = 0; i < packages.size(); ++i) {
-        if (!verbose) {
-            render_package_progress("prep", i, packages.size(), packages[i].name, &prepare_progress_width);
-        }
-        if (!download_report.results[i].success) continue;
-        std::string error;
-        if (ensure_install_archive_ready(packages[i], verbose, &error)) {
-            if (!verbose) {
-                render_package_progress("prep", i + 1, packages.size(), packages[i].name, &prepare_progress_width);
-            }
-            continue;
-        }
-
-        if (!verbose) finish_progress_line(&prepare_progress_width);
-        std::string message = packages[i].name;
-        if (!error.empty()) message += " (" + error + ")";
-        failures.push_back(message);
+    const size_t worker_count = recommended_parallel_worker_count(packages.size());
+    if (verbose) {
+        std::cout << "[DEBUG] Preparing packages with "
+                  << worker_count << " worker(s)." << std::endl;
     }
 
+    std::atomic<size_t> next_index{0};
+    std::atomic<size_t> completed_count{0};
+    std::mutex state_mutex;
+    size_t prepare_progress_width = 0;
+
+    auto worker = [&]() {
+        while (true) {
+            size_t package_index = next_index.fetch_add(1);
+            if (package_index >= packages.size()) return;
+
+            std::string error;
+            bool ok = true;
+            if (download_report.results[package_index].success) {
+                ok = ensure_install_archive_ready(packages[package_index], verbose, &error);
+            }
+
+            size_t completed = completed_count.fetch_add(1) + 1;
+            std::lock_guard<std::mutex> lock(state_mutex);
+            if (!ok) {
+                std::string message = packages[package_index].name;
+                if (!error.empty()) message += " (" + error + ")";
+                failures.push_back(message);
+            }
+            if (!verbose) {
+                render_package_progress("prep", completed, packages.size(), packages[package_index].name, &prepare_progress_width);
+            }
+        }
+    };
+
+    std::vector<std::thread> workers;
+    workers.reserve(worker_count > 0 ? worker_count - 1 : 0);
+    for (size_t worker_index = 1; worker_index < worker_count; ++worker_index) {
+        workers.emplace_back(worker);
+    }
+    worker();
+    for (auto& thread : workers) {
+        thread.join();
+    }
+
+    if (!verbose) finish_progress_line(&prepare_progress_width);
     if (!failures.empty()) return false;
 
     cleanup_converted_debian_archives(packages);
     if (!verbose) {
-        finish_progress_line(&prepare_progress_width);
         std::cout << Color::GREEN << "✓ Prepared " << packages.size()
                   << " package(s)." << Color::RESET << std::endl;
     }
