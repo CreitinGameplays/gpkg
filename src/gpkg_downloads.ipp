@@ -52,7 +52,8 @@ std::string format_total_bytes(size_t bytes) {
     return out.str();
 }
 
-std::string format_data_progress(size_t transferred, size_t estimated) {
+std::string format_data_progress(size_t transferred, size_t estimated, bool estimate_complete = true) {
+    if (!estimate_complete) return format_total_bytes(transferred) + "/?";
     if (estimated == 0) return format_total_bytes(transferred);
     return format_total_bytes(transferred) + "/" + format_total_bytes(estimated);
 }
@@ -241,6 +242,18 @@ bool fetch_package_archive(
     return fail("Failed to fetch a valid archive for " + meta.name + " from " + url + " (" + last_error + ")");
 }
 
+size_t estimate_package_archive_bytes(const PackageMetadata& meta) {
+    size_t cached_bytes = get_cached_package_bytes(meta);
+    if (cached_bytes > 0) return cached_bytes;
+
+    std::string url;
+    if (!resolve_download_url(meta, url)) return 0;
+
+    long remote_size = GetRemoteFileSize(url);
+    if (remote_size <= 0) return 0;
+    return static_cast<size_t>(remote_size);
+}
+
 DownloadBatchReport download_package_archives(
     const std::vector<PackageMetadata>& packages,
     bool verbose,
@@ -252,6 +265,8 @@ DownloadBatchReport download_package_archives(
 
     const size_t worker_count = std::max<size_t>(1, std::min(max_parallel_downloads, packages.size()));
     std::atomic<size_t> next_index{0};
+    std::atomic<size_t> next_estimate_index{0};
+    std::atomic<bool> stop_estimators{false};
     std::mutex output_mutex;
     struct ActiveDownloadState {
         bool active = false;
@@ -284,6 +299,7 @@ DownloadBatchReport download_package_archives(
         double live_speed = 0.0;
         size_t active_count = 0;
         std::string label = last_package;
+        bool all_archive_estimates_known = true;
 
         for (const auto& state : active_downloads) {
             if (!state.active || state.reused) continue;
@@ -293,8 +309,15 @@ DownloadBatchReport download_package_archives(
             if (label.empty()) label = state.name;
         }
 
+        for (size_t estimate : known_archive_estimates) {
+            if (estimate == 0) {
+                all_archive_estimates_known = false;
+                break;
+            }
+        }
+
         int percent = 0;
-        if (report.estimated_bytes > 0) {
+        if (all_archive_estimates_known && report.estimated_bytes > 0) {
             percent = static_cast<int>((live_bytes * 100) / report.estimated_bytes);
         } else {
             percent = static_cast<int>((completed_count * 100) / packages.size());
@@ -314,7 +337,7 @@ DownloadBatchReport download_package_archives(
              << "(" << completed_count << "/" << packages.size() << ")"
              << "  net:" << downloaded_count
              << "  fail:" << failed_count
-             << "  data:" << format_data_progress(live_bytes, report.estimated_bytes)
+             << "  data:" << format_data_progress(live_bytes, report.estimated_bytes, all_archive_estimates_known)
              << "  speed:" << format_batch_speed(live_speed);
         if (!label.empty()) {
             line << "  pkg:" << label;
@@ -337,6 +360,30 @@ DownloadBatchReport download_package_archives(
         std::lock_guard<std::mutex> lock(output_mutex);
         render_progress("");
     }
+
+    auto estimator = [&]() {
+        while (!stop_estimators.load()) {
+            size_t idx = next_estimate_index.fetch_add(1);
+            if (idx >= packages.size()) return;
+
+            {
+                std::lock_guard<std::mutex> lock(output_mutex);
+                if (known_archive_estimates[idx] > 0) continue;
+            }
+
+            size_t estimate = estimate_package_archive_bytes(packages[idx]);
+            if (estimate == 0) continue;
+
+            std::lock_guard<std::mutex> lock(output_mutex);
+            if (known_archive_estimates[idx] > 0) continue;
+            known_archive_estimates[idx] = estimate;
+            report.estimated_bytes += estimate;
+            if (active_downloads[idx].active) {
+                active_downloads[idx].estimated = estimate;
+            }
+            render_progress(active_downloads[idx].name.empty() ? packages[idx].name : active_downloads[idx].name);
+        }
+    };
 
     auto worker = [&]() {
         while (true) {
@@ -420,12 +467,23 @@ DownloadBatchReport download_package_archives(
         }
     };
 
+    std::vector<std::thread> estimators;
+    estimators.reserve(worker_count);
+    for (size_t i = 0; i < worker_count; ++i) {
+        estimators.emplace_back(estimator);
+    }
+
     std::vector<std::thread> workers;
     workers.reserve(worker_count);
     for (size_t i = 0; i < worker_count; ++i) {
         workers.emplace_back(worker);
     }
     for (auto& thread : workers) {
+        thread.join();
+    }
+
+    stop_estimators.store(true);
+    for (auto& thread : estimators) {
         thread.join();
     }
 
