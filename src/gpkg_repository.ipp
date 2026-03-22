@@ -303,6 +303,7 @@ int handle_show(const std::string& pkg_name, bool verbose) {
     if (!meta.debian_version.empty()) std::cout << "  Debian Ver:  " << meta.debian_version << std::endl;
     if (!meta.description.empty()) print_description_block("Description", meta.description);
     if (!meta.depends.empty()) print_wrapped_block("  Depends:     ", join_strings(meta.depends));
+    if (!meta.recommends.empty()) print_wrapped_block("  Recommends:  ", join_strings(meta.recommends));
     if (!meta.suggests.empty()) print_wrapped_block("  Suggests:    ", join_strings(meta.suggests));
     if (!meta.conflicts.empty()) print_wrapped_block("  Conflicts:   ", join_strings(meta.conflicts));
     if (!meta.provides.empty()) print_wrapped_block("  Provides:    ", join_strings(meta.provides));
@@ -367,8 +368,6 @@ int handle_add_repo(const std::string& url, bool verbose) {
 
 int handle_clean(bool verbose) {
     std::cout << "Cleaning package cache..." << std::endl;
-    run_command("rm -f " + REPO_CACHE_PATH + "*" + EXTENSION, verbose);
-    run_command("rm -f " + REPO_CACHE_PATH + "Packages.json", verbose);
-    run_command("rm -f " + REPO_CACHE_PATH + "*.zst", verbose);
+    run_command("rm -rf " + REPO_CACHE_PATH + "*", verbose);
     return 0;
 }

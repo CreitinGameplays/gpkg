@@ -138,6 +138,14 @@ std::string get_partial_package_path(const PackageMetadata& meta) {
     return get_cached_package_path(meta) + ".part";
 }
 
+size_t file_size_if_exists(const std::string& path) {
+    struct stat st;
+    if (stat(path.c_str(), &st) == 0 && st.st_size > 0) {
+        return static_cast<size_t>(st.st_size);
+    }
+    return 0;
+}
+
 size_t get_partial_package_bytes(const PackageMetadata& meta) {
     struct stat st;
     if (stat(get_partial_package_path(meta).c_str(), &st) == 0 && st.st_size > 0) {
@@ -147,11 +155,13 @@ size_t get_partial_package_bytes(const PackageMetadata& meta) {
 }
 
 size_t get_cached_package_bytes(const PackageMetadata& meta) {
-    struct stat st;
-    if (stat(get_cached_package_path(meta).c_str(), &st) == 0 && st.st_size > 0) {
-        return static_cast<size_t>(st.st_size);
+    if (package_is_debian_source(meta)) {
+        size_t deb_bytes = file_size_if_exists(get_cached_debian_archive_path(meta));
+        if (deb_bytes > 0) return deb_bytes;
+        return file_size_if_exists(get_imported_gpkg_path(meta));
     }
-    return 0;
+
+    return file_size_if_exists(get_cached_package_path(meta));
 }
 
 bool fetch_package_archive(
@@ -176,6 +186,16 @@ bool fetch_package_archive(
         }
         return false;
     };
+
+    if (package_is_debian_source(meta) &&
+        access(get_imported_gpkg_path(meta).c_str(), F_OK) == 0) {
+        if (!quiet) {
+            std::cout << "Using converted cache (" << index << "/" << total << ") "
+                      << meta.name << "..." << std::endl;
+        }
+        if (reused_out) *reused_out = true;
+        return true;
+    }
 
     if (!mkdir_parent(get_cached_package_path(meta))) {
         return fail("Failed to create cache directory for " + meta.name);

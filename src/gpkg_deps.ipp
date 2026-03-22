@@ -338,12 +338,28 @@ bool resolve_dependencies(
     }
 
     VLOG(verbose, "Found " << pkg << " in repository (version: " << meta.version << ")");
-    if (verbose && !meta.depends.empty()) {
-        VLOG(verbose, pkg << " depends on: " << join_strings(meta.depends));
+    if (verbose) {
+        if (!meta.depends.empty()) {
+            VLOG(verbose, pkg << " depends on: " << join_strings(meta.depends));
+        }
+        if (!meta.recommends.empty()) {
+            VLOG(verbose, pkg
+                 << (should_include_recommends_for_transaction(meta)
+                        ? " includes recommends: "
+                        : " skips recommends: ")
+                 << join_strings(meta.recommends));
+        }
+        if (!meta.suggests.empty()) {
+            VLOG(verbose, pkg
+                 << (should_include_suggests_for_transaction(meta)
+                        ? " includes suggests: "
+                        : " skips suggests: ")
+                 << join_strings(meta.suggests));
+        }
     }
 
     visited.insert(pkg);
-    for (const auto& dep_str : meta.depends) {
+    for (const auto& dep_str : collect_transaction_dependency_edges(meta)) {
         Dependency dep = parse_dependency(dep_str);
         if (!resolve_dependencies(dep.name, dep.op, dep.version, install_queue, visited, installed_cache, verbose)) {
             return false;

@@ -72,6 +72,17 @@ struct CommandCaptureResult {
 
 CommandCaptureResult run_command_captured(const std::string& cmd, bool verbose, const std::string& log_prefix);
 
+enum class OptionalDependencyMode {
+    Auto,
+    ForceYes,
+    ForceNo,
+};
+
+struct OptionalDependencyPolicy {
+    OptionalDependencyMode recommends = OptionalDependencyMode::Auto;
+    OptionalDependencyMode suggests = OptionalDependencyMode::Auto;
+};
+
 bool mkdir_p(const std::string& path) {
     if (path.empty()) return false;
 
@@ -167,6 +178,42 @@ std::string truncate_progress_label(const std::string& value, size_t max_len) {
 
 std::set<std::string> g_pending_triggers;
 bool g_assume_yes = false;
+OptionalDependencyPolicy g_optional_dependency_policy;
+
+bool is_optional_dependency_option(const std::string& arg) {
+    return arg == "--recommended-yes" ||
+           arg == "--recommended-no" ||
+           arg == "--suggested-yes" ||
+           arg == "--suggested-no";
+}
+
+bool is_known_cli_option(const std::string& arg) {
+    return arg == "-v" ||
+           arg == "--verbose" ||
+           arg == "-y" ||
+           arg == "--yes" ||
+           arg == "-r" ||
+           arg == "--repair" ||
+           arg == "-V" ||
+           arg == "--version" ||
+           arg == "--purge" ||
+           is_optional_dependency_option(arg);
+}
+
+std::vector<std::string> collect_cli_operands(int argc, char* argv[], int start_index = 2) {
+    std::vector<std::string> operands;
+    for (int i = start_index; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (is_known_cli_option(arg)) continue;
+        operands.push_back(arg);
+    }
+    return operands;
+}
+
+std::string first_cli_operand(int argc, char* argv[], int start_index = 2) {
+    auto operands = collect_cli_operands(argc, argv, start_index);
+    return operands.empty() ? "" : operands.front();
+}
 
 std::vector<std::string> read_installed_file_list(const std::string& pkg_name) {
     std::vector<std::string> files;
@@ -362,6 +409,77 @@ struct PackageMetadata {
     std::vector<std::string> conflicts;
     std::vector<std::string> provides;
 };
+
+bool package_scope_contains(const std::string& scope, const std::string& token) {
+    if (scope.empty() || token.empty()) return false;
+
+    std::string current;
+    std::vector<std::string> parts;
+    for (char ch : scope) {
+        if (ch == '+') {
+            if (!current.empty()) parts.push_back(current);
+            current.clear();
+            continue;
+        }
+        current += ch;
+    }
+    if (!current.empty()) parts.push_back(current);
+    return std::find(parts.begin(), parts.end(), token) != parts.end();
+}
+
+std::string describe_optional_dependency_mode(OptionalDependencyMode mode) {
+    switch (mode) {
+        case OptionalDependencyMode::ForceYes:
+            return "yes";
+        case OptionalDependencyMode::ForceNo:
+            return "no";
+        case OptionalDependencyMode::Auto:
+        default:
+            return "auto";
+    }
+}
+
+bool should_include_optional_group(
+    OptionalDependencyMode mode,
+    const PackageMetadata& meta,
+    const std::string& token
+) {
+    if (mode == OptionalDependencyMode::ForceYes) return true;
+    if (mode == OptionalDependencyMode::ForceNo) return false;
+    return package_scope_contains(meta.package_scope, token);
+}
+
+bool should_include_recommends_for_transaction(const PackageMetadata& meta) {
+    return should_include_optional_group(g_optional_dependency_policy.recommends, meta, "recommends");
+}
+
+bool should_include_suggests_for_transaction(const PackageMetadata& meta) {
+    return should_include_optional_group(g_optional_dependency_policy.suggests, meta, "suggests");
+}
+
+std::vector<std::string> collect_transaction_dependency_edges(const PackageMetadata& meta) {
+    std::vector<std::string> edges = meta.depends;
+    if (should_include_recommends_for_transaction(meta)) {
+        edges.insert(edges.end(), meta.recommends.begin(), meta.recommends.end());
+    }
+    if (should_include_suggests_for_transaction(meta)) {
+        edges.insert(edges.end(), meta.suggests.begin(), meta.suggests.end());
+    }
+
+    std::vector<std::string> unique;
+    std::set<std::string> seen;
+    for (const auto& edge : edges) {
+        if (seen.insert(edge).second) unique.push_back(edge);
+    }
+    return unique;
+}
+
+std::string describe_optional_dependency_policy() {
+    std::ostringstream out;
+    out << "recommends=" << describe_optional_dependency_mode(g_optional_dependency_policy.recommends)
+        << ", suggests=" << describe_optional_dependency_mode(g_optional_dependency_policy.suggests);
+    return out.str();
+}
 
 std::string cache_safe_component(const std::string& value) {
     std::string safe;

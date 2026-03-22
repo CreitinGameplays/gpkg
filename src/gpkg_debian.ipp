@@ -1,5 +1,10 @@
 // Debian sid backend: config loading, metadata import, and .deb to .gpkg conversion.
 
+#include <cstdint>
+#include <lzma.h>
+#include <zlib.h>
+#include <zstd.h>
+
 struct DebianBackendConfig {
     std::string packages_url = "https://deb.debian.org/debian/dists/sid/main/binary-amd64/Packages.gz";
     std::string base_url = "https://deb.debian.org/debian";
@@ -266,6 +271,26 @@ std::map<std::string, std::vector<std::string>> build_debian_provider_map(
     return providers;
 }
 
+std::vector<std::string> apply_dependency_removals(
+    const std::vector<std::string>& dependencies,
+    const PackageOverridePolicy& package_override
+) {
+    std::vector<std::string> filtered = unique_string_list(dependencies);
+    if (package_override.depends_remove.empty()) return filtered;
+
+    std::vector<std::string> result;
+    for (const auto& dep : filtered) {
+        if (std::find(
+                package_override.depends_remove.begin(),
+                package_override.depends_remove.end(),
+                dep
+            ) == package_override.depends_remove.end()) {
+            result.push_back(dep);
+        }
+    }
+    return result;
+}
+
 PackageMetadata build_debian_package_metadata(
     const DebianPackageRecord& record,
     const DebianBackendConfig& config,
@@ -283,39 +308,51 @@ PackageMetadata build_debian_package_metadata(
     bool include_recommends = true;
     if (package_override.has_include_recommends) include_recommends = package_override.include_recommends;
 
-    std::string dependency_text;
-    if (!record.pre_depends_raw.empty()) dependency_text += record.pre_depends_raw;
+    std::string required_dependency_text;
+    if (!record.pre_depends_raw.empty()) required_dependency_text += record.pre_depends_raw;
     if (!record.depends_raw.empty()) {
-        if (!dependency_text.empty()) dependency_text += ", ";
-        dependency_text += record.depends_raw;
-    }
-    if (include_recommends && !record.recommends_raw.empty()) {
-        if (!dependency_text.empty()) dependency_text += ", ";
-        dependency_text += record.recommends_raw;
+        if (!required_dependency_text.empty()) required_dependency_text += ", ";
+        required_dependency_text += record.depends_raw;
     }
 
     std::vector<std::string> depends = normalize_dependency_relation_value(
-        dependency_text,
+        required_dependency_text,
         record.package,
         config.apt_arch,
-        include_recommends,
+        false,
         policy,
         available_packages,
         provider_map,
         system_drop_patterns
     );
     for (const auto& dep : package_override.depends_add) depends.push_back(dep);
-    depends = unique_string_list(depends);
-    if (!package_override.depends_remove.empty()) {
-        std::vector<std::string> filtered;
-        for (const auto& dep : depends) {
-            if (std::find(package_override.depends_remove.begin(), package_override.depends_remove.end(), dep) ==
-                package_override.depends_remove.end()) {
-                filtered.push_back(dep);
-            }
-        }
-        depends.swap(filtered);
-    }
+    depends = apply_dependency_removals(depends, package_override);
+    std::vector<std::string> recommends = apply_dependency_removals(
+        normalize_dependency_relation_value(
+            record.recommends_raw,
+            record.package,
+            config.apt_arch,
+            false,
+            policy,
+            available_packages,
+            provider_map,
+            system_drop_patterns
+        ),
+        package_override
+    );
+    std::vector<std::string> suggests = apply_dependency_removals(
+        normalize_dependency_relation_value(
+            record.suggests_raw,
+            record.package,
+            config.apt_arch,
+            false,
+            policy,
+            available_packages,
+            provider_map,
+            system_drop_patterns
+        ),
+        package_override
+    );
 
     meta.name = package_name;
     meta.version = record.version;
@@ -332,10 +369,8 @@ PackageMetadata build_debian_package_metadata(
     meta.priority = record.priority;
     meta.size = record.size;
     meta.depends = depends;
-    meta.recommends = include_recommends
-        ? normalize_relation_field_value(record.recommends_raw, config.apt_arch)
-        : std::vector<std::string>{};
-    meta.suggests = normalize_relation_field_value(record.suggests_raw, config.apt_arch);
+    meta.recommends = recommends;
+    meta.suggests = suggests;
     meta.conflicts = normalize_relation_field_value(record.conflicts_raw, config.apt_arch);
     meta.provides = normalize_relation_field_value(record.provides_raw, config.apt_arch);
     meta.package_scope = include_recommends ? "depends+recommends" : "depends";
@@ -472,6 +507,270 @@ bool locate_deb_data_archive(const std::string& directory, std::string& out_path
     return false;
 }
 
+bool path_has_suffix(const std::string& path, const std::string& suffix) {
+    return path.size() >= suffix.size() &&
+           path.compare(path.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+std::string lzma_error_string(lzma_ret ret) {
+    switch (ret) {
+        case LZMA_OK:
+            return "ok";
+        case LZMA_STREAM_END:
+            return "stream end";
+        case LZMA_MEM_ERROR:
+            return "out of memory";
+        case LZMA_FORMAT_ERROR:
+            return "input is not a valid .xz/.lzma stream";
+        case LZMA_OPTIONS_ERROR:
+            return "unsupported compression options";
+        case LZMA_DATA_ERROR:
+            return "corrupt compressed data";
+        case LZMA_BUF_ERROR:
+            return "truncated compressed data";
+        default:
+            return "liblzma error";
+    }
+}
+
+bool decompress_xz_file(
+    const std::string& input_path,
+    const std::string& output_path,
+    std::string* error_out = nullptr
+) {
+    if (error_out) error_out->clear();
+
+    std::ifstream input(input_path, std::ios::binary);
+    if (!input) {
+        if (error_out) *error_out = "could not open compressed archive";
+        return false;
+    }
+
+    std::ofstream output(output_path, std::ios::binary);
+    if (!output) {
+        if (error_out) *error_out = "could not open decompression target";
+        return false;
+    }
+
+    lzma_stream stream = LZMA_STREAM_INIT;
+    lzma_ret init_ret = lzma_auto_decoder(&stream, UINT64_MAX, LZMA_CONCATENATED);
+    if (init_ret != LZMA_OK) {
+        if (error_out) *error_out = lzma_error_string(init_ret);
+        return false;
+    }
+
+    bool success = false;
+    bool input_finished = false;
+    uint8_t input_buffer[32768];
+    uint8_t output_buffer[32768];
+
+    while (true) {
+        if (stream.avail_in == 0 && !input_finished) {
+            input.read(reinterpret_cast<char*>(input_buffer), sizeof(input_buffer));
+            stream.next_in = input_buffer;
+            stream.avail_in = static_cast<size_t>(input.gcount());
+            if (input.bad()) {
+                if (error_out) *error_out = "failed while reading compressed archive";
+                break;
+            }
+            input_finished = input.eof();
+        }
+
+        stream.next_out = output_buffer;
+        stream.avail_out = sizeof(output_buffer);
+        lzma_ret ret = lzma_code(&stream, input_finished ? LZMA_FINISH : LZMA_RUN);
+
+        size_t produced = sizeof(output_buffer) - stream.avail_out;
+        if (produced > 0) {
+            output.write(reinterpret_cast<const char*>(output_buffer), produced);
+            if (!output) {
+                if (error_out) *error_out = "failed while writing decompressed archive";
+                break;
+            }
+        }
+
+        if (ret == LZMA_STREAM_END) {
+            success = true;
+            break;
+        }
+        if (ret != LZMA_OK) {
+            if (error_out) *error_out = lzma_error_string(ret);
+            break;
+        }
+        if (input_finished && stream.avail_in == 0 && produced == 0) {
+            if (error_out) *error_out = "truncated compressed archive";
+            break;
+        }
+    }
+
+    lzma_end(&stream);
+    return success;
+}
+
+bool decompress_gzip_file(
+    const std::string& input_path,
+    const std::string& output_path,
+    std::string* error_out = nullptr
+) {
+    if (error_out) error_out->clear();
+
+    gzFile input = gzopen(input_path.c_str(), "rb");
+    if (!input) {
+        if (error_out) *error_out = "could not open gzip archive";
+        return false;
+    }
+
+    std::ofstream output(output_path, std::ios::binary);
+    if (!output) {
+        gzclose(input);
+        if (error_out) *error_out = "could not open decompression target";
+        return false;
+    }
+
+    char buffer[32768];
+    int bytes_read = 0;
+    while ((bytes_read = gzread(input, buffer, sizeof(buffer))) > 0) {
+        output.write(buffer, bytes_read);
+        if (!output) {
+            gzclose(input);
+            if (error_out) *error_out = "failed while writing decompressed archive";
+            return false;
+        }
+    }
+
+    if (bytes_read < 0) {
+        int errnum = Z_OK;
+        const char* message = gzerror(input, &errnum);
+        gzclose(input);
+        if (error_out) {
+            *error_out = (message && *message) ? message : "gzip decompression failed";
+        }
+        return false;
+    }
+
+    gzclose(input);
+    return true;
+}
+
+bool decompress_zstd_file(
+    const std::string& input_path,
+    const std::string& output_path,
+    std::string* error_out = nullptr
+) {
+    if (error_out) error_out->clear();
+
+    std::ifstream input(input_path, std::ios::binary);
+    if (!input) {
+        if (error_out) *error_out = "could not open zstd archive";
+        return false;
+    }
+
+    std::ofstream output(output_path, std::ios::binary);
+    if (!output) {
+        if (error_out) *error_out = "could not open decompression target";
+        return false;
+    }
+
+    ZSTD_DStream* stream = ZSTD_createDStream();
+    if (!stream) {
+        if (error_out) *error_out = "could not allocate zstd decompressor";
+        return false;
+    }
+
+    size_t init_ret = ZSTD_initDStream(stream);
+    if (ZSTD_isError(init_ret)) {
+        if (error_out) *error_out = ZSTD_getErrorName(init_ret);
+        ZSTD_freeDStream(stream);
+        return false;
+    }
+
+    char input_buffer[32768];
+    char output_buffer[32768];
+    size_t last_ret = 1;
+
+    while (input.read(input_buffer, sizeof(input_buffer)) || input.gcount() > 0) {
+        ZSTD_inBuffer in_buffer = {
+            input_buffer,
+            static_cast<size_t>(input.gcount()),
+            0
+        };
+
+        while (in_buffer.pos < in_buffer.size) {
+            ZSTD_outBuffer out_buffer = {output_buffer, sizeof(output_buffer), 0};
+            last_ret = ZSTD_decompressStream(stream, &out_buffer, &in_buffer);
+            if (ZSTD_isError(last_ret)) {
+                if (error_out) *error_out = ZSTD_getErrorName(last_ret);
+                ZSTD_freeDStream(stream);
+                return false;
+            }
+            if (out_buffer.pos > 0) {
+                output.write(output_buffer, out_buffer.pos);
+                if (!output) {
+                    if (error_out) *error_out = "failed while writing decompressed archive";
+                    ZSTD_freeDStream(stream);
+                    return false;
+                }
+            }
+        }
+    }
+
+    ZSTD_freeDStream(stream);
+    if (!input.eof()) {
+        if (error_out) *error_out = "failed while reading compressed archive";
+        return false;
+    }
+    if (last_ret != 0) {
+        if (error_out) *error_out = "truncated compressed archive";
+        return false;
+    }
+    return true;
+}
+
+bool materialize_deb_payload_tar(
+    const std::string& archive_path,
+    const std::string& temp_root,
+    std::string& tar_path_out,
+    std::string* error_out = nullptr
+) {
+    if (error_out) error_out->clear();
+
+    tar_path_out = temp_root + "/data.tar";
+    if (path_has_suffix(archive_path, ".tar")) {
+        std::ifstream input(archive_path, std::ios::binary);
+        std::ofstream output(tar_path_out, std::ios::binary);
+        if (!input || !output) {
+            if (error_out) *error_out = "could not copy uncompressed payload tar";
+            return false;
+        }
+
+        char buffer[32768];
+        while (input.read(buffer, sizeof(buffer)) || input.gcount() > 0) {
+            output.write(buffer, input.gcount());
+            if (!output) {
+                if (error_out) *error_out = "failed while copying payload tar";
+                return false;
+            }
+        }
+        if (!input.eof()) {
+            if (error_out) *error_out = "failed while reading payload tar";
+            return false;
+        }
+        return true;
+    }
+    if (path_has_suffix(archive_path, ".tar.gz") || path_has_suffix(archive_path, ".tgz")) {
+        return decompress_gzip_file(archive_path, tar_path_out, error_out);
+    }
+    if (path_has_suffix(archive_path, ".tar.xz") || path_has_suffix(archive_path, ".tar.lzma")) {
+        return decompress_xz_file(archive_path, tar_path_out, error_out);
+    }
+    if (path_has_suffix(archive_path, ".tar.zst") || path_has_suffix(archive_path, ".tar.zstd")) {
+        return decompress_zstd_file(archive_path, tar_path_out, error_out);
+    }
+
+    if (error_out) *error_out = "unsupported Debian payload compression";
+    return false;
+}
+
 bool write_imported_control_json(const PackageMetadata& meta, const std::string& control_path) {
     if (!mkdir_parent(control_path)) return false;
     std::ofstream out(control_path);
@@ -480,14 +779,42 @@ bool write_imported_control_json(const PackageMetadata& meta, const std::string&
     return true;
 }
 
+bool run_quiet_import_command(
+    const std::string& cmd,
+    const std::string& log_prefix,
+    std::string* failure_log_out = nullptr
+) {
+    if (failure_log_out) failure_log_out->clear();
+
+    CommandCaptureResult result = run_command_captured(cmd, false, log_prefix);
+    if (result.exit_code == 0) {
+        if (!result.log_path.empty()) unlink(result.log_path.c_str());
+        return true;
+    }
+
+    if (failure_log_out) *failure_log_out = result.log_path;
+    return false;
+}
+
+std::string format_import_failure_hint(const std::string& log_path) {
+    if (log_path.empty()) return "";
+    return " (see " + log_path + ")";
+}
+
 bool build_imported_gpkg_archive(
     const PackageMetadata& meta,
     const std::string& payload_root,
     const std::string& output_path,
     bool verbose
 ) {
+    (void)verbose;
+
     if (access(output_path.c_str(), F_OK) == 0) return true;
-    if (!mkdir_parent(output_path)) return false;
+    if (!mkdir_parent(output_path)) {
+        std::cerr << Color::RED << "E: Failed to create converted package cache directory for "
+                  << meta.name << Color::RESET << std::endl;
+        return false;
+    }
 
     char temp_template[] = "/tmp/gpkg-import-build-XXXXXX";
     char* temp_dir = mkdtemp(temp_template);
@@ -499,39 +826,58 @@ bool build_imported_gpkg_archive(
     std::string final_tar = temp_root + "/package.tar";
 
     if (!write_imported_control_json(meta, control_json)) {
+        std::cerr << Color::RED << "E: Failed to write converted package metadata for "
+                  << meta.name << Color::RESET << std::endl;
         run_command("rm -rf " + shell_quote(temp_root), false);
         return false;
     }
 
     std::string tar_data_cmd = "tar -cf " + shell_quote(data_tar)
         + " -C " + shell_quote(payload_root) + " .";
-    if (run_command(tar_data_cmd, verbose) != 0) {
+    std::string failure_log;
+    if (!run_quiet_import_command(tar_data_cmd, "gpkg-import-build", &failure_log)) {
+        std::cerr << Color::RED << "E: Failed to stage the converted payload for "
+                  << meta.name << format_import_failure_hint(failure_log)
+                  << Color::RESET << std::endl;
         run_command("rm -rf " + shell_quote(temp_root), false);
         return false;
     }
 
     std::string zstd_data_cmd = "zstd -T0 -f -10 --quiet "
         + shell_quote(data_tar) + " -o " + shell_quote(data_tar_zst);
-    if (run_command(zstd_data_cmd, verbose) != 0) {
+    if (!run_quiet_import_command(zstd_data_cmd, "gpkg-import-build", &failure_log)) {
+        std::cerr << Color::RED << "E: Failed to compress the converted payload for "
+                  << meta.name << format_import_failure_hint(failure_log)
+                  << Color::RESET << std::endl;
         run_command("rm -rf " + shell_quote(temp_root), false);
         return false;
     }
 
     std::string build_tar_cmd = "tar -cf " + shell_quote(final_tar)
         + " -C " + shell_quote(temp_root) + " control.json data.tar.zst";
-    if (run_command(build_tar_cmd, verbose) != 0) {
+    if (!run_quiet_import_command(build_tar_cmd, "gpkg-import-build", &failure_log)) {
+        std::cerr << Color::RED << "E: Failed to assemble the converted package for "
+                  << meta.name << format_import_failure_hint(failure_log)
+                  << Color::RESET << std::endl;
         run_command("rm -rf " + shell_quote(temp_root), false);
         return false;
     }
 
     std::string final_cmd = "zstd -T0 -f -10 --quiet "
         + shell_quote(final_tar) + " -o " + shell_quote(output_path);
-    bool ok = run_command(final_cmd, verbose) == 0;
+    bool ok = run_quiet_import_command(final_cmd, "gpkg-import-build", &failure_log);
+    if (!ok) {
+        std::cerr << Color::RED << "E: Failed to write the converted package cache entry for "
+                  << meta.name << format_import_failure_hint(failure_log)
+                  << Color::RESET << std::endl;
+    }
     run_command("rm -rf " + shell_quote(temp_root), false);
     return ok;
 }
 
 bool convert_debian_archive_to_gpkg(const PackageMetadata& meta, bool verbose, std::string* out_path = nullptr) {
+    (void)verbose;
+
     std::string output_path = get_imported_gpkg_path(meta);
     if (out_path) *out_path = output_path;
     if (access(output_path.c_str(), F_OK) == 0) return true;
@@ -548,7 +894,11 @@ bool convert_debian_archive_to_gpkg(const PackageMetadata& meta, bool verbose, s
     if (!temp_dir) return false;
     std::string temp_root = temp_dir;
     std::string unpack_cmd = "cd " + shell_quote(temp_root) + " && ar x " + shell_quote(deb_path);
-    if (run_command(unpack_cmd, verbose) != 0) {
+    std::string failure_log;
+    if (!run_quiet_import_command(unpack_cmd, "gpkg-deb-import", &failure_log)) {
+        std::cerr << Color::RED << "E: Failed to unpack the Debian archive for "
+                  << meta.name << format_import_failure_hint(failure_log)
+                  << Color::RESET << std::endl;
         run_command("rm -rf " + shell_quote(temp_root), false);
         return false;
     }
@@ -566,11 +916,22 @@ bool convert_debian_archive_to_gpkg(const PackageMetadata& meta, bool verbose, s
         return false;
     }
 
-    std::string extract_cmd = "tar -xf " + shell_quote(data_archive)
+    std::string payload_tar;
+    std::string materialize_error;
+    if (!materialize_deb_payload_tar(data_archive, temp_root, payload_tar, &materialize_error)) {
+        std::cerr << Color::RED << "E: Failed to prepare Debian payload for " << meta.name;
+        if (!materialize_error.empty()) std::cerr << ": " << materialize_error;
+        std::cerr << Color::RESET << std::endl;
+        run_command("rm -rf " + shell_quote(temp_root), false);
+        return false;
+    }
+
+    std::string extract_cmd = "tar -xf " + shell_quote(payload_tar)
         + " -C " + shell_quote(payload_root);
-    if (run_command(extract_cmd, verbose) != 0) {
-        std::cerr << Color::RED << "E: Failed to extract Debian payload for " << meta.name
-                  << ". Unsupported compression format?" << Color::RESET << std::endl;
+    if (!run_quiet_import_command(extract_cmd, "gpkg-deb-import", &failure_log)) {
+        std::cerr << Color::RED << "E: Failed to extract the prepared Debian payload tar for "
+                  << meta.name << format_import_failure_hint(failure_log)
+                  << Color::RESET << std::endl;
         run_command("rm -rf " + shell_quote(temp_root), false);
         return false;
     }

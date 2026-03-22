@@ -77,6 +77,18 @@ bool ensure_install_archive_ready(const PackageMetadata& meta, bool verbose, std
     return false;
 }
 
+void cleanup_converted_debian_archives(const std::vector<PackageMetadata>& packages) {
+    for (const auto& meta : packages) {
+        if (!package_is_debian_source(meta)) continue;
+        if (access(get_imported_gpkg_path(meta).c_str(), F_OK) != 0) continue;
+
+        std::string deb_path = get_cached_debian_archive_path(meta);
+        if (access(deb_path.c_str(), F_OK) == 0) {
+            unlink(deb_path.c_str());
+        }
+    }
+}
+
 bool prepare_install_archives(
     const std::vector<PackageMetadata>& packages,
     const DownloadBatchReport& download_report,
@@ -84,14 +96,38 @@ bool prepare_install_archives(
     std::vector<std::string>& failures
 ) {
     failures.clear();
+    if (packages.empty()) return true;
+
+    std::cout << Color::CYAN << "[*] Preparing " << packages.size()
+              << " package(s)..." << Color::RESET << std::endl;
+    size_t prepare_progress_width = 0;
+
     for (size_t i = 0; i < packages.size(); ++i) {
+        if (!verbose) {
+            render_package_progress("prep", i, packages.size(), packages[i].name, &prepare_progress_width);
+        }
         if (!download_report.results[i].success) continue;
         std::string error;
-        if (ensure_install_archive_ready(packages[i], verbose, &error)) continue;
+        if (ensure_install_archive_ready(packages[i], verbose, &error)) {
+            if (!verbose) {
+                render_package_progress("prep", i + 1, packages.size(), packages[i].name, &prepare_progress_width);
+            }
+            continue;
+        }
 
+        if (!verbose) finish_progress_line(&prepare_progress_width);
         std::string message = packages[i].name;
         if (!error.empty()) message += " (" + error + ")";
         failures.push_back(message);
+    }
+
+    if (!failures.empty()) return false;
+
+    cleanup_converted_debian_archives(packages);
+    if (!verbose) {
+        finish_progress_line(&prepare_progress_width);
+        std::cout << Color::GREEN << "✓ Prepared " << packages.size()
+                  << " package(s)." << Color::RESET << std::endl;
     }
     return failures.empty();
 }
@@ -345,7 +381,7 @@ bool queue_upgrade_target(
         }
     }
 
-    for (const auto& dep_str : meta.depends) {
+    for (const auto& dep_str : collect_transaction_dependency_edges(meta)) {
         Dependency dep = parse_dependency(dep_str);
         if (!resolve_dependencies(
                 dep.name,
@@ -407,7 +443,7 @@ RepairInspection inspect_repair_state(bool verbose) {
             }
             needs_reinstall = true;
         } else {
-            for (const auto& dep_str : installed_meta.depends) {
+            for (const auto& dep_str : collect_transaction_dependency_edges(installed_meta)) {
                 Dependency dep = parse_dependency(dep_str);
                 std::string provider_name;
                 if (is_dependency_satisfied_locally(dep, installed_cache, verbose, &provider_name)) continue;
@@ -481,6 +517,7 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
     if (!ensure_repo_index_available()) return 1;
 
     std::cout << "Reading package lists..." << std::endl;
+    std::cout << "Optional dependency policy: " << describe_optional_dependency_policy() << std::endl;
     VLOG(verbose, "Checking " << installed_cache.size() << " installed packages and upgradeable base runtimes.");
 
     std::vector<PackageMetadata> upgrade_queue;
@@ -656,6 +693,7 @@ int handle_repair(bool verbose) {
     if (!ensure_repo_index_available()) return 1;
 
     std::cout << "Inspecting installed packages..." << std::endl;
+    std::cout << "Optional dependency policy: " << describe_optional_dependency_policy() << std::endl;
     RepairInspection inspection = inspect_repair_state(verbose);
 
     if (inspection.detected_issues.empty()) {
@@ -819,14 +857,18 @@ int handle_repair(bool verbose) {
 int handle_install(int argc, char* argv[], const std::set<std::string>& installed_cache, bool verbose) {
     std::vector<PackageMetadata> install_queue;
     std::vector<std::string> local_files;
+    std::vector<std::string> operands = collect_cli_operands(argc, argv, 2);
     std::set<std::string> visited;
     bool needs_repo_index = false;
 
-    std::cout << "Resolving dependencies..." << std::endl;
-    for (int i = 2; i < argc; ++i) {
-        std::string arg = trim(argv[i]);
-        if (arg == "-v" || arg == "--verbose" || arg == "-y" || arg == "--yes") continue;
+    if (operands.empty()) {
+        std::cerr << "Usage: gpkg install <package_name> [options]" << std::endl;
+        return 1;
+    }
 
+    std::cout << "Resolving dependencies..." << std::endl;
+    std::cout << "Optional dependency policy: " << describe_optional_dependency_policy() << std::endl;
+    for (const auto& arg : operands) {
         if (arg.length() > 5 && arg.substr(arg.length() - 5) == ".gpkg" && access(arg.c_str(), F_OK) == 0) {
             local_files.push_back(arg);
         } else {
@@ -836,9 +878,7 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
 
     if (needs_repo_index && !ensure_repo_index_available()) return 1;
 
-    for (int i = 2; i < argc; ++i) {
-        std::string arg = trim(argv[i]);
-        if (arg == "-v" || arg == "--verbose" || arg == "-y" || arg == "--yes") continue;
+    for (const auto& arg : operands) {
         if (arg.length() > 5 && arg.substr(arg.length() - 5) == ".gpkg" && access(arg.c_str(), F_OK) == 0) {
             continue;
         }
@@ -947,19 +987,16 @@ int handle_remove(int argc, char* argv[], bool verbose, bool purge) {
         return 1;
     }
 
-    std::string target_pkg;
-    for (int i = 2; i < argc; ++i) {
-        std::string arg = argv[i];
-        if (arg != "--purge" && arg != "-v" && arg != "--verbose" && arg != "-y" && arg != "--yes") {
-            target_pkg = arg;
-            break;
-        }
-    }
-
-    if (target_pkg.empty()) {
+    std::vector<std::string> operands = collect_cli_operands(argc, argv, 2);
+    if (operands.empty()) {
         std::cerr << "E: No package specified for removal." << std::endl;
         return 1;
     }
+    if (operands.size() > 1) {
+        std::cerr << "E: gpkg remove currently supports one package at a time." << std::endl;
+        return 1;
+    }
+    std::string target_pkg = operands.front();
 
     if (!is_installed(target_pkg)) {
         std::cerr << Color::RED << "E: Package '" << target_pkg << "' is not installed."

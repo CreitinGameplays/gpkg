@@ -9,6 +9,11 @@ ROOTFS ?=
 TARGET_CXX_VERSION := $(shell find $(ROOTFS)/usr/include/c++ -maxdepth 1 -mindepth 1 -type d -printf '%f\n' 2>/dev/null | grep -E '^[0-9]+$$' | sort -V | tail -n1)
 GPKG_VERSION ?=
 GPKG_CODENAME ?=
+LZMA_STATIC := $(firstword \
+	$(wildcard $(ROOTFS)/usr/lib64/x86_64-linux-gnu/liblzma.a) \
+	$(wildcard $(ROOTFS)/usr/lib64/liblzma.a) \
+	$(wildcard $(PROJECT_ROOT)/rootfs/usr/lib64/x86_64-linux-gnu/liblzma.a) \
+	$(wildcard $(PROJECT_ROOT)/rootfs/usr/lib64/liblzma.a))
 ifeq ($(strip $(GPKG_VERSION)),)
 GPKG_VERSION := $(shell awk '$$2 == "OS_VERSION" { gsub(/"/, "", $$3); print $$3; exit }' $(SYS_INFO_HEADER))
 endif
@@ -25,6 +30,11 @@ CXXFLAGS += -isystem $(ROOTFS)/usr/include/x86_64-linux-gnu/c++/$(TARGET_CXX_VER
 CXXFLAGS += -isystem $(ROOTFS)/usr/include/c++/$(TARGET_CXX_VERSION)/backward
 endif
 GPKG_LDFLAGS = -L$(GINIT_DIR)/lib -lgemcore -lssl -lcrypto -lz -lzstd -ldl -lpthread -lcrypt
+ifeq ($(strip $(LZMA_STATIC)),)
+GPKG_LDFLAGS += -llzma
+else
+GPKG_LDFLAGS += $(LZMA_STATIC)
+endif
 WORKER_LDFLAGS = -lssl -lcrypto -lz -lzstd -ldl -lpthread
 ifneq ($(strip $(TARGET_CXX_VERSION)),)
 GPKG_LDFLAGS += $(ROOTFS)/lib64/ld-linux-x86-64.so.2
