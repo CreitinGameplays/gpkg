@@ -512,7 +512,7 @@ bool update_debian_backend_index(
         ++total_packages;
     }
 
-    std::cout << Color::GREEN << "✓ Updated Debian sid index"
+    std::cout << Color::GREEN << "✓ Updated package index"
               << " (" << entries.size() << " packages)" << Color::RESET << std::endl;
     return true;
 }
