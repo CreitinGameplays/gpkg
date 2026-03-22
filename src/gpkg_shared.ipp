@@ -94,6 +94,21 @@ bool mkdir_p(const std::string& path) {
 
 std::set<std::string> g_pending_triggers;
 
+std::vector<std::string> read_installed_file_list(const std::string& pkg_name) {
+    std::vector<std::string> files;
+    std::ifstream in(INFO_DIR + pkg_name + ".list");
+    if (!in) return files;
+
+    std::string line;
+    while (std::getline(in, line)) {
+        size_t first = line.find_first_not_of(" \t\n\r");
+        if (first == std::string::npos) continue;
+        size_t last = line.find_last_not_of(" \t\n\r");
+        files.push_back(line.substr(first, last - first + 1));
+    }
+    return files;
+}
+
 void release_lock(bool verbose) {
     if (verbose) std::cout << "[DEBUG] Releasing lock: " << LOCK_FILE << std::endl;
     unlink(LOCK_FILE.c_str());
@@ -149,15 +164,34 @@ void check_triggers(const std::vector<std::string>& files) {
     }
 }
 
+void queue_triggers_for_package(const std::string& pkg_name) {
+    check_triggers(read_installed_file_list(pkg_name));
+}
+
 void run_triggers(bool verbose) {
     if (g_pending_triggers.empty()) return;
 
     std::cout << Color::CYAN << "Processing triggers..." << Color::RESET << std::endl;
     if (verbose) std::cout << "[DEBUG] " << g_pending_triggers.size() << " triggers pending." << std::endl;
 
+    std::vector<std::string> failed_triggers;
     for (const auto& cmd : g_pending_triggers) {
         if (verbose) std::cout << "[DEBUG] Running trigger: " << cmd << std::endl;
-        run_command(cmd, verbose);
+        if (run_command(cmd, verbose) != 0) {
+            failed_triggers.push_back(cmd);
+        }
+    }
+    g_pending_triggers.clear();
+
+    if (!failed_triggers.empty()) {
+        std::ostringstream joined;
+        for (size_t i = 0; i < failed_triggers.size(); ++i) {
+            if (i > 0) joined << ", ";
+            joined << failed_triggers[i];
+        }
+        std::cerr << Color::RED
+                  << "E: Trigger processing failed for: " << joined.str()
+                  << Color::RESET << std::endl;
     }
 }
 

@@ -63,6 +63,17 @@ InstallCommandResult install_package_v2(const std::string& pkg_name, bool verbos
     return install_package_from_file(get_cached_package_path(meta), verbose);
 }
 
+std::string read_package_name_from_archive(const std::string& pkg_file) {
+    std::string control_json = get_command_output(
+        "zstd -dc " + shell_quote(pkg_file) + " | tar -xOf - control.json 2>/dev/null"
+    );
+    if (control_json.empty()) return "";
+
+    std::string pkg_name;
+    if (!get_json_value(control_json, "package", pkg_name)) return "";
+    return pkg_name;
+}
+
 bool is_required_by_others(const std::string& pkg, const std::set<std::string>& excluding, bool verbose) {
     auto all_installed = get_installed_packages();
     for (const auto& other : all_installed) {
@@ -540,6 +551,7 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
             continue;
         }
 
+        queue_triggers_for_package(upgrade_queue[i].name);
         ++installed_count;
         if (!verbose) render_install_progress(i + 1, upgrade_queue.size(), upgrade_queue[i].name, &install_progress_width);
     }
@@ -675,6 +687,7 @@ int handle_repair(bool verbose) {
             failures.push_back(repair_queue[i].name);
             break;
         }
+        queue_triggers_for_package(repair_queue[i].name);
         ++repaired_count;
         if (!verbose) render_install_progress(i + 1, repair_queue.size(), repair_queue[i].name, &install_progress_width);
     }
@@ -752,6 +765,9 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
             std::cerr << std::endl;
             return 1;
         }
+
+        std::string local_pkg_name = read_package_name_from_archive(local_file);
+        if (!local_pkg_name.empty()) queue_triggers_for_package(local_pkg_name);
     }
 
     if (install_queue.empty()) {
@@ -811,6 +827,7 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
             std::cerr << std::endl;
             return 1;
         }
+        queue_triggers_for_package(install_queue[i].name);
         ++installed_count;
         if (!verbose) render_install_progress(i + 1, install_queue.size(), install_queue[i].name, &install_progress_width);
     }
@@ -883,6 +900,7 @@ int handle_remove(int argc, char* argv[], bool verbose, bool purge) {
     }
 
     for (const auto& pkg : to_remove) {
+        std::vector<std::string> removed_files = read_installed_file_list(pkg);
         std::string cmd = "gpkg-worker --remove " + pkg;
         if (verbose) cmd += " --verbose";
         if (!ROOT_PREFIX.empty()) cmd += " --root " + ROOT_PREFIX;
@@ -891,6 +909,7 @@ int handle_remove(int argc, char* argv[], bool verbose, bool purge) {
             std::cerr << Color::RED << "E: Failed to remove " << pkg << Color::RESET << std::endl;
             return 1;
         }
+        check_triggers(removed_files);
     }
 
     return 0;
