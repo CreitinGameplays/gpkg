@@ -17,6 +17,7 @@ void print_help() {
               << "GeminiOS Package Manager " << GPKG_VERSION << " (" << GPKG_CODENAME << ")\n\n"
               << "Options:\n"
               << "  -v, --verbose   Show detailed logging information\n"
+              << "  -y, --yes       Assume yes for confirmation prompts\n"
               << "  -r, --repair    Repair broken dependencies and damaged installs\n"
               << "  -V, --version   Show version\n\n"
               << "Commands:\n"
@@ -43,11 +44,13 @@ int main(int argc, char* argv[]) {
 
     std::string action;
     bool verbose = false;
+    bool assume_yes = false;
     bool purge = false;
     bool repair = false;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "-v" || arg == "--verbose") verbose = true;
+        else if (arg == "-y" || arg == "--yes") assume_yes = true;
         else if (arg == "--purge") purge = true;
         else if (arg == "-r" || arg == "--repair") repair = true;
         else if (arg == "-V" || arg == "--version") {
@@ -72,6 +75,8 @@ int main(int argc, char* argv[]) {
         print_help();
         return 1;
     }
+
+    g_assume_yes = assume_yes;
 
 #ifndef DEV_MODE
     if (geteuid() != 0 &&

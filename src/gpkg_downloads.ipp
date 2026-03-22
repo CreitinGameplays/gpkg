@@ -294,7 +294,10 @@ DownloadBatchReport download_package_archives(
     }
 
     auto render_progress = [&](const std::string& last_package) {
-        const int bar_width = 32;
+        const size_t terminal_width = get_terminal_width();
+        const int bar_width = static_cast<int>(
+            std::max<size_t>(10, std::min<size_t>(48, terminal_width > 72 ? terminal_width / 3 : 10))
+        );
         size_t live_bytes = completed_archive_bytes;
         double live_speed = 0.0;
         size_t active_count = 0;
@@ -325,7 +328,9 @@ DownloadBatchReport download_package_archives(
         if (percent > 100) percent = 100;
         int filled = (percent * bar_width) / 100;
 
-        if (label.size() > 24) label = label.substr(0, 21) + "...";
+        const size_t base_width = static_cast<size_t>(bar_width) + 58;
+        const size_t label_width = terminal_width > base_width ? terminal_width - base_width : 12;
+        label = truncate_progress_label(label, std::max<size_t>(12, label_width));
 
         std::ostringstream line;
         line << "\r" << Color::CYAN << "[";
@@ -347,7 +352,7 @@ DownloadBatchReport download_package_archives(
         }
 
         std::string rendered = line.str();
-        size_t visible_width = rendered.size();
+        size_t visible_width = visible_text_width(rendered);
         std::cout << rendered;
         if (visible_width < last_render_width) {
             std::cout << std::string(last_render_width - visible_width, ' ');

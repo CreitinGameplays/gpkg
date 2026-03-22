@@ -5,13 +5,8 @@ struct InstallCommandResult {
     std::string log_path;
 };
 
-std::string truncate_install_label(const std::string& value, size_t max_len = 32) {
-    if (value.size() <= max_len) return value;
-    if (max_len <= 3) return value.substr(0, max_len);
-    return value.substr(0, max_len - 3) + "...";
-}
-
-void render_install_progress(
+void render_package_progress(
+    const std::string& item_label,
     size_t completed,
     size_t total,
     const std::string& current_pkg,
@@ -19,9 +14,12 @@ void render_install_progress(
 ) {
     if (total == 0) return;
 
-    const size_t width = 32;
+    const size_t terminal_width = get_terminal_width();
+    const size_t width = std::max<size_t>(10, std::min<size_t>(48, terminal_width > 72 ? terminal_width / 3 : 10));
     const double ratio = static_cast<double>(completed) / static_cast<double>(total);
     const size_t filled = static_cast<size_t>(ratio * static_cast<double>(width) + 0.5);
+    const size_t base_width = width + item_label.size() + 20;
+    const size_t label_width = terminal_width > base_width ? terminal_width - base_width : 12;
 
     std::ostringstream line;
     line << Color::CYAN << "[";
@@ -31,10 +29,10 @@ void render_install_progress(
     line << "] " << Color::RESET
          << std::setw(3) << static_cast<int>(ratio * 100.0 + 0.5) << "% "
          << "(" << completed << "/" << total << ") "
-         << "current:" << truncate_install_label(current_pkg);
+         << item_label << ":" << truncate_progress_label(current_pkg, std::max<size_t>(12, label_width));
 
     std::string rendered = line.str();
-    size_t visible_width = rendered.size();
+    size_t visible_width = visible_text_width(rendered);
     if (last_render_width && *last_render_width > visible_width) {
         rendered += std::string(*last_render_width - visible_width, ' ');
     }
@@ -43,7 +41,7 @@ void render_install_progress(
     if (last_render_width) *last_render_width = std::max(*last_render_width, visible_width);
 }
 
-void finish_install_progress_line(size_t* last_render_width) {
+void finish_progress_line(size_t* last_render_width) {
     if (!last_render_width || *last_render_width == 0) return;
     std::cout << "\r" << std::string(*last_render_width, ' ') << "\r" << std::flush;
     *last_render_width = 0;
@@ -537,10 +535,10 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
             continue;
         }
 
-        if (!verbose) render_install_progress(i, upgrade_queue.size(), upgrade_queue[i].name, &install_progress_width);
+        if (!verbose) render_package_progress("current", i, upgrade_queue.size(), upgrade_queue[i].name, &install_progress_width);
         InstallCommandResult result = install_package_v2(upgrade_queue[i].name, verbose);
         if (!result.success) {
-            if (!verbose) finish_install_progress_line(&install_progress_width);
+            if (!verbose) finish_progress_line(&install_progress_width);
             std::cerr << Color::RED << "E: Failed to install " << upgrade_queue[i].name
                       << Color::RESET;
             if (!verbose && !result.log_path.empty()) {
@@ -553,10 +551,10 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
 
         queue_triggers_for_package(upgrade_queue[i].name);
         ++installed_count;
-        if (!verbose) render_install_progress(i + 1, upgrade_queue.size(), upgrade_queue[i].name, &install_progress_width);
+        if (!verbose) render_package_progress("current", i + 1, upgrade_queue.size(), upgrade_queue[i].name, &install_progress_width);
     }
     if (!verbose) {
-        finish_install_progress_line(&install_progress_width);
+        finish_progress_line(&install_progress_width);
         std::cout << Color::GREEN << "✓ Installed " << installed_count << "/" << upgrade_queue.size()
                   << " package(s)." << Color::RESET << std::endl;
     }
@@ -674,10 +672,10 @@ int handle_repair(bool verbose) {
     size_t install_progress_width = 0;
     std::vector<std::string> failures;
     for (size_t i = 0; i < repair_queue.size(); ++i) {
-        if (!verbose) render_install_progress(i, repair_queue.size(), repair_queue[i].name, &install_progress_width);
+        if (!verbose) render_package_progress("current", i, repair_queue.size(), repair_queue[i].name, &install_progress_width);
         InstallCommandResult result = install_package_v2(repair_queue[i].name, verbose);
         if (!result.success) {
-            if (!verbose) finish_install_progress_line(&install_progress_width);
+            if (!verbose) finish_progress_line(&install_progress_width);
             std::cerr << Color::RED << "E: Repair stopped at " << repair_queue[i].name
                       << Color::RESET;
             if (!verbose && !result.log_path.empty()) {
@@ -689,9 +687,9 @@ int handle_repair(bool verbose) {
         }
         queue_triggers_for_package(repair_queue[i].name);
         ++repaired_count;
-        if (!verbose) render_install_progress(i + 1, repair_queue.size(), repair_queue[i].name, &install_progress_width);
+        if (!verbose) render_package_progress("current", i + 1, repair_queue.size(), repair_queue[i].name, &install_progress_width);
     }
-    if (!verbose) finish_install_progress_line(&install_progress_width);
+    if (!verbose) finish_progress_line(&install_progress_width);
 
     if (!failures.empty()) {
         return 1;
@@ -728,7 +726,7 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
     std::cout << "Resolving dependencies..." << std::endl;
     for (int i = 2; i < argc; ++i) {
         std::string arg = trim(argv[i]);
-        if (arg == "-v" || arg == "--verbose") continue;
+        if (arg == "-v" || arg == "--verbose" || arg == "-y" || arg == "--yes") continue;
 
         if (arg.length() > 5 && arg.substr(arg.length() - 5) == ".gpkg" && access(arg.c_str(), F_OK) == 0) {
             local_files.push_back(arg);
@@ -741,7 +739,7 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
 
     for (int i = 2; i < argc; ++i) {
         std::string arg = trim(argv[i]);
-        if (arg == "-v" || arg == "--verbose") continue;
+        if (arg == "-v" || arg == "--verbose" || arg == "-y" || arg == "--yes") continue;
         if (arg.length() > 5 && arg.substr(arg.length() - 5) == ".gpkg" && access(arg.c_str(), F_OK) == 0) {
             continue;
         }
@@ -814,10 +812,10 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
     size_t installed_count = 0;
     size_t install_progress_width = 0;
     for (size_t i = 0; i < install_queue.size(); ++i) {
-        if (!verbose) render_install_progress(i, install_queue.size(), install_queue[i].name, &install_progress_width);
+        if (!verbose) render_package_progress("current", i, install_queue.size(), install_queue[i].name, &install_progress_width);
         InstallCommandResult result = install_package_v2(install_queue[i].name, verbose);
         if (!result.success) {
-            if (!verbose) finish_install_progress_line(&install_progress_width);
+            if (!verbose) finish_progress_line(&install_progress_width);
             std::cerr << Color::RED << "E: Installation stopped at " << install_queue[i].name
                       << ". " << installed_count << " package(s) were installed before the failure."
                       << Color::RESET;
@@ -829,9 +827,9 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
         }
         queue_triggers_for_package(install_queue[i].name);
         ++installed_count;
-        if (!verbose) render_install_progress(i + 1, install_queue.size(), install_queue[i].name, &install_progress_width);
+        if (!verbose) render_package_progress("current", i + 1, install_queue.size(), install_queue[i].name, &install_progress_width);
     }
-    if (!verbose) finish_install_progress_line(&install_progress_width);
+    if (!verbose) finish_progress_line(&install_progress_width);
 
     std::cout << Color::GREEN << "✓ Installed " << installed_count << " package(s)." << Color::RESET << std::endl;
     return 0;
@@ -846,7 +844,7 @@ int handle_remove(int argc, char* argv[], bool verbose, bool purge) {
     std::string target_pkg;
     for (int i = 2; i < argc; ++i) {
         std::string arg = argv[i];
-        if (arg != "--purge" && arg != "-v" && arg != "--verbose") {
+        if (arg != "--purge" && arg != "-v" && arg != "--verbose" && arg != "-y" && arg != "--yes") {
             target_pkg = arg;
             break;
         }
@@ -899,18 +897,28 @@ int handle_remove(int argc, char* argv[], bool verbose, bool purge) {
         return 0;
     }
 
-    for (const auto& pkg : to_remove) {
+    std::cout << Color::CYAN << "[*] Removing " << to_remove.size()
+              << " package(s)..." << Color::RESET << std::endl;
+    size_t remove_progress_width = 0;
+
+    for (size_t i = 0; i < to_remove.size(); ++i) {
+        const auto& pkg = to_remove[i];
+        if (!verbose) render_package_progress("current", i, to_remove.size(), pkg, &remove_progress_width);
         std::vector<std::string> removed_files = read_installed_file_list(pkg);
         std::string cmd = "gpkg-worker --remove " + pkg;
         if (verbose) cmd += " --verbose";
         if (!ROOT_PREFIX.empty()) cmd += " --root " + ROOT_PREFIX;
 
         if (run_command(cmd, verbose) != 0) {
+            if (!verbose) finish_progress_line(&remove_progress_width);
             std::cerr << Color::RED << "E: Failed to remove " << pkg << Color::RESET << std::endl;
             return 1;
         }
         check_triggers(removed_files);
+        if (!verbose) render_package_progress("current", i + 1, to_remove.size(), pkg, &remove_progress_width);
     }
+
+    if (!verbose) finish_progress_line(&remove_progress_width);
 
     return 0;
 }

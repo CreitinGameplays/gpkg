@@ -26,6 +26,7 @@
 #include <sstream>
 #include <string>
 #include <sys/stat.h>
+#include <sys/ioctl.h>
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -122,7 +123,48 @@ bool is_executable_command_available(const std::string& cmd) {
     return false;
 }
 
+size_t visible_text_width(const std::string& value) {
+    size_t width = 0;
+    for (size_t i = 0; i < value.size(); ++i) {
+        unsigned char ch = static_cast<unsigned char>(value[i]);
+        if (ch == '\033' && i + 1 < value.size() && value[i + 1] == '[') {
+            i += 2;
+            while (i < value.size()) {
+                unsigned char seq = static_cast<unsigned char>(value[i]);
+                if ((seq >= '@' && seq <= '~') || std::isalpha(seq)) break;
+                ++i;
+            }
+            continue;
+        }
+        ++width;
+    }
+    return width;
+}
+
+size_t get_terminal_width(size_t fallback = 80) {
+    const char* columns_env = getenv("COLUMNS");
+    if (columns_env) {
+        char* end = nullptr;
+        long parsed = std::strtol(columns_env, &end, 10);
+        if (end != columns_env && parsed > 0) return static_cast<size_t>(parsed);
+    }
+
+    struct winsize ws {};
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0) {
+        return static_cast<size_t>(ws.ws_col);
+    }
+
+    return fallback;
+}
+
+std::string truncate_progress_label(const std::string& value, size_t max_len) {
+    if (value.size() <= max_len) return value;
+    if (max_len <= 3) return value.substr(0, max_len);
+    return value.substr(0, max_len - 3) + "...";
+}
+
 std::set<std::string> g_pending_triggers;
+bool g_assume_yes = false;
 
 std::vector<std::string> read_installed_file_list(const std::string& pkg_name) {
     std::vector<std::string> files;
@@ -214,7 +256,15 @@ void run_triggers(bool verbose) {
             continue;
         }
         if (verbose) std::cout << "[DEBUG] Running trigger: " << cmd << std::endl;
-        if (run_command(cmd, verbose) != 0) {
+        int rc = run_command(cmd, verbose);
+        if (rc == 127) {
+            if (verbose) {
+                std::cout << "[DEBUG] Skipping trigger because its command resolved to shell exit 127: "
+                          << cmd << std::endl;
+            }
+            continue;
+        }
+        if (rc != 0) {
             failed_triggers.push_back(cmd);
         }
     }

@@ -286,7 +286,12 @@ std::vector<std::string> get_installed_packages(const std::string& extension = "
         std::string fname = dir->d_name;
         if (fname.size() > extension.size() &&
             fname.substr(fname.size() - extension.size()) == extension) {
-            pkgs.push_back(fname.substr(0, fname.size() - extension.size()));
+            std::string pkg_name = fname.substr(0, fname.size() - extension.size());
+            if (pkg_name.size() >= 14 &&
+                pkg_name.substr(pkg_name.size() - 14) == ".system-backup") {
+                continue;
+            }
+            pkgs.push_back(pkg_name);
         }
     }
     closedir(d);
@@ -343,6 +348,10 @@ bool get_json_array(const std::string& obj, const std::string& key, std::vector<
 }
 
 bool ask_confirmation(const std::string& query) {
+    if (g_assume_yes) {
+        std::cout << Color::YELLOW << query << " [Y/n] y" << Color::RESET << std::endl;
+        return true;
+    }
     std::cout << Color::YELLOW << query << " [Y/n] " << Color::RESET;
     std::string response;
     std::getline(std::cin, response);
