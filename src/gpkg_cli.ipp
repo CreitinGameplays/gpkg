@@ -19,6 +19,7 @@ void print_help() {
               << "  -v, --verbose   Show detailed logging information\n"
               << "  -y, --yes       Assume yes for confirmation prompts\n"
               << "  -r, --repair    Repair broken dependencies and damaged installs\n"
+              << "  --reinstall     Reinstall requested packages even if the same version is already installed\n"
               << "  --recommended-yes  Force installation of Debian Recommends for this transaction\n"
               << "  --recommended-no   Do not install Debian Recommends for this transaction\n"
               << "  --suggested-yes    Force installation of Debian Suggests for this transaction\n"
@@ -51,6 +52,7 @@ int main(int argc, char* argv[]) {
     bool assume_yes = false;
     bool purge = false;
     bool repair = false;
+    bool reinstall = false;
     bool recommended_yes = false;
     bool recommended_no = false;
     bool suggested_yes = false;
@@ -61,6 +63,7 @@ int main(int argc, char* argv[]) {
         else if (arg == "-y" || arg == "--yes") assume_yes = true;
         else if (arg == "--purge") purge = true;
         else if (arg == "-r" || arg == "--repair") repair = true;
+        else if (arg == "--reinstall") reinstall = true;
         else if (arg == "--recommended-yes") recommended_yes = true;
         else if (arg == "--recommended-no") recommended_no = true;
         else if (arg == "--suggested-yes") suggested_yes = true;
@@ -117,7 +120,17 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    if (reinstall &&
+        action != "install" &&
+        action != "upgrade") {
+        std::cerr << Color::RED
+                  << "E: --reinstall is only valid with install or upgrade."
+                  << Color::RESET << std::endl;
+        return 1;
+    }
+
     g_assume_yes = assume_yes;
+    g_force_reinstall = reinstall;
     g_optional_dependency_policy.recommends = recommended_yes ? OptionalDependencyMode::ForceYes
         : (recommended_no ? OptionalDependencyMode::ForceNo : OptionalDependencyMode::Auto);
     g_optional_dependency_policy.suggests = suggested_yes ? OptionalDependencyMode::ForceYes

@@ -191,6 +191,7 @@ size_t recommended_parallel_worker_count(size_t task_count) {
 
 std::set<std::string> g_pending_triggers;
 bool g_assume_yes = false;
+bool g_force_reinstall = false;
 OptionalDependencyPolicy g_optional_dependency_policy;
 
 bool is_optional_dependency_option(const std::string& arg) {
@@ -207,6 +208,7 @@ bool is_known_cli_option(const std::string& arg) {
            arg == "--yes" ||
            arg == "-r" ||
            arg == "--repair" ||
+           arg == "--reinstall" ||
            arg == "-V" ||
            arg == "--version" ||
            arg == "--purge" ||

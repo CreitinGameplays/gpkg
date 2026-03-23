@@ -275,7 +275,8 @@ bool resolve_dependencies(
     std::vector<PackageMetadata>& install_queue,
     std::set<std::string>& visited,
     const std::set<std::string>& installed_cache,
-    bool verbose
+    bool verbose,
+    bool force_queue_requested = false
 ) {
     std::string canonical_pkg = canonicalize_package_name(pkg, verbose);
     Dependency requested_dep{canonical_pkg, op, req_version};
@@ -298,7 +299,8 @@ bool resolve_dependencies(
          << (op.empty() ? "" : (" (" + op + " " + req_version + ")")));
 
     std::string provider_name;
-    if (is_dependency_satisfied_locally(requested_dep, installed_cache, verbose, &provider_name)) {
+    if (!force_queue_requested &&
+        is_dependency_satisfied_locally(requested_dep, installed_cache, verbose, &provider_name)) {
         if (provider_name == BASE_SYSTEM_PROVIDER) {
             VLOG(verbose, canonical_pkg << " is satisfied by the base-system policy.");
         } else if (provider_name == canonical_pkg) {
@@ -312,7 +314,7 @@ bool resolve_dependencies(
     }
 
     std::string installed_ver;
-    if (is_installed(canonical_pkg, &installed_ver)) {
+    if (!force_queue_requested && is_installed(canonical_pkg, &installed_ver)) {
         if (version_satisfies(installed_ver, op, req_version)) {
             VLOG(verbose, canonical_pkg << " " << installed_ver << " is installed and satisfies constraints.");
             return true;
@@ -336,7 +338,7 @@ bool resolve_dependencies(
         std::string provider = find_provider(canonical_pkg, op, req_version, verbose);
         if (!provider.empty()) {
             VLOG(verbose, "Redirecting " << canonical_pkg << " -> " << provider);
-            return resolve_dependencies(provider, "", "", install_queue, visited, installed_cache, verbose);
+            return resolve_dependencies(provider, "", "", install_queue, visited, installed_cache, verbose, force_queue_requested);
         }
 
         std::cerr << Color::RED << "E: Unable to locate package " << canonical_pkg << Color::RESET << std::endl;
@@ -374,7 +376,7 @@ bool resolve_dependencies(
     visited.insert(canonical_pkg);
     for (const auto& dep_str : collect_transaction_dependency_edges(meta)) {
         Dependency dep = parse_dependency(dep_str);
-        if (!resolve_dependencies(dep.name, dep.op, dep.version, install_queue, visited, installed_cache, verbose)) {
+        if (!resolve_dependencies(dep.name, dep.op, dep.version, install_queue, visited, installed_cache, verbose, false)) {
             return false;
         }
     }
@@ -394,26 +396,53 @@ struct TransactionPlan {
     std::vector<TransactionRetirement> retirements;
 };
 
-std::string canonical_relation_name(const std::string& relation) {
-    std::string name = relation_name_from_text(relation);
-    if (name.empty()) return "";
-    return canonicalize_package_name(name);
+Dependency parse_relation_constraint(const std::string& relation) {
+    Dependency dep = parse_dependency(relation);
+    dep.name = canonicalize_package_name(dep.name);
+    return dep;
 }
 
-bool relation_list_contains_package(const std::vector<std::string>& relations, const std::string& pkg_name) {
-    std::string canonical_target = canonicalize_package_name(pkg_name);
+bool relation_matches_package(
+    const std::string& relation,
+    const std::string& pkg_name,
+    const PackageMetadata* pkg_meta = nullptr
+) {
+    Dependency dep = parse_relation_constraint(relation);
+    if (dep.name.empty()) return false;
+
+    if (pkg_meta) {
+        return package_metadata_satisfies_dependency(pkg_name, *pkg_meta, dep);
+    }
+
+    if (!dep.op.empty()) return false;
+    return canonicalize_package_name(pkg_name) == dep.name;
+}
+
+bool relation_list_matches_package(
+    const std::vector<std::string>& relations,
+    const std::string& pkg_name,
+    const PackageMetadata* pkg_meta = nullptr
+) {
     for (const auto& relation : relations) {
-        if (canonical_relation_name(relation) == canonical_target) return true;
+        if (relation_matches_package(relation, pkg_name, pkg_meta)) return true;
     }
     return false;
 }
 
-bool package_conflicts_with_package(const PackageMetadata& meta, const std::string& pkg_name) {
-    return relation_list_contains_package(meta.conflicts, pkg_name);
+bool package_conflicts_with_package(
+    const PackageMetadata& meta,
+    const std::string& pkg_name,
+    const PackageMetadata* pkg_meta = nullptr
+) {
+    return relation_list_matches_package(meta.conflicts, pkg_name, pkg_meta);
 }
 
-bool package_replaces_package(const PackageMetadata& meta, const std::string& pkg_name) {
-    return relation_list_contains_package(meta.replaces, pkg_name);
+bool package_replaces_package(
+    const PackageMetadata& meta,
+    const std::string& pkg_name,
+    const PackageMetadata* pkg_meta = nullptr
+) {
+    return relation_list_matches_package(meta.replaces, pkg_name, pkg_meta);
 }
 
 bool build_transaction_plan(
@@ -432,6 +461,23 @@ bool build_transaction_plan(
         working_queue.push_back(pkg);
     }
 
+    std::map<std::string, PackageMetadata> installed_meta_cache;
+    std::set<std::string> missing_installed_meta;
+    auto get_installed_meta = [&](const std::string& pkg_name) -> const PackageMetadata* {
+        auto cache_it = installed_meta_cache.find(pkg_name);
+        if (cache_it != installed_meta_cache.end()) return &cache_it->second;
+        if (missing_installed_meta.count(pkg_name)) return nullptr;
+
+        PackageMetadata meta;
+        if (!get_installed_package_metadata(pkg_name, meta)) {
+            missing_installed_meta.insert(pkg_name);
+            return nullptr;
+        }
+
+        auto inserted = installed_meta_cache.emplace(pkg_name, std::move(meta));
+        return &inserted.first->second;
+    };
+
     std::vector<bool> dropped(working_queue.size(), false);
     for (size_t i = 0; i < working_queue.size(); ++i) {
         if (dropped[i]) continue;
@@ -441,12 +487,12 @@ bool build_transaction_plan(
 
             const PackageMetadata& left = working_queue[i];
             const PackageMetadata& right = working_queue[j];
-            bool left_conflicts = package_conflicts_with_package(left, right.name);
-            bool right_conflicts = package_conflicts_with_package(right, left.name);
+            bool left_conflicts = package_conflicts_with_package(left, right.name, &right);
+            bool right_conflicts = package_conflicts_with_package(right, left.name, &left);
             if (!left_conflicts && !right_conflicts) continue;
 
-            bool left_replaces = package_replaces_package(left, right.name);
-            bool right_replaces = package_replaces_package(right, left.name);
+            bool left_replaces = package_replaces_package(left, right.name, &right);
+            bool right_replaces = package_replaces_package(right, left.name, &left);
             if (left_replaces && !right_replaces) {
                 dropped[j] = true;
                 continue;
@@ -469,35 +515,34 @@ bool build_transaction_plan(
 
     std::set<std::string> scheduled_retirements;
     for (const auto& pkg : out_plan.install_queue) {
-        std::string canonical_pkg_name = canonicalize_package_name(pkg.name);
-        for (const auto& replaced_relation : pkg.replaces) {
-            std::string replaced_name = canonical_relation_name(replaced_relation);
-            if (replaced_name.empty() || replaced_name == canonical_pkg_name) continue;
+        for (const auto& installed_name : installed) {
+            if (installed_name == pkg.name) continue;
 
-            for (const auto& installed_name : installed) {
-                if (canonicalize_package_name(installed_name) != replaced_name) continue;
-                if (scheduled_retirements.insert(installed_name).second) {
-                    out_plan.retirements.push_back({installed_name, pkg.name});
-                }
+            const PackageMetadata* installed_meta = get_installed_meta(installed_name);
+            if (!package_replaces_package(pkg, installed_name, installed_meta)) continue;
+
+            if (scheduled_retirements.insert(installed_name).second) {
+                out_plan.retirements.push_back({installed_name, pkg.name});
             }
         }
     }
 
     for (const auto& pkg : out_plan.install_queue) {
-        for (const auto& conflict_relation : pkg.conflicts) {
-            std::string conflict_name = canonical_relation_name(conflict_relation);
-            if (conflict_name.empty()) continue;
+        for (const auto& installed_name : installed) {
+            if (installed_name == pkg.name) continue;
 
-            for (const auto& installed_name : installed) {
-                if (installed_name == pkg.name) continue;
-                if (canonicalize_package_name(installed_name) != conflict_name) continue;
-                if (package_replaces_package(pkg, installed_name)) continue;
+            const PackageMetadata* installed_meta = get_installed_meta(installed_name);
+            bool queued_conflicts_installed =
+                package_conflicts_with_package(pkg, installed_name, installed_meta);
+            bool installed_conflicts_queued =
+                installed_meta && package_conflicts_with_package(*installed_meta, pkg.name, &pkg);
+            if (!queued_conflicts_installed && !installed_conflicts_queued) continue;
+            if (package_replaces_package(pkg, installed_name, installed_meta)) continue;
 
-                std::cerr << Color::RED << "E: Conflict detected! " << pkg.name
-                          << " conflicts with installed package " << installed_name
-                          << Color::RESET << std::endl;
-                return false;
-            }
+            std::cerr << Color::RED << "E: Conflict detected! " << pkg.name
+                      << " conflicts with installed package " << installed_name
+                      << Color::RESET << std::endl;
+            return false;
         }
     }
 
@@ -522,28 +567,5 @@ bool should_retire_after_install(const TransactionPlan& plan, const std::string&
 }
 
 bool check_conflicts_legacy(const std::vector<PackageMetadata>& queue, const std::set<std::string>& installed, bool verbose) {
-    bool has_conflict = false;
-    for (const auto& pkg : queue) {
-        for (const auto& conflict : pkg.conflicts) {
-            if (installed.count(conflict)) {
-                std::cerr << Color::RED << "E: Conflict detected! " << pkg.name
-                          << " conflicts with installed package " << conflict
-                          << Color::RESET << std::endl;
-                has_conflict = true;
-            }
-
-            for (const auto& other : queue) {
-                if (other.name != conflict) continue;
-                std::cerr << Color::RED << "E: Conflict detected in transaction! "
-                          << pkg.name << " conflicts with " << other.name
-                          << Color::RESET << std::endl;
-                has_conflict = true;
-            }
-        }
-    }
-
-    if (verbose && !has_conflict) {
-        VLOG(verbose, "No conflicts detected for " << queue.size() << " queued packages.");
-    }
-    return !has_conflict;
+    return check_conflicts(queue, installed, verbose);
 }

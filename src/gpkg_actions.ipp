@@ -5,6 +5,25 @@ struct InstallCommandResult {
     std::string log_path;
 };
 
+enum class PlannedPackageKind {
+    NewInstall,
+    Upgrade,
+    Reinstall,
+};
+
+PlannedPackageKind classify_planned_package(const PackageMetadata& meta, std::string* current_version = nullptr) {
+    std::string installed_version;
+    if (!is_installed(meta.name, &installed_version)) {
+        if (current_version) current_version->clear();
+        return PlannedPackageKind::NewInstall;
+    }
+
+    if (current_version) *current_version = installed_version;
+    return compare_versions(meta.version, installed_version) == 0
+        ? PlannedPackageKind::Reinstall
+        : PlannedPackageKind::Upgrade;
+}
+
 void render_package_progress(
     const std::string& item_label,
     size_t completed,
@@ -286,6 +305,7 @@ struct UpgradePlanEntry {
     PackageMetadata meta;
     std::string current_version;
     bool was_installed = false;
+    bool reinstall_only = false;
 };
 
 std::vector<std::string> parse_companion_tokens(const std::string& raw_value) {
@@ -383,7 +403,8 @@ bool queue_upgrade_target(
     std::set<std::string>& target_walk,
     std::set<std::string>& dependency_visited,
     const std::set<std::string>& installed_cache,
-    bool verbose
+    bool verbose,
+    bool force_reinstall = false
 ) {
     PackageMetadata meta;
     if (!resolve_upgrade_target_metadata(requested_dep, meta, verbose)) {
@@ -399,7 +420,8 @@ bool queue_upgrade_target(
             was_installed = is_installed(requested_dep.name, &current_version);
         }
     }
-    if (was_installed && compare_versions(meta.version, current_version) <= 0) {
+    bool reinstall_only = was_installed && compare_versions(meta.version, current_version) == 0;
+    if (was_installed && compare_versions(meta.version, current_version) <= 0 && !force_reinstall) {
         VLOG(verbose, meta.name << " is already up to date (" << current_version << ").");
         return true;
     }
@@ -426,7 +448,8 @@ bool queue_upgrade_target(
                 target_walk,
                 dependency_visited,
                 installed_cache,
-                verbose
+                verbose,
+                force_reinstall
             )) {
             target_walk.erase(meta.name);
             return false;
@@ -454,7 +477,7 @@ bool queue_upgrade_target(
     }
 
     if (explicit_target_names.insert(meta.name).second) {
-        explicit_targets.push_back({meta, current_version, was_installed});
+        explicit_targets.push_back({meta, current_version, was_installed, reinstall_only});
     }
 
     target_walk.erase(meta.name);
@@ -594,7 +617,8 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
                 target_walk,
                 dependency_visited,
                 installed_cache,
-                verbose
+                verbose,
+                g_force_reinstall
             )) {
             return 1;
         }
@@ -606,9 +630,13 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
 
         PackageMetadata repo_meta;
         if (!get_repo_package_info(pkg, repo_meta)) continue;
-        if (compare_versions(repo_meta.version, current_ver) <= 0) continue;
+        if (!g_force_reinstall && compare_versions(repo_meta.version, current_ver) <= 0) continue;
 
-        VLOG(verbose, "Update found for " << pkg << ": " << current_ver << " -> " << repo_meta.version);
+        if (compare_versions(repo_meta.version, current_ver) > 0) {
+            VLOG(verbose, "Update found for " << pkg << ": " << current_ver << " -> " << repo_meta.version);
+        } else if (g_force_reinstall) {
+            VLOG(verbose, "Reinstall requested for " << pkg << " at " << current_ver);
+        }
         Dependency dep{pkg, "", ""};
         if (!queue_upgrade_target(
                 dep,
@@ -620,7 +648,8 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
                 target_walk,
                 dependency_visited,
                 installed_cache,
-                verbose
+                verbose,
+                g_force_reinstall
             )) {
             return 1;
         }
@@ -639,10 +668,12 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
     for (const auto& pkg : upgrade_queue) planned_names.insert(pkg.name);
 
     std::vector<UpgradePlanEntry> installed_upgrades;
+    std::vector<UpgradePlanEntry> installed_reinstalls;
     std::vector<UpgradePlanEntry> base_bootstraps;
     for (const auto& entry : explicit_targets) {
         if (!planned_names.count(entry.meta.name)) continue;
-        if (entry.was_installed) installed_upgrades.push_back(entry);
+        if (entry.was_installed && entry.reinstall_only) installed_reinstalls.push_back(entry);
+        else if (entry.was_installed) installed_upgrades.push_back(entry);
         else base_bootstraps.push_back(entry);
     }
 
@@ -651,6 +682,14 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
         for (const auto& entry : installed_upgrades) {
             std::cout << "  " << Color::GREEN << entry.meta.name << Color::RESET
                       << " (" << entry.current_version << " -> " << entry.meta.version << ")" << std::endl;
+        }
+    }
+
+    if (!installed_reinstalls.empty()) {
+        std::cout << "The following packages will be reinstalled:" << std::endl;
+        for (const auto& entry : installed_reinstalls) {
+            std::cout << "  " << Color::BLUE << entry.meta.name << Color::RESET
+                      << " (" << entry.meta.version << ")" << std::endl;
         }
     }
 
@@ -760,6 +799,7 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
     if (!failures.empty()) {
         std::cout << Color::CYAN << "Upgrade summary: "
                   << installed_upgrades.size() << " upgraded, "
+                  << installed_reinstalls.size() << " reinstalled, "
                   << base_bootstraps.size() << " imported from base image, "
                   << dependency_installs.size() << " dependency installs, "
                   << download_report.downloaded_count << " downloaded, "
@@ -773,6 +813,7 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
 
     std::cout << Color::CYAN << "Upgrade summary: "
               << installed_upgrades.size() << " upgraded, "
+              << installed_reinstalls.size() << " reinstalled, "
               << base_bootstraps.size() << " imported from base image, "
               << dependency_installs.size() << " dependency installs, "
               << download_report.downloaded_count << " downloaded, "
@@ -1003,7 +1044,7 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
             continue;
         }
 
-        if (!resolve_dependencies(arg, "", "", install_queue, visited, installed_cache, verbose)) {
+        if (!resolve_dependencies(arg, "", "", install_queue, visited, installed_cache, verbose, g_force_reinstall)) {
             std::cerr << Color::RED << "E: Failed to resolve dependencies for " << arg
                       << Color::RESET << std::endl;
             return 1;
@@ -1063,10 +1104,37 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
         return 0;
     }
 
-    std::cout << "The following NEW packages will be installed:" << std::endl;
+    std::vector<PackageMetadata> new_installs;
+    std::vector<std::pair<PackageMetadata, std::string>> reinstalls;
+    std::vector<std::pair<PackageMetadata, std::string>> upgrades;
     for (const auto& pkg : install_queue) {
-        std::cout << "  " << Color::GREEN << pkg.name << Color::RESET
-                  << " (" << pkg.version << ")" << std::endl;
+        std::string current_version;
+        PlannedPackageKind kind = classify_planned_package(pkg, &current_version);
+        if (kind == PlannedPackageKind::NewInstall) new_installs.push_back(pkg);
+        else if (kind == PlannedPackageKind::Reinstall) reinstalls.push_back({pkg, current_version});
+        else upgrades.push_back({pkg, current_version});
+    }
+
+    if (!new_installs.empty()) {
+        std::cout << "The following packages will be installed:" << std::endl;
+        for (const auto& pkg : new_installs) {
+            std::cout << "  " << Color::GREEN << pkg.name << Color::RESET
+                      << " (" << pkg.version << ")" << std::endl;
+        }
+    }
+    if (!upgrades.empty()) {
+        std::cout << "The following packages will be upgraded:" << std::endl;
+        for (const auto& entry : upgrades) {
+            std::cout << "  " << Color::GREEN << entry.first.name << Color::RESET
+                      << " (" << entry.second << " -> " << entry.first.version << ")" << std::endl;
+        }
+    }
+    if (!reinstalls.empty()) {
+        std::cout << "The following packages will be reinstalled:" << std::endl;
+        for (const auto& entry : reinstalls) {
+            std::cout << "  " << Color::BLUE << entry.first.name << Color::RESET
+                      << " (" << entry.first.version << ")" << std::endl;
+        }
     }
 
     if (!install_plan.retirements.empty()) {
