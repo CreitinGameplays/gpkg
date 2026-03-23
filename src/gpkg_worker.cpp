@@ -31,6 +31,7 @@ bool mkdir_p(const std::string& path);
 bool path_exists_no_follow(const std::string& path);
 bool write_text_file_atomic(const std::string& target_path, const std::string& content, mode_t mode = 0644);
 bool copy_file_atomic(const std::string& source_path, const std::string& target_path);
+std::string canonical_existing_path(const std::string& path);
 
 // Logging
 bool g_verbose = false;
@@ -92,13 +93,50 @@ std::string read_symlink_target(const std::string& path) {
     return std::string(buffer);
 }
 
+std::vector<std::string> split_path_components(const std::string& path) {
+    std::vector<std::string> parts;
+    std::stringstream ss(path);
+    std::string part;
+    while (std::getline(ss, part, '/')) {
+        if (part.empty() || part == ".") continue;
+        parts.push_back(part);
+    }
+    return parts;
+}
+
+std::string relative_symlink_target(const std::string& link_path, const std::string& target_path) {
+    std::vector<std::string> from_parts = split_path_components(path_parent_dir(link_path));
+    std::vector<std::string> to_parts = split_path_components(target_path);
+
+    size_t common = 0;
+    while (common < from_parts.size() &&
+           common < to_parts.size() &&
+           from_parts[common] == to_parts[common]) {
+        ++common;
+    }
+
+    std::string relative;
+    for (size_t i = common; i < from_parts.size(); ++i) {
+        if (!relative.empty()) relative += "/";
+        relative += "..";
+    }
+    for (size_t i = common; i < to_parts.size(); ++i) {
+        if (!relative.empty()) relative += "/";
+        relative += to_parts[i];
+    }
+
+    return relative.empty() ? "." : relative;
+}
+
 bool ensure_symlink_target_if_possible(
     const std::string& link_path,
-    const std::string& target
+    const std::string& target,
+    bool replace_non_symlink = false
 ) {
     struct stat st;
     if (lstat(link_path.c_str(), &st) == 0) {
-        if (!S_ISLNK(st.st_mode)) return true;
+        if (!S_ISLNK(st.st_mode) && !replace_non_symlink) return true;
+        if (S_ISDIR(st.st_mode)) return false;
         if (read_symlink_target(link_path) == target) return true;
         if (unlink(link_path.c_str()) != 0) return false;
     } else if (errno != ENOENT) {
@@ -107,6 +145,16 @@ bool ensure_symlink_target_if_possible(
 
     if (!mkdir_p(path_parent_dir(link_path))) return false;
     return symlink(target.c_str(), link_path.c_str()) == 0;
+}
+
+bool runtime_alias_paths_equivalent(
+    const std::string& active_path,
+    const std::string& compat_path
+) {
+    if (!path_exists_no_follow(active_path) || !path_exists_no_follow(compat_path)) return false;
+    std::string active_real = canonical_existing_path(active_path);
+    std::string compat_real = canonical_existing_path(compat_path);
+    return !active_real.empty() && active_real == compat_real;
 }
 
 void sync_multiarch_runtime_aliases_for_prefix(
@@ -129,7 +177,14 @@ void sync_multiarch_runtime_aliases_for_prefix(
             if (lstat(active_path.c_str(), &st) != 0 || S_ISDIR(st.st_mode)) continue;
 
             std::string compat_path = compat_dir + "/" + name;
-            if (!ensure_symlink_target_if_possible(compat_path, "../" + name)) {
+            if (runtime_alias_paths_equivalent(active_path, compat_path)) continue;
+
+            std::string compat_target = relative_symlink_target(
+                compat_live_prefix + "/" + name,
+                active_live_prefix + "/" + name
+            );
+            bool replace_non_symlink = path_exists_no_follow(compat_path);
+            if (!ensure_symlink_target_if_possible(compat_path, compat_target, replace_non_symlink)) {
                 VLOG("Failed to refresh multiarch compat alias for " << compat_path);
             }
         }
@@ -149,7 +204,11 @@ void sync_multiarch_runtime_aliases_for_prefix(
 
             std::string active_path = active_dir + "/" + name;
             if (!path_exists_no_follow(active_path)) {
-                if (!ensure_symlink_target_if_possible(active_path, compat_live_prefix + "/" + name)) {
+                std::string active_target = relative_symlink_target(
+                    active_live_prefix + "/" + name,
+                    compat_live_prefix + "/" + name
+                );
+                if (!ensure_symlink_target_if_possible(active_path, active_target)) {
                     VLOG("Failed to backfill active runtime alias for " << active_path);
                 }
             }
@@ -160,7 +219,9 @@ void sync_multiarch_runtime_aliases_for_prefix(
 
 void sync_multiarch_runtime_aliases() {
     sync_multiarch_runtime_aliases_for_prefix("/lib64", "/lib64/x86_64-linux-gnu");
+    sync_multiarch_runtime_aliases_for_prefix("/lib64", "/lib/x86_64-linux-gnu");
     sync_multiarch_runtime_aliases_for_prefix("/usr/lib64", "/usr/lib64/x86_64-linux-gnu");
+    sync_multiarch_runtime_aliases_for_prefix("/usr/lib64", "/usr/lib/x86_64-linux-gnu");
 }
 
 std::string canonical_existing_path(const std::string& path) {
