@@ -375,8 +375,13 @@ PackageMetadata build_debian_package_metadata(
     meta.recommends = recommends;
     meta.suggests = suggests;
     meta.conflicts = normalize_relation_field_value(record.conflicts_raw, config.apt_arch);
+    for (const auto& dep : package_override.conflicts_add) meta.conflicts.push_back(dep);
+    
     meta.provides = normalize_relation_field_value(record.provides_raw, config.apt_arch);
+    
     meta.replaces = normalize_relation_field_value(record.replaces_raw, config.apt_arch);
+    for (const auto& dep : package_override.replaces_add) meta.replaces.push_back(dep);
+    
     meta.package_scope = include_recommends ? "depends+recommends" : "depends";
     meta.installed_from = config.packages_url;
     return meta;

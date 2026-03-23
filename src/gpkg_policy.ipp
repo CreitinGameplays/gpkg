@@ -17,6 +17,8 @@ struct PackageOverridePolicy {
     bool include_recommends = true;
     std::vector<std::string> depends_add;
     std::vector<std::string> depends_remove;
+    std::vector<std::string> conflicts_add;
+    std::vector<std::string> replaces_add;
 };
 
 struct ImportPolicy {
@@ -252,6 +254,8 @@ ImportPolicy load_import_policy(bool verbose = false) {
             }
             package_override.depends_add = json_string_array(json_object_get(entry.second, "depends_add"));
             package_override.depends_remove = json_string_array(json_object_get(entry.second, "depends_remove"));
+            package_override.conflicts_add = json_string_array(json_object_get(entry.second, "conflicts_add"));
+            package_override.replaces_add = json_string_array(json_object_get(entry.second, "replaces_add"));
             policy.package_overrides[entry.first] = package_override;
         }
     }
