@@ -186,6 +186,8 @@ bool queued_candidate_satisfies_dependency(
     return package_metadata_satisfies_dependency(meta.name, meta, dep);
 }
 
+std::map<std::string, std::vector<std::string>> load_upgrade_companions();
+
 bool find_installed_dependency_provider(
     const Dependency& dep,
     const std::set<std::string>& installed_cache,
@@ -445,6 +447,96 @@ bool package_replaces_package(
     return relation_list_matches_package(meta.replaces, pkg_name, pkg_meta);
 }
 
+void sort_transaction_queue_for_install(
+    std::vector<PackageMetadata>& queue,
+    bool verbose
+) {
+    if (queue.size() < 2) return;
+
+    const size_t n = queue.size();
+    std::vector<std::set<size_t>> outgoing(n);
+    std::vector<size_t> indegree(n, 0);
+
+    auto add_edge = [&](size_t from, size_t to) {
+        if (from == to) return;
+        if (outgoing[from].insert(to).second) {
+            ++indegree[to];
+        }
+    };
+
+    for (size_t dependent = 0; dependent < n; ++dependent) {
+        for (const auto& dep_str : collect_transaction_dependency_edges(queue[dependent])) {
+            Dependency dep = parse_dependency(dep_str);
+            if (dep.name.empty()) continue;
+
+            int provider_index = -1;
+            for (size_t candidate = 0; candidate < n; ++candidate) {
+                if (candidate == dependent) continue;
+                if (!queued_candidate_satisfies_dependency(queue[candidate], dep)) continue;
+                provider_index = static_cast<int>(candidate);
+                break;
+            }
+
+            if (provider_index >= 0) {
+                add_edge(static_cast<size_t>(provider_index), dependent);
+            }
+        }
+    }
+
+    std::map<std::string, std::vector<std::string>> companion_map = load_upgrade_companions();
+    std::map<std::string, std::set<std::string>> reverse_companions;
+    for (const auto& entry : companion_map) {
+        std::string trigger = canonicalize_package_name(entry.first, verbose);
+        for (const auto& companion_token : entry.second) {
+            Dependency dep = parse_dependency(companion_token);
+            if (dep.name.empty()) continue;
+            reverse_companions[canonicalize_package_name(dep.name, verbose)].insert(trigger);
+        }
+    }
+
+    std::vector<PackageMetadata> ordered;
+    ordered.reserve(n);
+    std::vector<bool> emitted(n, false);
+    std::set<std::string> completed_names;
+
+    auto candidate_priority = [&](size_t index) {
+        std::string canonical_name = canonicalize_package_name(queue[index].name, verbose);
+        auto it = reverse_companions.find(canonical_name);
+        if (it == reverse_companions.end()) return 1;
+        for (const auto& trigger : it->second) {
+            if (completed_names.count(trigger) != 0) return 0;
+        }
+        return 1;
+    };
+
+    for (size_t emitted_count = 0; emitted_count < n; ++emitted_count) {
+        size_t best_index = n;
+        int best_priority = 2;
+        for (size_t i = 0; i < n; ++i) {
+            if (emitted[i] || indegree[i] != 0) continue;
+            int priority = candidate_priority(i);
+            if (best_index == n || priority < best_priority || (priority == best_priority && i < best_index)) {
+                best_index = i;
+                best_priority = priority;
+            }
+        }
+
+        if (best_index == n) {
+            VLOG(verbose, "Falling back to original transaction order because dependency ordering contains a cycle or unresolved provider ambiguity.");
+            return;
+        }
+
+        emitted[best_index] = true;
+        ordered.push_back(queue[best_index]);
+        completed_names.insert(canonicalize_package_name(queue[best_index].name, verbose));
+        for (size_t successor : outgoing[best_index]) {
+            if (indegree[successor] > 0) --indegree[successor];
+        }
+    }
+
+    queue.swap(ordered);
+}
+
 bool build_transaction_plan(
     const std::vector<PackageMetadata>& queue,
     const std::set<std::string>& installed,
@@ -512,6 +604,8 @@ bool build_transaction_plan(
     for (size_t i = 0; i < working_queue.size(); ++i) {
         if (!dropped[i]) out_plan.install_queue.push_back(working_queue[i]);
     }
+
+    sort_transaction_queue_for_install(out_plan.install_queue, verbose);
 
     std::set<std::string> scheduled_retirements;
     for (const auto& pkg : out_plan.install_queue) {

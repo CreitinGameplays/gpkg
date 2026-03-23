@@ -25,7 +25,7 @@ std::string get_info_dir() {
     return g_root_prefix + "/var/lib/gpkg/info/";
 }
 
-const std::string TMP_EXTRACT_PATH = "/tmp/gpkg_worker_extract/";
+std::string g_tmp_extract_path;
 
 std::string path_parent_dir(const std::string& full_path);
 bool mkdir_p(const std::string& path);
@@ -33,6 +33,9 @@ bool path_exists_no_follow(const std::string& path);
 bool write_text_file_atomic(const std::string& target_path, const std::string& content, mode_t mode = 0644);
 bool copy_file_atomic(const std::string& source_path, const std::string& target_path);
 bool copy_path_atomic_no_follow(const std::string& source_path, const std::string& target_path);
+bool remove_tree_no_follow(const std::string& path);
+bool path_is_directory_or_directory_symlink(const std::string& full_path, const struct stat* lstat_result = nullptr);
+bool remove_live_path_exact(const std::string& live_full_path);
 std::string canonical_existing_path(const std::string& path);
 std::string allocate_sibling_temp_path(const std::string& live_full_path, const std::string& tag, int* fd_out = nullptr);
 
@@ -72,6 +75,46 @@ int decode_command_exit_status(int status) {
     return status;
 }
 
+int run_executable(const std::vector<std::string>& argv) {
+    if (argv.empty() || argv.front().empty()) return -1;
+
+    std::ostringstream rendered;
+    for (size_t i = 0; i < argv.size(); ++i) {
+        if (i != 0) rendered << " ";
+        rendered << shell_quote(argv[i]);
+    }
+    VLOG("Execv: " << rendered.str());
+
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        std::vector<char*> cargv;
+        cargv.reserve(argv.size() + 1);
+        for (const auto& arg : argv) {
+            cargv.push_back(const_cast<char*>(arg.c_str()));
+        }
+        cargv.push_back(nullptr);
+        execv(argv.front().c_str(), cargv.data());
+        _exit(127);
+    }
+
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno == EINTR) continue;
+        return -1;
+    }
+    return status;
+}
+
+int run_path_with_args(const std::string& path, const std::vector<std::string>& args = {}) {
+    if (path.empty()) return -1;
+    std::vector<std::string> argv;
+    argv.reserve(args.size() + 1);
+    argv.push_back(path);
+    argv.insert(argv.end(), args.begin(), args.end());
+    return decode_command_exit_status(run_executable(argv));
+}
+
 bool refresh_linker_cache_if_available() {
     const char* candidates[] = {
         "/sbin/ldconfig",
@@ -82,12 +125,9 @@ bool refresh_linker_cache_if_available() {
 
     for (const char* candidate : candidates) {
         if (access(candidate, X_OK) != 0) continue;
-        std::string cmd = candidate;
-        if (!g_root_prefix.empty()) {
-            cmd += " -r " + shell_quote(g_root_prefix);
-        }
-        int status = run_command(cmd);
-        return decode_command_exit_status(status) == 0;
+        return run_path_with_args(candidate, g_root_prefix.empty()
+            ? std::vector<std::string>{}
+            : std::vector<std::string>{"-r", g_root_prefix}) == 0;
     }
 
     return true;
@@ -280,14 +320,88 @@ bool runtime_alias_pair_for_path(
 }
 
 bool mkdir_p(const std::string& path) {
-    std::string cmd = "mkdir -p " + shell_quote(path);
-    return run_command(cmd) == 0;
+    if (path.empty()) return false;
+    if (path == "/" || path == ".") return true;
+
+    std::string current;
+    if (!path.empty() && path[0] == '/') current = "/";
+    std::vector<std::string> parts = split_path_components(path);
+    for (const auto& part : parts) {
+        if (current.empty() || current == "/") current += part;
+        else current += "/" + part;
+
+        struct stat st;
+        if (lstat(current.c_str(), &st) == 0) {
+            if (!path_is_directory_or_directory_symlink(current, &st)) {
+                errno = ENOTDIR;
+                return false;
+            }
+            continue;
+        }
+        if (errno != ENOENT) return false;
+        if (mkdir(current.c_str(), 0755) != 0 && errno != EEXIST) return false;
+    }
+
+    return true;
 }
 
 bool path_exists_no_follow(const std::string& path) {
     struct stat st;
     return lstat(path.c_str(), &st) == 0;
 }
+
+bool remove_tree_no_follow(const std::string& path) {
+    struct stat st;
+    if (lstat(path.c_str(), &st) != 0) return errno == ENOENT;
+
+    if (!S_ISDIR(st.st_mode) || S_ISLNK(st.st_mode)) {
+        return unlink(path.c_str()) == 0 || errno == ENOENT;
+    }
+
+    DIR* dir = opendir(path.c_str());
+    if (!dir) return false;
+
+    bool ok = true;
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != nullptr) {
+        std::string name = entry->d_name;
+        if (name == "." || name == "..") continue;
+        if (!remove_tree_no_follow(path + "/" + name)) {
+            ok = false;
+            break;
+        }
+    }
+    int saved_errno = errno;
+    closedir(dir);
+    if (!ok) {
+        errno = saved_errno;
+        return false;
+    }
+
+    return rmdir(path.c_str()) == 0 || errno == ENOENT;
+}
+
+bool create_extract_workspace() {
+    char path_template[] = "/tmp/gpkg_worker_extract-XXXXXX";
+    char* created = mkdtemp(path_template);
+    if (!created) return false;
+    g_tmp_extract_path = std::string(created) + "/";
+    return true;
+}
+
+void cleanup_extract_workspace() {
+    if (g_tmp_extract_path.empty()) return;
+    remove_tree_no_follow(g_tmp_extract_path);
+    g_tmp_extract_path.clear();
+}
+
+struct ScopedExtractWorkspace {
+    bool active = false;
+
+    ~ScopedExtractWorkspace() {
+        if (active) cleanup_extract_workspace();
+    }
+};
 
 // --- Database (List File) Management ---
 
@@ -593,7 +707,7 @@ struct ReplacedSystemFile {
 
 bool path_is_directory_or_directory_symlink(
     const std::string& full_path,
-    const struct stat* lstat_result = nullptr
+    const struct stat* lstat_result
 ) {
     struct stat local_st;
     const struct stat* st = lstat_result;
@@ -643,7 +757,7 @@ std::vector<PreservedConfigFile> collect_preserved_config_files(
 
         PreservedConfigFile entry;
         entry.path = file;
-        entry.backup_path = TMP_EXTRACT_PATH + "preserve/" + std::to_string(preserve_index++) + ".orig";
+        entry.backup_path = g_tmp_extract_path + "preserve/" + std::to_string(preserve_index++) + ".orig";
         preserved.push_back(entry);
     }
 
@@ -652,12 +766,11 @@ std::vector<PreservedConfigFile> collect_preserved_config_files(
 
 bool backup_preserved_config_files(const std::vector<PreservedConfigFile>& preserved) {
     if (preserved.empty()) return true;
-    if (!mkdir_p(TMP_EXTRACT_PATH + "preserve")) return false;
+    if (!mkdir_p(g_tmp_extract_path + "preserve")) return false;
 
     for (const auto& entry : preserved) {
         std::string source_path = g_root_prefix + entry.path;
-        std::string cmd = "cp -a " + shell_quote(source_path) + " " + shell_quote(entry.backup_path);
-        if (run_command(cmd) != 0) {
+        if (!copy_path_atomic_no_follow(source_path, entry.backup_path)) {
             std::cerr << "E: Failed to back up local config " << entry.path << std::endl;
             return false;
         }
@@ -667,7 +780,24 @@ bool backup_preserved_config_files(const std::vector<PreservedConfigFile>& prese
 }
 
 bool paths_are_identical(const std::string& left, const std::string& right) {
-    return run_command("cmp -s " + shell_quote(left) + " " + shell_quote(right)) == 0;
+    struct stat left_st;
+    struct stat right_st;
+    if (lstat(left.c_str(), &left_st) != 0) return false;
+    if (lstat(right.c_str(), &right_st) != 0) return false;
+
+    mode_t left_type = left_st.st_mode & S_IFMT;
+    mode_t right_type = right_st.st_mode & S_IFMT;
+    if (left_type != right_type) return false;
+
+    if (S_ISLNK(left_st.st_mode)) {
+        return read_symlink_target(left) == read_symlink_target(right);
+    }
+
+    if (S_ISREG(left_st.st_mode)) {
+        return compare_regular_files_exact(left, right);
+    }
+
+    return false;
 }
 
 void apply_preserved_config_metadata(
@@ -694,14 +824,18 @@ bool finalize_preserved_config_files(std::vector<PreservedConfigFile>& preserved
         }
 
         if (paths_are_identical(entry.backup_path, live_path)) {
-            if (run_command("rm -f " + shell_quote(live_path)) != 0) {
+            if (!remove_live_path_exact(live_path)) {
                 std::cerr << "E: Failed to discard duplicate package config " << entry.path << std::endl;
                 return false;
             }
             entry.staged_path.clear();
             VLOG("Keeping existing config " << entry.path << " (package copy was identical).");
         } else {
-            if (run_command("mv -f " + shell_quote(live_path) + " " + shell_quote(staged_live_path)) != 0) {
+            if (!remove_live_path_exact(staged_live_path)) {
+                std::cerr << "E: Failed to clear stale staged config " << entry.path << ".gpkg-new" << std::endl;
+                return false;
+            }
+            if (rename(live_path.c_str(), staged_live_path.c_str()) != 0) {
                 std::cerr << "E: Failed to stage package config as " << entry.path << ".gpkg-new" << std::endl;
                 return false;
             }
@@ -710,7 +844,7 @@ bool finalize_preserved_config_files(std::vector<PreservedConfigFile>& preserved
                       << "; package version saved as " << entry.staged_path << std::endl;
         }
 
-        if (run_command("cp -a " + shell_quote(entry.backup_path) + " " + shell_quote(live_path)) != 0) {
+        if (!copy_path_atomic_no_follow(entry.backup_path, live_path)) {
             std::cerr << "E: Failed to restore preserved config " << entry.path << std::endl;
             return false;
         }
@@ -746,7 +880,11 @@ bool write_replaced_system_files(
 ) {
     if (entries.empty()) {
         unlink(get_replaced_system_manifest(pkg_name).c_str());
-        run_command("rm -rf " + shell_quote(get_replaced_system_dir(pkg_name)));
+        if (!remove_tree_no_follow(get_replaced_system_dir(pkg_name)) && errno != ENOENT) {
+            std::cerr << "E: Failed to remove stale system backup directory for "
+                      << pkg_name << ": " << strerror(errno) << std::endl;
+            return false;
+        }
         return true;
     }
 
@@ -928,8 +1066,7 @@ bool remove_path(const std::string& abs_path) {
         } else {
             // count == 0
             VLOG("Directory is empty (count 0). Removing.");
-            std::string cmd = "rmdir \"" + full_path + "\"";
-            if (run_command(cmd) == 0) {
+            if (rmdir(full_path.c_str()) == 0) {
                 VLOG("Removed directory: " << full_path);
                 return true;
             } else {
@@ -1146,24 +1283,36 @@ bool backup_live_path_if_present(
     }
 
     if (rename(live_full_path.c_str(), backup_full_path.c_str()) != 0) {
-        if (errno == EXDEV) {
-            std::string cmd = "mv -f " + shell_quote(live_full_path) + " " + shell_quote(backup_full_path);
-            if (run_command(cmd) != 0) {
-                std::cerr << "E: Failed to move existing path aside for " << live_full_path << " (via mv fallback)" << std::endl;
-                // 'mv' failed, potentially leaving a partial copy. Use rm -rf to clean it up since it might be a directory
-                run_command("rm -rf " + shell_quote(backup_full_path));
-                return false;
-            }
-        } else {
-            std::cerr << "E: Failed to move existing path aside for " << live_full_path << ": "
-                      << strerror(errno) << std::endl;
-            unlink(backup_full_path.c_str());
-            return false;
-        }
+        std::cerr << "E: Failed to move existing path aside for " << live_full_path << ": "
+                  << strerror(errno) << std::endl;
+        unlink(backup_full_path.c_str());
+        return false;
     }
 
     if (had_existing) *had_existing = true;
     rollback_entries.push_back({path, live_full_path, backup_full_path, false});
+    return true;
+}
+
+bool prepare_path_for_transaction_write(
+    const std::string& live_full_path,
+    const std::string& logical_path,
+    std::vector<InstallRollbackEntry>& rollback_entries
+) {
+    if (!mkdir_p(path_parent_dir(live_full_path))) {
+        std::cerr << "E: Failed to prepare parent directory for " << live_full_path << std::endl;
+        return false;
+    }
+
+    bool had_existing = false;
+    if (!backup_live_path_if_present(live_full_path, logical_path, rollback_entries, &had_existing)) {
+        return false;
+    }
+
+    if (!had_existing) {
+        rollback_entries.push_back({logical_path, live_full_path, "", true});
+    }
+
     return true;
 }
 
@@ -1296,6 +1445,69 @@ bool copy_path_atomic_no_follow(const std::string& source_path, const std::strin
 
     if (!S_ISREG(st.st_mode)) return false;
     return copy_file_atomic(source_path, target_path);
+}
+
+std::vector<std::string> load_registered_undo_commands(const std::string& pkg_name) {
+    std::vector<std::string> undo_cmds;
+    std::string undo_path = get_info_dir() + pkg_name + ".undo";
+    std::ifstream undo_f(undo_path);
+    if (!undo_f) return undo_cmds;
+
+    std::string line;
+    while (std::getline(undo_f, line)) {
+        line = trim(line);
+        if (!line.empty()) undo_cmds.push_back(line);
+    }
+
+    return undo_cmds;
+}
+
+bool run_registered_undo_commands_reverse(
+    const std::vector<std::string>& undo_cmds,
+    const std::string& context,
+    bool best_effort = false
+) {
+    for (auto it = undo_cmds.rbegin(); it != undo_cmds.rend(); ++it) {
+        if (run_command(*it) == 0) continue;
+        if (best_effort) {
+            std::cerr << "W: Undo command failed during " << context << "." << std::endl;
+            continue;
+        }
+        std::cerr << "E: Undo command failed during " << context << "." << std::endl;
+        return false;
+    }
+    return true;
+}
+
+bool run_postinst_abort_remove(const std::string& pkg_name, bool best_effort = true) {
+    std::string postinst = get_info_dir() + pkg_name + ".postinst";
+    if (access(postinst.c_str(), X_OK) != 0) return true;
+
+    int rc = run_path_with_args(postinst, {"abort-remove"});
+    if (rc == 0) return true;
+    if (best_effort) {
+        std::cerr << "W: postinst abort-remove failed for " << pkg_name << "." << std::endl;
+        return false;
+    }
+
+    std::cerr << "E: postinst abort-remove failed for " << pkg_name << "." << std::endl;
+    return false;
+}
+
+void rollback_remove_transaction(
+    const std::string& pkg_name,
+    std::vector<InstallRollbackEntry>& rollback_entries,
+    bool runtime_sensitive,
+    bool try_abort_remove = true
+) {
+    rollback_install_changes(rollback_entries);
+    if (runtime_sensitive) {
+        sync_multiarch_runtime_aliases();
+        refresh_linker_cache_if_available();
+    }
+    if (try_abort_remove) {
+        run_postinst_abort_remove(pkg_name, true);
+    }
 }
 
 bool activate_live_path_from_source(
@@ -1519,22 +1731,14 @@ bool action_remove_safe(const std::string& pkg_name) {
 
     std::string prerm = get_info_dir() + pkg_name + ".prerm";
     if (access(prerm.c_str(), X_OK) == 0) {
-        if (run_command(prerm) != 0) {
+        if (run_path_with_args(prerm, {"remove"}) != 0) {
+            run_postinst_abort_remove(pkg_name, true);
             std::cerr << "E: prerm script failed." << std::endl;
             return false;
         }
     }
 
-    std::string undo_path = get_info_dir() + pkg_name + ".undo";
-    std::vector<std::string> undo_cmds;
-    std::ifstream undo_f(undo_path);
-    if (undo_f) {
-        std::string line;
-        while (std::getline(undo_f, line)) {
-            line = trim(line);
-            if (!line.empty()) undo_cmds.push_back(line);
-        }
-    }
+    std::vector<std::string> undo_cmds = load_registered_undo_commands(pkg_name);
 
     std::vector<std::string> owned_files = read_list_file(pkg_name);
     bool runtime_sensitive = files_touch_runtime_linker_state(owned_files);
@@ -1543,49 +1747,44 @@ bool action_remove_safe(const std::string& pkg_name) {
     std::vector<InstallRollbackEntry> removal_rollback_entries;
     for (const auto& path : owned_files) {
         if (!stage_owned_path_removal(path, removal_rollback_entries)) {
-            rollback_install_changes(removal_rollback_entries);
+            rollback_remove_transaction(pkg_name, removal_rollback_entries, runtime_sensitive);
             std::cerr << "E: Failed while staging removal of " << path << std::endl;
             return false;
         }
     }
 
     if (!stage_replaced_system_restore(pkg_name, removal_rollback_entries)) {
-        rollback_install_changes(removal_rollback_entries);
+        rollback_remove_transaction(pkg_name, removal_rollback_entries, runtime_sensitive);
         std::cerr << "E: Failed to restore replaced system files safely." << std::endl;
         return false;
     }
 
     if (!undo_cmds.empty()) {
         VLOG("Executing " << undo_cmds.size() << " registered undo commands...");
-        for (auto it = undo_cmds.rbegin(); it != undo_cmds.rend(); ++it) {
-            if (run_command(*it) != 0) {
-                rollback_install_changes(removal_rollback_entries);
-                std::cerr << "E: Undo command failed during removal." << std::endl;
-                return false;
-            }
+        if (!run_registered_undo_commands_reverse(undo_cmds, "removal")) {
+            rollback_remove_transaction(pkg_name, removal_rollback_entries, runtime_sensitive);
+            return false;
         }
     }
 
     std::string postrm = get_info_dir() + pkg_name + ".postrm";
     if (access(postrm.c_str(), X_OK) == 0) {
-        if (run_command(postrm) != 0) {
-            rollback_install_changes(removal_rollback_entries);
+        if (run_path_with_args(postrm, {"remove"}) != 0) {
+            rollback_remove_transaction(pkg_name, removal_rollback_entries, runtime_sensitive);
             std::cerr << "E: postrm script failed." << std::endl;
             return false;
         }
     }
 
     if (!stage_package_metadata_removal(pkg_name, removal_rollback_entries)) {
-        rollback_install_changes(removal_rollback_entries);
+        rollback_remove_transaction(pkg_name, removal_rollback_entries, runtime_sensitive, false);
         std::cerr << "E: Failed to remove package metadata safely." << std::endl;
         return false;
     }
 
     sync_multiarch_runtime_aliases();
     if (runtime_sensitive && !refresh_linker_cache_if_available()) {
-        rollback_install_changes(removal_rollback_entries);
-        sync_multiarch_runtime_aliases();
-        refresh_linker_cache_if_available();
+        rollback_remove_transaction(pkg_name, removal_rollback_entries, runtime_sensitive, false);
         std::cerr << "E: ldconfig failed after removing runtime files for "
                   << pkg_name << "." << std::endl;
         return false;
@@ -1690,13 +1889,12 @@ bool build_staged_install_entries(
 
 void rollback_install_changes(const std::vector<InstallRollbackEntry>& rollback_entries) {
     for (auto it = rollback_entries.rbegin(); it != rollback_entries.rend(); ++it) {
-        remove_live_path_exact(it->live_full_path);
+        if (it->created_only) remove_tree_no_follow(it->live_full_path);
+        else remove_live_path_exact(it->live_full_path);
         if (!it->backup_full_path.empty()) {
             if (rename(it->backup_full_path.c_str(), it->live_full_path.c_str()) != 0) {
-                if (errno == EXDEV) {
-                    std::string cmd = "mv -f " + shell_quote(it->backup_full_path) + " " + shell_quote(it->live_full_path);
-                    run_command(cmd);
-                }
+                std::cerr << "W: Failed to restore backup for " << it->path << ": "
+                          << strerror(errno) << std::endl;
             }
         }
     }
@@ -1705,7 +1903,10 @@ void rollback_install_changes(const std::vector<InstallRollbackEntry>& rollback_
 void discard_install_backups(const std::vector<InstallRollbackEntry>& rollback_entries) {
     for (const auto& entry : rollback_entries) {
         if (entry.backup_full_path.empty()) continue;
-        run_command("rm -rf " + shell_quote(entry.backup_full_path));
+        if (!remove_tree_no_follow(entry.backup_full_path) && errno != ENOENT) {
+            std::cerr << "W: Failed to discard backup path " << entry.backup_full_path
+                      << ": " << strerror(errno) << std::endl;
+        }
     }
 }
 
@@ -1713,8 +1914,6 @@ bool apply_staged_install_entries(
     const std::vector<StagedInstallEntry>& entries,
     std::vector<InstallRollbackEntry>& rollback_entries
 ) {
-    rollback_entries.clear();
-
     for (const auto& entry : entries) {
         std::string live_full_path = g_root_prefix + entry.path;
 
@@ -1925,7 +2124,7 @@ bool verify_staged_install_entries(
 
 std::vector<std::string> get_staged_replaces() {
     std::vector<std::string> replaced;
-    std::ifstream f(TMP_EXTRACT_PATH + "control.json");
+    std::ifstream f(g_tmp_extract_path + "control.json");
     if (!f) return replaced;
     std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
     size_t key_pos = content.find("\"replaces\"");
@@ -2025,12 +2224,13 @@ std::string get_package_version(const std::string& pkg_name) {
 
 bool action_install(const std::string& pkg_file) {
     // 1. Unpack to temp
-    run_command("rm -rf " + TMP_EXTRACT_PATH);
-    if (!mkdir_p(TMP_EXTRACT_PATH)) {
+    ScopedExtractWorkspace workspace;
+    if (!create_extract_workspace()) {
         std::cerr << "E: Failed to prepare extraction workspace." << std::endl;
         return false;
     }
-    std::string tmp_tar = TMP_EXTRACT_PATH + "temp.tar";
+    workspace.active = true;
+    std::string tmp_tar = g_tmp_extract_path + "temp.tar";
 
     std::string archive_error;
     if (!GpkgArchive::decompress_zstd_file(pkg_file, tmp_tar, &archive_error)) {
@@ -2040,15 +2240,15 @@ bool action_install(const std::string& pkg_file) {
         return false;
     }
 
-    if (!GpkgArchive::tar_extract_to_directory(tmp_tar, TMP_EXTRACT_PATH, {}, &archive_error)) {
+    if (!GpkgArchive::tar_extract_to_directory(tmp_tar, g_tmp_extract_path, {}, &archive_error)) {
         std::cerr << "E: Package extraction failed.";
         if (!archive_error.empty()) std::cerr << " " << archive_error;
         std::cerr << std::endl;
         return false;
     }
     
-    std::string data_tar_zst = TMP_EXTRACT_PATH + "data.tar.zst";
-    std::string data_tar = TMP_EXTRACT_PATH + "data.tar";
+    std::string data_tar_zst = g_tmp_extract_path + "data.tar.zst";
+    std::string data_tar = g_tmp_extract_path + "data.tar";
 
     if (!GpkgArchive::decompress_zstd_file(data_tar_zst, data_tar, &archive_error)) {
          std::cerr << "E: Data decompression failed.";
@@ -2066,7 +2266,7 @@ bool action_install(const std::string& pkg_file) {
     
     std::string pkg_name;
     std::string new_version;
-    std::ifstream control_file(TMP_EXTRACT_PATH + "control.json");
+    std::ifstream control_file(g_tmp_extract_path + "control.json");
     std::string content((std::istreambuf_iterator<char>(control_file)), std::istreambuf_iterator<char>());
     
     // Parse name
@@ -2092,7 +2292,6 @@ bool action_install(const std::string& pkg_file) {
 
     // 3. Check Collisions & Detect Upgrade
     if (!check_collisions(pkg_name, new_files)) {
-        run_command("rm -rf " + TMP_EXTRACT_PATH);
         return false;
     }
 
@@ -2106,12 +2305,14 @@ bool action_install(const std::string& pkg_file) {
     }
     std::vector<ReplacedSystemFile> replaced_system_files =
         collect_replaced_system_files(pkg_name, new_files, old_files_set);
+    std::vector<InstallRollbackEntry> install_rollback_entries;
 
     // 4. Preinst
-    std::string preinst = TMP_EXTRACT_PATH + "scripts/preinst";
+    std::string preinst = g_tmp_extract_path + "scripts/preinst";
     if (access(preinst.c_str(), X_OK) == 0) {
-        std::string cmd = preinst + " " + (is_upgrade ? "upgrade " + old_version : "install");
-        if (run_command(cmd) != 0) {
+        std::vector<std::string> preinst_args = {is_upgrade ? "upgrade" : "install"};
+        if (is_upgrade) preinst_args.push_back(old_version);
+        if (run_path_with_args(preinst, preinst_args) != 0) {
              std::cerr << "E: preinst failed." << std::endl;
              return false;
         }
@@ -2122,14 +2323,23 @@ bool action_install(const std::string& pkg_file) {
     if (!backup_preserved_config_files(preserved_configs)) {
         return false;
     }
+    if (!prepare_path_for_transaction_write(
+            get_replaced_system_dir(pkg_name),
+            get_replaced_system_dir(pkg_name),
+            install_rollback_entries)) {
+        rollback_install_changes(install_rollback_entries);
+        return false;
+    }
     if (!backup_replaced_system_files(replaced_system_files)) {
+        rollback_install_changes(install_rollback_entries);
         return false;
     }
 
     // 5. Extract into a staging tree first, then apply entries atomically.
-    std::string payload_root = TMP_EXTRACT_PATH + "payload";
-    run_command("rm -rf " + shell_quote(payload_root));
+    std::string payload_root = g_tmp_extract_path + "payload";
+    remove_tree_no_follow(payload_root);
     if (!mkdir_p(payload_root)) {
+        rollback_install_changes(install_rollback_entries);
         std::cerr << "E: Failed to create payload staging directory." << std::endl;
         return false;
     }
@@ -2137,6 +2347,7 @@ bool action_install(const std::string& pkg_file) {
     GpkgArchive::TarExtractOptions extract_options;
     extract_options.strip_components = strip_data ? 1 : 0;
     if (!GpkgArchive::tar_extract_to_directory(data_tar, payload_root, extract_options, &archive_error)) {
+        rollback_install_changes(install_rollback_entries);
         std::cerr << "E: Extraction failed." << std::endl;
         if (!archive_error.empty()) std::cerr << "E: " << archive_error << std::endl;
         return false;
@@ -2144,10 +2355,10 @@ bool action_install(const std::string& pkg_file) {
 
     std::vector<StagedInstallEntry> staged_entries;
     if (!build_staged_install_entries(new_files, payload_root, staged_entries)) {
+        rollback_install_changes(install_rollback_entries);
         return false;
     }
 
-    std::vector<InstallRollbackEntry> install_rollback_entries;
     if (!apply_staged_install_entries(staged_entries, install_rollback_entries)) {
         rollback_install_changes(install_rollback_entries);
         std::cerr << "E: Failed to apply staged filesystem changes safely." << std::endl;
@@ -2169,15 +2380,6 @@ bool action_install(const std::string& pkg_file) {
             }
             return false;
         }
-
-        if (!refresh_linker_cache_if_available()) {
-            rollback_install_changes(install_rollback_entries);
-            sync_multiarch_runtime_aliases();
-            refresh_linker_cache_if_available();
-            std::cerr << "E: ldconfig failed after installing runtime files for "
-                      << pkg_name << "." << std::endl;
-            return false;
-        }
     }
 
     if (!finalize_preserved_config_files(preserved_configs)) {
@@ -2189,18 +2391,37 @@ bool action_install(const std::string& pkg_file) {
         return false;
     }
 
+    if (runtime_sensitive && !refresh_linker_cache_if_available()) {
+        rollback_install_changes(install_rollback_entries);
+        sync_multiarch_runtime_aliases();
+        refresh_linker_cache_if_available();
+        std::cerr << "E: ldconfig failed after installing runtime files for "
+                  << pkg_name << "." << std::endl;
+        return false;
+    }
+
     std::vector<std::string> installed_files = new_files;
     apply_preserved_config_metadata(installed_files, preserved_configs);
     prune_non_owned_directory_symlink_entries(installed_files, staged_entries);
 
     // 6. Register in Database
-    run_command("mkdir -p " + get_info_dir());
+    if (!mkdir_p(get_info_dir())) {
+        rollback_install_changes(install_rollback_entries);
+        if (runtime_sensitive) {
+            sync_multiarch_runtime_aliases();
+            refresh_linker_cache_if_available();
+        }
+        std::cerr << "E: Failed to prepare package metadata directory." << std::endl;
+        return false;
+    }
 
     std::ostringstream list_buffer;
     for (const auto& f : installed_files) {
         list_buffer << f << "\n";
     }
-    if (!write_text_file_atomic(get_info_dir() + pkg_name + ".list", list_buffer.str(), 0644)) {
+    std::string list_path = get_info_dir() + pkg_name + ".list";
+    if (!prepare_path_for_transaction_write(list_path, list_path, install_rollback_entries) ||
+        !write_text_file_atomic(list_path, list_buffer.str(), 0644)) {
         rollback_install_changes(install_rollback_entries);
         if (runtime_sensitive) {
             sync_multiarch_runtime_aliases();
@@ -2210,13 +2431,25 @@ bool action_install(const std::string& pkg_file) {
         return false;
     }
     
-    if (!copy_file_atomic(TMP_EXTRACT_PATH + "control.json", get_info_dir() + pkg_name + ".json")) {
+    std::string json_path = get_info_dir() + pkg_name + ".json";
+    if (!prepare_path_for_transaction_write(json_path, json_path, install_rollback_entries) ||
+        !copy_file_atomic(g_tmp_extract_path + "control.json", json_path)) {
         rollback_install_changes(install_rollback_entries);
         if (runtime_sensitive) {
             sync_multiarch_runtime_aliases();
             refresh_linker_cache_if_available();
         }
         std::cerr << "E: Failed to write installed package metadata." << std::endl;
+        return false;
+    }
+    std::string replaced_manifest_path = get_replaced_system_manifest(pkg_name);
+    if (!prepare_path_for_transaction_write(replaced_manifest_path, replaced_manifest_path, install_rollback_entries)) {
+        rollback_install_changes(install_rollback_entries);
+        if (runtime_sensitive) {
+            sync_multiarch_runtime_aliases();
+            refresh_linker_cache_if_available();
+        }
+        std::cerr << "E: Failed to prepare replaced-system manifest path." << std::endl;
         return false;
     }
     if (!write_replaced_system_files(pkg_name, replaced_system_files)) {
@@ -2231,25 +2464,59 @@ bool action_install(const std::string& pkg_file) {
     // Copy scripts
     std::vector<std::string> scripts = {"preinst", "postinst", "prerm", "postrm"};
     for(const auto& s : scripts) {
-        std::string src = TMP_EXTRACT_PATH + "scripts/" + s;
-        if(access(src.c_str(), F_OK) == 0) {
-             if (!copy_file_atomic(src, get_info_dir() + pkg_name + "." + s)) {
-                 rollback_install_changes(install_rollback_entries);
-                 if (runtime_sensitive) {
-                     sync_multiarch_runtime_aliases();
-                     refresh_linker_cache_if_available();
-                 }
-                 std::cerr << "E: Failed to install maintainer script " << s << "." << std::endl;
-                 return false;
-             }
+        std::string src = g_tmp_extract_path + "scripts/" + s;
+        std::string target = get_info_dir() + pkg_name + "." + s;
+        if (!prepare_path_for_transaction_write(target, target, install_rollback_entries)) {
+            rollback_install_changes(install_rollback_entries);
+            if (runtime_sensitive) {
+                sync_multiarch_runtime_aliases();
+                refresh_linker_cache_if_available();
+            }
+            std::cerr << "E: Failed to prepare maintainer script target " << s << "." << std::endl;
+            return false;
         }
+        if(access(src.c_str(), F_OK) == 0) {
+            if (!copy_file_atomic(src, target)) {
+                rollback_install_changes(install_rollback_entries);
+                if (runtime_sensitive) {
+                    sync_multiarch_runtime_aliases();
+                    refresh_linker_cache_if_available();
+                }
+                std::cerr << "E: Failed to install maintainer script " << s << "." << std::endl;
+                return false;
+            }
+        }
+    }
+
+    std::string undo_path = get_info_dir() + pkg_name + ".undo";
+    if (!prepare_path_for_transaction_write(undo_path, undo_path, install_rollback_entries)) {
+        rollback_install_changes(install_rollback_entries);
+        if (runtime_sensitive) {
+            sync_multiarch_runtime_aliases();
+            refresh_linker_cache_if_available();
+        }
+        std::cerr << "E: Failed to prepare undo metadata path." << std::endl;
+        return false;
     }
 
     // 7. Postinst
     std::string installed_postinst = get_info_dir() + pkg_name + ".postinst";
     if (access(installed_postinst.c_str(), X_OK) == 0) {
-         std::string cmd = installed_postinst + " " + (is_upgrade ? "configure " + old_version : "configure");
-         run_command(cmd);
+         std::vector<std::string> postinst_args = {"configure"};
+         if (is_upgrade) postinst_args.push_back(old_version);
+         if (run_path_with_args(installed_postinst, postinst_args) != 0) {
+             std::vector<std::string> undo_cmds = load_registered_undo_commands(pkg_name);
+             if (!undo_cmds.empty()) {
+                 run_registered_undo_commands_reverse(undo_cmds, "failed postinst rollback", true);
+             }
+             rollback_install_changes(install_rollback_entries);
+             if (runtime_sensitive) {
+                 sync_multiarch_runtime_aliases();
+                 refresh_linker_cache_if_available();
+             }
+             std::cerr << "E: postinst failed." << std::endl;
+             return false;
+         }
     }
 
     // 8. Cleanup Orphans (Upgrade only)
@@ -2281,8 +2548,6 @@ bool action_install(const std::string& pkg_file) {
     discard_install_backups(install_rollback_entries);
 
     std::cout << "✓ Installed " << pkg_name << " (" << new_version << ")" << std::endl;
-    
-    run_command("rm -rf " + TMP_EXTRACT_PATH);
     return true;
 }
 

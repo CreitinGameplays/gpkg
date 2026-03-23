@@ -66,6 +66,12 @@ const std::string LOCK_FILE = ROOT_PREFIX + "/var/lib/gpkg/lock";
 constexpr size_t MAX_PARALLEL_PACKAGE_DOWNLOADS = 5;
 
 int run_command(const std::string& cmd, bool verbose);
+int run_command_argv(
+    const std::vector<std::string>& argv,
+    bool verbose,
+    int stdout_fd = -1,
+    int stderr_fd = -1
+);
 int decode_command_exit_status(int status);
 std::string shell_quote(const std::string& value);
 
@@ -75,6 +81,11 @@ struct CommandCaptureResult {
 };
 
 CommandCaptureResult run_command_captured(const std::string& cmd, bool verbose, const std::string& log_prefix);
+CommandCaptureResult run_command_captured_argv(
+    const std::vector<std::string>& argv,
+    bool verbose,
+    const std::string& log_prefix
+);
 
 enum class OptionalDependencyMode {
     Auto,

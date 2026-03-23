@@ -66,19 +66,40 @@ void finish_progress_line(size_t* last_render_width) {
     *last_render_width = 0;
 }
 
+std::vector<std::string> build_worker_command_argv(const std::string& mode, const std::string& value, bool verbose) {
+    std::vector<std::string> argv = {"gpkg-worker", mode, value};
+    if (verbose) argv.push_back("--verbose");
+    if (!ROOT_PREFIX.empty()) {
+        argv.push_back("--root");
+        argv.push_back(ROOT_PREFIX);
+    }
+    return argv;
+}
+
 InstallCommandResult install_package_from_file(const std::string& pkg_file, bool verbose) {
-    std::string cmd = "gpkg-worker --install " + shell_quote(pkg_file);
-    if (verbose) cmd += " --verbose";
-    if (!ROOT_PREFIX.empty()) cmd += " --root " + shell_quote(ROOT_PREFIX);
-    CommandCaptureResult result = run_command_captured(cmd, verbose, "gpkg-install");
+    CommandCaptureResult result = run_command_captured_argv(
+        build_worker_command_argv("--install", pkg_file, verbose),
+        verbose,
+        "gpkg-install"
+    );
     return {result.exit_code == 0, result.log_path};
 }
 
 InstallCommandResult retire_package_by_name(const std::string& pkg_name, bool verbose) {
-    std::string cmd = "gpkg-worker --retire " + shell_quote(pkg_name);
-    if (verbose) cmd += " --verbose";
-    if (!ROOT_PREFIX.empty()) cmd += " --root " + shell_quote(ROOT_PREFIX);
-    CommandCaptureResult result = run_command_captured(cmd, verbose, "gpkg-retire");
+    CommandCaptureResult result = run_command_captured_argv(
+        build_worker_command_argv("--retire", pkg_name, verbose),
+        verbose,
+        "gpkg-retire"
+    );
+    return {result.exit_code == 0, result.log_path};
+}
+
+InstallCommandResult remove_package_by_name(const std::string& pkg_name, bool verbose) {
+    CommandCaptureResult result = run_command_captured_argv(
+        build_worker_command_argv("--remove", pkg_name, verbose),
+        verbose,
+        "gpkg-remove"
+    );
     return {result.exit_code == 0, result.log_path};
 }
 
@@ -247,6 +268,77 @@ void append_unique_message(std::vector<std::string>& messages, const std::string
     }
 }
 
+void sort_removal_queue_for_operation(std::vector<std::string>& to_remove, bool verbose) {
+    if (to_remove.size() < 2) return;
+
+    std::map<std::string, PackageMetadata> meta_by_name;
+    std::vector<std::string> filtered;
+    filtered.reserve(to_remove.size());
+    for (const auto& pkg : to_remove) {
+        PackageMetadata meta;
+        if (!get_installed_package_metadata(pkg, meta)) {
+            filtered.push_back(pkg);
+            continue;
+        }
+        meta_by_name[pkg] = meta;
+        filtered.push_back(pkg);
+    }
+    to_remove.swap(filtered);
+
+    const size_t n = to_remove.size();
+    std::vector<std::set<size_t>> outgoing(n);
+    std::vector<size_t> indegree(n, 0);
+
+    auto add_edge = [&](size_t from, size_t to) {
+        if (from == to) return;
+        if (outgoing[from].insert(to).second) ++indegree[to];
+    };
+
+    for (size_t i = 0; i < n; ++i) {
+        auto meta_it = meta_by_name.find(to_remove[i]);
+        if (meta_it == meta_by_name.end()) continue;
+
+        for (const auto& dep_str : collect_transaction_dependency_edges(meta_it->second)) {
+            Dependency dep = parse_dependency(dep_str);
+            if (dep.name.empty()) continue;
+
+            for (size_t j = 0; j < n; ++j) {
+                if (i == j) continue;
+                auto provider_it = meta_by_name.find(to_remove[j]);
+                if (provider_it == meta_by_name.end()) continue;
+                if (!package_metadata_satisfies_dependency(to_remove[j], provider_it->second, dep)) continue;
+                add_edge(i, j);
+                break;
+            }
+        }
+    }
+
+    std::vector<std::string> ordered;
+    ordered.reserve(n);
+    std::vector<bool> emitted(n, false);
+    for (size_t emitted_count = 0; emitted_count < n; ++emitted_count) {
+        size_t best = n;
+        for (size_t i = 0; i < n; ++i) {
+            if (emitted[i] || indegree[i] != 0) continue;
+            best = i;
+            break;
+        }
+
+        if (best == n) {
+            VLOG(verbose, "Falling back to original removal order because dependency ordering contains a cycle or unresolved provider ambiguity.");
+            return;
+        }
+
+        emitted[best] = true;
+        ordered.push_back(to_remove[best]);
+        for (size_t succ : outgoing[best]) {
+            if (indegree[succ] > 0) --indegree[succ];
+        }
+    }
+
+    to_remove.swap(ordered);
+}
+
 std::vector<std::string> get_registered_package_names() {
     std::set<std::string> package_names;
     for (const auto& pkg : get_installed_packages(".json")) {
@@ -260,10 +352,11 @@ std::vector<std::string> get_registered_package_names() {
 }
 
 bool verify_installed_package(const std::string& pkg_name, bool verbose, std::string* log_path = nullptr) {
-    std::string cmd = "gpkg-worker --verify " + shell_quote(pkg_name);
-    if (verbose) cmd += " --verbose";
-    if (!ROOT_PREFIX.empty()) cmd += " --root " + shell_quote(ROOT_PREFIX);
-    CommandCaptureResult result = run_command_captured(cmd, verbose, "gpkg-verify");
+    CommandCaptureResult result = run_command_captured_argv(
+        build_worker_command_argv("--verify", pkg_name, verbose),
+        verbose,
+        "gpkg-verify"
+    );
     if (log_path) *log_path = result.log_path;
     return result.exit_code == 0;
 }
@@ -1389,6 +1482,8 @@ int handle_remove(int argc, char* argv[], bool verbose, bool purge) {
         }
     }
 
+    sort_removal_queue_for_operation(to_remove, verbose);
+
     std::cout << "The following packages will be REMOVED:" << std::endl;
     for (const auto& pkg : to_remove) {
         std::cout << "  " << Color::RED << pkg << Color::RESET << std::endl;
@@ -1407,13 +1502,14 @@ int handle_remove(int argc, char* argv[], bool verbose, bool purge) {
         const auto& pkg = to_remove[i];
         if (!verbose) render_package_progress("current", i, to_remove.size(), pkg, &remove_progress_width);
         std::vector<std::string> removed_files = read_installed_file_list(pkg);
-        std::string cmd = "gpkg-worker --remove " + pkg;
-        if (verbose) cmd += " --verbose";
-        if (!ROOT_PREFIX.empty()) cmd += " --root " + ROOT_PREFIX;
-
-        if (run_command(cmd, verbose) != 0) {
+        InstallCommandResult result = remove_package_by_name(pkg, verbose);
+        if (!result.success) {
             if (!verbose) finish_progress_line(&remove_progress_width);
             std::cerr << Color::RED << "E: Failed to remove " << pkg << Color::RESET << std::endl;
+            if (!verbose && !result.log_path.empty()) {
+                std::cerr << " See " << result.log_path << " for details.";
+            }
+            std::cerr << std::endl;
             return 1;
         }
         check_triggers(removed_files);

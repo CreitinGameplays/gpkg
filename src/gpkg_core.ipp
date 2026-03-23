@@ -470,6 +470,47 @@ int run_command(const std::string& cmd, bool verbose) {
     return system(cmd.c_str());
 }
 
+int run_command_argv(
+    const std::vector<std::string>& argv,
+    bool verbose,
+    int stdout_fd,
+    int stderr_fd
+) {
+    if (argv.empty() || argv.front().empty()) return -1;
+
+    if (verbose) {
+        std::ostringstream rendered;
+        for (size_t i = 0; i < argv.size(); ++i) {
+            if (i != 0) rendered << ' ';
+            rendered << shell_quote(argv[i]);
+        }
+        std::cout << "[DEBUG] Executing: " << rendered.str() << std::endl;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        if (stdout_fd >= 0 && dup2(stdout_fd, STDOUT_FILENO) < 0) _exit(127);
+        if (stderr_fd >= 0 && dup2(stderr_fd, STDERR_FILENO) < 0) _exit(127);
+
+        std::vector<char*> cargv;
+        cargv.reserve(argv.size() + 1);
+        for (const auto& arg : argv) {
+            cargv.push_back(const_cast<char*>(arg.c_str()));
+        }
+        cargv.push_back(nullptr);
+        execvp(argv.front().c_str(), cargv.data());
+        _exit(127);
+    }
+
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno == EINTR) continue;
+        return -1;
+    }
+    return status;
+}
+
 int decode_command_exit_status(int status) {
     if (status == -1) return -1;
     if (WIFEXITED(status)) return WEXITSTATUS(status);
@@ -508,4 +549,28 @@ CommandCaptureResult run_command_captured(const std::string& cmd, bool verbose, 
     std::string log_path(tmpl.data());
     std::string wrapped = cmd + " >" + shell_quote(log_path) + " 2>&1";
     return {decode_command_exit_status(run_command(wrapped, false)), log_path};
+}
+
+CommandCaptureResult run_command_captured_argv(
+    const std::vector<std::string>& argv,
+    bool verbose,
+    const std::string& log_prefix
+) {
+    if (verbose) {
+        return {decode_command_exit_status(run_command_argv(argv, true)), ""};
+    }
+
+    std::string prefix = "/tmp/" + log_prefix + "-XXXXXX.log";
+    std::vector<char> tmpl(prefix.begin(), prefix.end());
+    tmpl.push_back('\0');
+
+    int fd = mkstemps(tmpl.data(), 4);
+    if (fd < 0) {
+        return {decode_command_exit_status(run_command_argv(argv, false)), ""};
+    }
+
+    std::string log_path(tmpl.data());
+    int status = run_command_argv(argv, false, fd, fd);
+    close(fd);
+    return {decode_command_exit_status(status), log_path};
 }
