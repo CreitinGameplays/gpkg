@@ -10,8 +10,10 @@ TARGET_CXX_VERSION := $(shell find $(ROOTFS)/usr/include/c++ -maxdepth 1 -mindep
 GPKG_VERSION ?=
 GPKG_CODENAME ?=
 LZMA_STATIC := $(firstword \
+	$(wildcard $(ROOTFS)/usr/lib/x86_64-linux-gnu/liblzma.a) \
 	$(wildcard $(ROOTFS)/usr/lib64/x86_64-linux-gnu/liblzma.a) \
 	$(wildcard $(ROOTFS)/usr/lib64/liblzma.a) \
+	$(wildcard $(PROJECT_ROOT)/rootfs/usr/lib/x86_64-linux-gnu/liblzma.a) \
 	$(wildcard $(PROJECT_ROOT)/rootfs/usr/lib64/x86_64-linux-gnu/liblzma.a) \
 	$(wildcard $(PROJECT_ROOT)/rootfs/usr/lib64/liblzma.a))
 ifeq ($(strip $(GPKG_VERSION)),)
@@ -42,8 +44,8 @@ else
 WORKER_LDFLAGS += $(LZMA_STATIC)
 endif
 ifneq ($(strip $(TARGET_CXX_VERSION)),)
-GPKG_LDFLAGS += $(ROOTFS)/lib64/ld-linux-x86-64.so.2
-WORKER_LDFLAGS += $(ROOTFS)/lib64/ld-linux-x86-64.so.2
+GPKG_LDFLAGS += $(ROOTFS)/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+WORKER_LDFLAGS += $(ROOTFS)/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
 endif
 
 SRCDIR = src

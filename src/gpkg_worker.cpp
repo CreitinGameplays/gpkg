@@ -97,6 +97,11 @@ bool remove_live_path_exact(const std::string& live_full_path);
 std::string canonical_existing_path(const std::string& path);
 std::string allocate_sibling_temp_path(const std::string& live_full_path, const std::string& tag, int* fd_out = nullptr);
 std::string get_package_version(const std::string& pkg_name);
+bool validate_elf_file(const std::string& path, off_t size, std::string* error);
+bool sync_multiarch_runtime_aliases();
+std::vector<std::string> read_list_file(const std::string& pkg_name);
+std::vector<std::string> get_installed_packages(const std::string& extension = ".list");
+std::string path_basename(const std::string& path);
 
 // Logging
 bool g_verbose = false;
@@ -317,6 +322,8 @@ int run_path_with_args(const std::string& path, const std::vector<std::string>& 
 }
 
 bool refresh_linker_cache_if_available() {
+    if (!sync_multiarch_runtime_aliases()) return false;
+
     const char* candidates[] = {
         "/sbin/ldconfig",
         "/usr/sbin/ldconfig",
@@ -335,7 +342,7 @@ bool refresh_linker_cache_if_available() {
 }
 
 bool is_multiarch_runtime_alias_candidate(const std::string& name) {
-    return (name.rfind("lib", 0) == 0 && name.find(".so") != std::string::npos) ||
+    return (name.rfind("lib", 0) == 0 && name.find(".so.") != std::string::npos) ||
            name.rfind("ld-linux-", 0) == 0;
 }
 
@@ -382,6 +389,31 @@ std::string relative_symlink_target(const std::string& link_path, const std::str
     return relative.empty() ? "." : relative;
 }
 
+std::string resolved_directory_path(const std::string& path) {
+    char resolved[4096];
+    if (!realpath(path.c_str(), resolved)) return "";
+
+    struct stat st;
+    if (stat(resolved, &st) != 0 || !S_ISDIR(st.st_mode)) return "";
+    return std::string(resolved);
+}
+
+std::string stable_runtime_alias_target(
+    const std::string& link_path,
+    const std::string& target_path
+) {
+    std::string resolved_link_parent = resolved_directory_path(path_parent_dir(link_path));
+    std::string resolved_target_parent = resolved_directory_path(path_parent_dir(target_path));
+    if (resolved_link_parent.empty() || resolved_target_parent.empty()) {
+        return relative_symlink_target(link_path, target_path);
+    }
+
+    size_t slash = target_path.find_last_of('/');
+    std::string basename = slash == std::string::npos ? target_path : target_path.substr(slash + 1);
+    std::string physical_target = resolved_target_parent + "/" + basename;
+    return relative_symlink_target(resolved_link_parent + "/.gpkg-link", physical_target);
+}
+
 bool ensure_symlink_target_if_possible(
     const std::string& link_path,
     const std::string& target,
@@ -411,6 +443,234 @@ bool runtime_alias_paths_equivalent(
     return !active_real.empty() && active_real == compat_real;
 }
 
+struct RuntimeAliasFamily {
+    const char* canonical_prefix;
+    const char* compat_prefix;
+    const char* legacy_compat_prefix;
+};
+
+const RuntimeAliasFamily k_runtime_alias_families[] = {
+    {"/lib/x86_64-linux-gnu", "/lib64", "/lib64/x86_64-linux-gnu"},
+    {"/usr/lib/x86_64-linux-gnu", "/usr/lib64", "/usr/lib64/x86_64-linux-gnu"},
+};
+
+std::vector<std::string> runtime_alias_family_prefixes(const RuntimeAliasFamily& family) {
+    return {family.canonical_prefix, family.compat_prefix, family.legacy_compat_prefix};
+}
+
+bool runtime_alias_managed_prefix(const std::string& path) {
+    static const char* prefixes[] = {
+        "/lib/x86_64-linux-gnu/",
+        "/lib64/",
+        "/lib64/x86_64-linux-gnu/",
+        "/usr/lib/x86_64-linux-gnu/",
+        "/usr/lib64/",
+        "/usr/lib64/x86_64-linux-gnu/",
+    };
+
+    for (const char* prefix : prefixes) {
+        if (path.rfind(prefix, 0) == 0) return true;
+    }
+    return false;
+}
+
+int runtime_alias_path_rank(const std::string& path) {
+    if (path.rfind("/lib/x86_64-linux-gnu/", 0) == 0) return 0;
+    if (path.rfind("/usr/lib/x86_64-linux-gnu/", 0) == 0) return 1;
+    if (path.rfind("/lib64/", 0) == 0 && path.find("/x86_64-linux-gnu/", 0) == std::string::npos) return 2;
+    if (path.rfind("/usr/lib64/", 0) == 0 && path.find("/x86_64-linux-gnu/", 0) == std::string::npos) return 3;
+    if (path.rfind("/lib64/x86_64-linux-gnu/", 0) == 0) return 4;
+    if (path.rfind("/usr/lib64/x86_64-linux-gnu/", 0) == 0) return 5;
+    return 100;
+}
+
+std::map<std::string, std::string> build_runtime_file_owner_index() {
+    std::map<std::string, std::string> owner_index;
+    for (const auto& pkg_name : get_installed_packages()) {
+        for (const auto& owned_path : read_list_file(pkg_name)) {
+            if (!runtime_alias_managed_prefix(owned_path)) continue;
+            if (!is_multiarch_runtime_alias_candidate(path_basename(owned_path))) continue;
+            owner_index.emplace(owned_path, pkg_name);
+        }
+    }
+    return owner_index;
+}
+
+bool runtime_path_resolves_to_valid_library(
+    const std::string& full_path,
+    std::string* resolved_path_out = nullptr,
+    std::string* error_out = nullptr
+) {
+    if (resolved_path_out) resolved_path_out->clear();
+    if (error_out) error_out->clear();
+
+    struct stat st;
+    if (lstat(full_path.c_str(), &st) != 0) {
+        if (error_out) *error_out = strerror(errno);
+        return false;
+    }
+    if (S_ISDIR(st.st_mode)) {
+        if (error_out) *error_out = "path is a directory";
+        return false;
+    }
+
+    std::string resolved = canonical_existing_path(full_path);
+    if (resolved.empty()) {
+        if (error_out) *error_out = "path does not resolve to an existing file";
+        return false;
+    }
+
+    struct stat resolved_st;
+    if (stat(resolved.c_str(), &resolved_st) != 0) {
+        if (error_out) *error_out = strerror(errno);
+        return false;
+    }
+    if (!S_ISREG(resolved_st.st_mode)) {
+        if (error_out) *error_out = "resolved path is not a regular file";
+        return false;
+    }
+
+    std::string elf_error;
+    if (!validate_elf_file(resolved, resolved_st.st_size, &elf_error)) {
+        if (error_out) *error_out = elf_error;
+        return false;
+    }
+
+    if (resolved_path_out) *resolved_path_out = resolved;
+    return true;
+}
+
+void collect_runtime_alias_names_for_prefix(
+    const std::string& live_prefix,
+    std::set<std::string>& names
+) {
+    std::string live_dir = g_root_prefix + live_prefix;
+    DIR* dir = opendir(live_dir.c_str());
+    if (!dir) return;
+
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != nullptr) {
+        std::string name = entry->d_name;
+        if (name == "." || name == ".." || !is_multiarch_runtime_alias_candidate(name)) continue;
+
+        std::string full_path = live_dir + "/" + name;
+        struct stat st;
+        if (lstat(full_path.c_str(), &st) != 0 || S_ISDIR(st.st_mode)) continue;
+        names.insert(name);
+    }
+
+    closedir(dir);
+}
+
+std::string select_global_runtime_alias_canonical_path(
+    const std::string& name,
+    const std::map<std::string, std::string>& owner_index
+) {
+    struct Candidate {
+        std::string path;
+        bool owned = false;
+        int rank = 100;
+    };
+
+    std::vector<Candidate> candidates;
+    for (const auto& family : k_runtime_alias_families) {
+        for (const auto& prefix : runtime_alias_family_prefixes(family)) {
+            std::string logical_path = prefix + "/" + name;
+            std::string full_path = g_root_prefix + logical_path;
+            if (!path_exists_no_follow(full_path)) continue;
+            if (!runtime_path_resolves_to_valid_library(full_path)) continue;
+
+            Candidate candidate;
+            candidate.path = full_path;
+            candidate.owned = owner_index.count(logical_path) != 0;
+            candidate.rank = runtime_alias_path_rank(logical_path);
+            candidates.push_back(candidate);
+        }
+    }
+
+    if (candidates.empty()) return "";
+
+    std::sort(candidates.begin(), candidates.end(), [](const Candidate& left, const Candidate& right) {
+        if (left.owned != right.owned) return left.owned && !right.owned;
+        if (left.rank != right.rank) return left.rank < right.rank;
+        return left.path < right.path;
+    });
+    return candidates.front().path;
+}
+
+std::string runtime_canonical_link_name(const std::string& name) {
+    size_t so_pos = name.find(".so");
+    if (so_pos == std::string::npos) return name;
+
+    size_t version_start = so_pos + 3;
+    if (version_start >= name.size() || name[version_start] != '.') return name;
+
+    size_t next_dot = name.find('.', version_start + 1);
+    if (next_dot == std::string::npos) return name;
+    return name.substr(0, next_dot);
+}
+
+bool discard_invalid_runtime_entries(
+    const RuntimeAliasFamily& family,
+    const std::string& name,
+    const std::string& canonical_hint
+) {
+    bool ok = true;
+    for (const auto& prefix : runtime_alias_family_prefixes(family)) {
+        std::string full_path = g_root_prefix + prefix + "/" + name;
+        if (!path_exists_no_follow(full_path)) continue;
+        if (runtime_path_resolves_to_valid_library(full_path)) continue;
+
+        if (!remove_live_path_exact(full_path)) {
+            VLOG("Failed to discard stale invalid runtime entry " << full_path
+                 << (canonical_hint.empty() ? "" : " while converging on " + canonical_hint));
+            ok = false;
+            continue;
+        }
+
+        VLOG("Discarded stale invalid runtime entry " << full_path
+             << (canonical_hint.empty() ? "" : " while converging on " + canonical_hint));
+    }
+
+    return ok;
+}
+
+bool reconcile_runtime_alias_family(
+    const RuntimeAliasFamily& family,
+    const std::string& name,
+    const std::string& canonical_source,
+    const std::string& canonical_link_source
+) {
+    if (canonical_source.empty()) {
+        return discard_invalid_runtime_entries(family, name, canonical_link_source);
+    }
+
+    bool ok = true;
+    for (const auto& prefix : runtime_alias_family_prefixes(family)) {
+        std::string live_path = g_root_prefix + prefix + "/" + name;
+        if (live_path == canonical_source) continue;
+
+        if (path_exists_no_follow(live_path) &&
+            runtime_path_resolves_to_valid_library(live_path) &&
+            runtime_alias_paths_equivalent(canonical_source, live_path)) {
+            continue;
+        }
+
+        std::string alias_target = stable_runtime_alias_target(live_path, canonical_source);
+        bool replace_non_symlink = path_exists_no_follow(live_path);
+        if (!ensure_symlink_target_if_possible(live_path, alias_target, replace_non_symlink)) {
+            VLOG("Failed to reconcile runtime alias " << live_path
+                 << " -> " << canonical_source);
+            ok = false;
+        } else if (replace_non_symlink || !runtime_alias_paths_equivalent(canonical_source, live_path)) {
+            VLOG("Reconciled runtime alias " << live_path
+                 << " -> " << canonical_source);
+        }
+    }
+
+    return ok;
+}
+
 void sync_multiarch_runtime_aliases_for_prefix(
     const std::string& active_live_prefix,
     const std::string& compat_live_prefix
@@ -433,10 +693,7 @@ void sync_multiarch_runtime_aliases_for_prefix(
             std::string compat_path = compat_dir + "/" + name;
             if (runtime_alias_paths_equivalent(active_path, compat_path)) continue;
 
-            std::string compat_target = relative_symlink_target(
-                compat_live_prefix + "/" + name,
-                active_live_prefix + "/" + name
-            );
+            std::string compat_target = stable_runtime_alias_target(compat_path, active_path);
             bool replace_non_symlink = path_exists_no_follow(compat_path);
             if (!ensure_symlink_target_if_possible(compat_path, compat_target, replace_non_symlink)) {
                 VLOG("Failed to refresh multiarch compat alias for " << compat_path);
@@ -458,10 +715,7 @@ void sync_multiarch_runtime_aliases_for_prefix(
 
             std::string active_path = active_dir + "/" + name;
             if (!path_exists_no_follow(active_path)) {
-                std::string active_target = relative_symlink_target(
-                    active_live_prefix + "/" + name,
-                    compat_live_prefix + "/" + name
-                );
+                std::string active_target = stable_runtime_alias_target(active_path, compat_path);
                 if (!ensure_symlink_target_if_possible(active_path, active_target)) {
                     VLOG("Failed to backfill active runtime alias for " << active_path);
                 }
@@ -471,17 +725,84 @@ void sync_multiarch_runtime_aliases_for_prefix(
     }
 }
 
-void sync_multiarch_runtime_aliases() {
-    sync_multiarch_runtime_aliases_for_prefix("/lib64", "/lib64/x86_64-linux-gnu");
-    sync_multiarch_runtime_aliases_for_prefix("/lib64", "/lib/x86_64-linux-gnu");
-    sync_multiarch_runtime_aliases_for_prefix("/usr/lib64", "/usr/lib64/x86_64-linux-gnu");
-    sync_multiarch_runtime_aliases_for_prefix("/usr/lib64", "/usr/lib/x86_64-linux-gnu");
+bool sync_multiarch_runtime_aliases() {
+    std::map<std::string, std::string> owner_index = build_runtime_file_owner_index();
+    std::set<std::string> family_names[sizeof(k_runtime_alias_families) / sizeof(k_runtime_alias_families[0])];
+    for (size_t i = 0; i < sizeof(k_runtime_alias_families) / sizeof(k_runtime_alias_families[0]); ++i) {
+        for (const auto& prefix : runtime_alias_family_prefixes(k_runtime_alias_families[i])) {
+            collect_runtime_alias_names_for_prefix(prefix, family_names[i]);
+        }
+    }
+
+    bool ok = true;
+    std::set<std::string> all_names = family_names[0];
+    all_names.insert(family_names[1].begin(), family_names[1].end());
+    for (const auto& name : all_names) {
+        std::string canonical_source = select_global_runtime_alias_canonical_path(name, owner_index);
+        std::string link_name = runtime_canonical_link_name(name);
+        std::string canonical_link_source = link_name == name
+            ? canonical_source
+            : select_global_runtime_alias_canonical_path(link_name, owner_index);
+
+        for (size_t i = 0; i < sizeof(k_runtime_alias_families) / sizeof(k_runtime_alias_families[0]); ++i) {
+            if (family_names[i].count(name) == 0) continue;
+
+            if (!reconcile_runtime_alias_family(
+                    k_runtime_alias_families[i],
+                    name,
+                    canonical_source,
+                    canonical_link_source)) {
+                ok = false;
+            }
+        }
+    }
+
+    return ok;
 }
 
 std::string canonical_existing_path(const std::string& path) {
     char resolved[4096];
     if (!realpath(path.c_str(), resolved)) return "";
     return std::string(resolved);
+}
+
+std::string normalize_logical_absolute_path(const std::string& path) {
+    if (path.empty() || path[0] != '/') return "";
+
+    std::vector<std::string> parts;
+    std::stringstream ss(path);
+    std::string part;
+    while (std::getline(ss, part, '/')) {
+        if (part.empty() || part == ".") continue;
+        if (part == "..") {
+            if (!parts.empty()) parts.pop_back();
+            continue;
+        }
+        parts.push_back(part);
+    }
+
+    std::string normalized = "/";
+    for (size_t i = 0; i < parts.size(); ++i) {
+        if (i) normalized += "/";
+        normalized += parts[i];
+    }
+    return normalized;
+}
+
+std::string resolve_logical_symlink_target(
+    const std::string& link_path,
+    const std::string& symlink_target
+) {
+    if (symlink_target.empty()) return "";
+    if (symlink_target[0] == '/') {
+        return normalize_logical_absolute_path(symlink_target);
+    }
+
+    std::string base = link_path;
+    size_t slash = base.find_last_of('/');
+    if (slash == std::string::npos) return "";
+    std::string combined = base.substr(0, slash + 1) + symlink_target;
+    return normalize_logical_absolute_path(combined);
 }
 
 bool runtime_alias_pair_for_path(
@@ -497,10 +818,12 @@ bool runtime_alias_pair_for_path(
     };
 
     const PrefixPair pairs[] = {
-        {"/lib64/", "/lib64", "/lib64/x86_64-linux-gnu"},
-        {"/usr/lib64/", "/usr/lib64", "/usr/lib64/x86_64-linux-gnu"},
-        {"/lib/x86_64-linux-gnu/", "/lib64", "/lib64/x86_64-linux-gnu"},
-        {"/usr/lib/x86_64-linux-gnu/", "/usr/lib64", "/usr/lib64/x86_64-linux-gnu"},
+        {"/lib/x86_64-linux-gnu/", "/lib/x86_64-linux-gnu", "/lib64"},
+        {"/lib64/x86_64-linux-gnu/", "/lib/x86_64-linux-gnu", "/lib64"},
+        {"/lib64/", "/lib/x86_64-linux-gnu", "/lib64"},
+        {"/usr/lib/x86_64-linux-gnu/", "/usr/lib/x86_64-linux-gnu", "/usr/lib64"},
+        {"/usr/lib64/x86_64-linux-gnu/", "/usr/lib/x86_64-linux-gnu", "/usr/lib64"},
+        {"/usr/lib64/", "/usr/lib/x86_64-linux-gnu", "/usr/lib64"},
     };
 
     for (const auto& pair : pairs) {
@@ -508,7 +831,7 @@ bool runtime_alias_pair_for_path(
         if (path.rfind(prefix, 0) != 0) continue;
 
         std::string remainder = path.substr(prefix.size());
-        if (remainder.empty() || remainder.find('/') != std::string::npos) return false;
+        if (remainder.empty() || remainder.find('/') != std::string::npos) continue;
         if (!is_multiarch_runtime_alias_candidate(remainder)) return false;
 
         if (active_prefix_out) *active_prefix_out = pair.active_prefix;
@@ -518,6 +841,30 @@ bool runtime_alias_pair_for_path(
     }
 
     return false;
+}
+
+std::string canonical_runtime_logical_path(const std::string& path) {
+    std::string active_prefix;
+    std::string compat_prefix;
+    std::string name;
+    if (!runtime_alias_pair_for_path(path, &active_prefix, &compat_prefix, &name)) return path;
+    return active_prefix + "/" + name;
+}
+
+bool runtime_symlink_target_equivalent(
+    const std::string& logical_path,
+    const std::string& expected_target,
+    const std::string& actual_target
+) {
+    if (expected_target == actual_target) return true;
+
+    std::string expected_resolved = resolve_logical_symlink_target(logical_path, expected_target);
+    std::string actual_resolved = resolve_logical_symlink_target(logical_path, actual_target);
+    if (expected_resolved.empty() || actual_resolved.empty()) return false;
+
+    expected_resolved = canonical_runtime_logical_path(expected_resolved);
+    actual_resolved = canonical_runtime_logical_path(actual_resolved);
+    return expected_resolved == actual_resolved;
 }
 
 bool mkdir_p(const std::string& path) {
@@ -621,7 +968,7 @@ std::vector<std::string> read_list_file(const std::string& pkg_name) {
 }
 
 // Get list of installed package names from INFO_DIR
-std::vector<std::string> get_installed_packages(const std::string& extension = ".list") {
+std::vector<std::string> get_installed_packages(const std::string& extension) {
     std::vector<std::string> pkgs;
     DIR* d = opendir(get_info_dir().c_str());
     if (!d) return pkgs;
@@ -769,6 +1116,39 @@ bool validate_elf_file(const std::string& path, off_t size, std::string* error) 
             if (error) *error = "ELF64 section header table extends past end of file";
             return false;
         }
+        if (ehdr.e_phoff > 0 && ehdr.e_phnum > 0) {
+            if (ehdr.e_phentsize < sizeof(Elf64_Phdr)) {
+                if (error) *error = "ELF64 program header entries are smaller than expected";
+                return false;
+            }
+
+            for (size_t i = 0; i < ehdr.e_phnum; ++i) {
+                unsigned long long phdr_offset =
+                    static_cast<unsigned long long>(ehdr.e_phoff) +
+                    static_cast<unsigned long long>(ehdr.e_phentsize) * i;
+                if (phdr_offset + sizeof(Elf64_Phdr) >
+                    static_cast<unsigned long long>(size)) {
+                    if (error) *error = "ELF64 program header table extends past end of file";
+                    return false;
+                }
+
+                Elf64_Phdr phdr {};
+                in.clear();
+                in.seekg(static_cast<std::streamoff>(phdr_offset), std::ios::beg);
+                if (!in.read(reinterpret_cast<char*>(&phdr), sizeof(phdr))) {
+                    if (error) *error = "unable to read ELF64 program header";
+                    return false;
+                }
+
+                if (phdr.p_filesz == 0) continue;
+                if ((static_cast<unsigned long long>(phdr.p_offset) +
+                     static_cast<unsigned long long>(phdr.p_filesz)) >
+                    static_cast<unsigned long long>(size)) {
+                    if (error) *error = "ELF64 segment extends past end of file";
+                    return false;
+                }
+            }
+        }
         return true;
     }
 
@@ -798,6 +1178,39 @@ bool validate_elf_file(const std::string& path, off_t size, std::string* error) 
                 static_cast<unsigned long long>(size)) {
             if (error) *error = "ELF32 section header table extends past end of file";
             return false;
+        }
+        if (ehdr.e_phoff > 0 && ehdr.e_phnum > 0) {
+            if (ehdr.e_phentsize < sizeof(Elf32_Phdr)) {
+                if (error) *error = "ELF32 program header entries are smaller than expected";
+                return false;
+            }
+
+            for (size_t i = 0; i < ehdr.e_phnum; ++i) {
+                unsigned long long phdr_offset =
+                    static_cast<unsigned long long>(ehdr.e_phoff) +
+                    static_cast<unsigned long long>(ehdr.e_phentsize) * i;
+                if (phdr_offset + sizeof(Elf32_Phdr) >
+                    static_cast<unsigned long long>(size)) {
+                    if (error) *error = "ELF32 program header table extends past end of file";
+                    return false;
+                }
+
+                Elf32_Phdr phdr {};
+                in.clear();
+                in.seekg(static_cast<std::streamoff>(phdr_offset), std::ios::beg);
+                if (!in.read(reinterpret_cast<char*>(&phdr), sizeof(phdr))) {
+                    if (error) *error = "unable to read ELF32 program header";
+                    return false;
+                }
+
+                if (phdr.p_filesz == 0) continue;
+                if ((static_cast<unsigned long long>(phdr.p_offset) +
+                     static_cast<unsigned long long>(phdr.p_filesz)) >
+                    static_cast<unsigned long long>(size)) {
+                    if (error) *error = "ELF32 segment extends past end of file";
+                    return false;
+                }
+            }
         }
         return true;
     }
@@ -2448,7 +2861,8 @@ bool verify_staged_install_entries(
                 issues.push_back(entry.path + ": expected symlink after install");
                 continue;
             }
-            if (read_symlink_target(live_full_path) != entry.symlink_target) {
+            std::string live_target = read_symlink_target(live_full_path);
+            if (!runtime_symlink_target_equivalent(entry.path, entry.symlink_target, live_target)) {
                 issues.push_back(entry.path + ": symlink target differs from staged payload");
                 continue;
             }
@@ -3079,11 +3493,15 @@ bool action_verify(const std::string& pkg_name) {
     return passed;
 }
 
+bool action_refresh_runtime_linker_state() {
+    return refresh_linker_cache_if_available();
+}
+
 int main(int argc, char* argv[]) {
 
     if (argc < 2) {
 
-        std::cout << "Usage: gpkg-worker [options]\nOptions:\n  --install <file>\n  --remove <pkg>\n  --purge <pkg>\n  --retire <pkg>\n  --verify <pkg>\n  --register-file <path> --pkg <name>\n  --register-undo <cmd> --pkg <name>\n";
+        std::cout << "Usage: gpkg-worker [options]\nOptions:\n  --install <file>\n  --remove <pkg>\n  --purge <pkg>\n  --retire <pkg>\n  --verify <pkg>\n  --refresh-runtime-linker-state\n  --register-file <path> --pkg <name>\n  --register-undo <cmd> --pkg <name>\n";
 
         return 1;
 
@@ -3104,6 +3522,8 @@ int main(int argc, char* argv[]) {
         else if (arg == "--retire") mode = "retire", target = argv[++i];
 
         else if (arg == "--verify") mode = "verify", target = argv[++i];
+
+        else if (arg == "--refresh-runtime-linker-state") mode = "refresh-runtime-linker-state";
 
         else if (arg == "--register-file") mode = "register-file", target = argv[++i];
 
@@ -3126,6 +3546,8 @@ int main(int argc, char* argv[]) {
     if (mode == "install" && !target.empty()) return action_install(target) ? 0 : 1;
 
     if (mode == "verify" && !target.empty()) return action_verify(target) ? 0 : 1;
+
+    if (mode == "refresh-runtime-linker-state") return action_refresh_runtime_linker_state() ? 0 : 1;
 
     if (mode == "register-file" && !target.empty() && !pkg_name.empty()) return action_register_file(pkg_name, target) ? 0 : 1;
 

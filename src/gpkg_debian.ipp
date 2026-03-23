@@ -95,22 +95,25 @@ bool should_promote_multiarch_runtime_entry(
     const struct stat& st
 ) {
     if (S_ISDIR(st.st_mode)) return false;
-    return name.rfind("lib", 0) == 0 || name.rfind("ld-linux-", 0) == 0;
+    return (name.rfind("lib", 0) == 0 && name.find(".so.") != std::string::npos) ||
+           name.rfind("ld-linux-", 0) == 0;
 }
 
-bool normalize_multiarch_payload_prefix(
+bool ensure_runtime_compat_payload_aliases(
     const std::string& payload_root,
-    const std::string& source_prefix,
-    const std::string& active_prefix,
+    const std::string& canonical_prefix,
+    const std::string& compat_prefix,
+    const std::string& legacy_compat_prefix,
     bool verbose
 ) {
-    std::string source_root = payload_root + source_prefix;
+    std::string source_root = payload_root + canonical_prefix;
     DIR* dir = opendir(source_root.c_str());
     if (!dir) {
         return errno == ENOENT;
     }
 
-    if (!mkdir_p(payload_root + active_prefix)) {
+    if (!mkdir_p(payload_root + compat_prefix) ||
+        !mkdir_p(payload_root + legacy_compat_prefix)) {
         closedir(dir);
         return false;
     }
@@ -121,8 +124,9 @@ bool normalize_multiarch_payload_prefix(
         if (name == "." || name == "..") continue;
 
         std::string source_full_path = source_root + "/" + name;
-        std::string active_path = payload_root + active_prefix + "/" + name;
-        std::string source_path = source_prefix + "/" + name;
+        std::string source_path = canonical_prefix + "/" + name;
+        std::string compat_path = payload_root + compat_prefix + "/" + name;
+        std::string legacy_compat_path = payload_root + legacy_compat_prefix + "/" + name;
         struct stat st {};
         if (lstat(source_full_path.c_str(), &st) != 0) {
             closedir(dir);
@@ -137,52 +141,31 @@ bool normalize_multiarch_payload_prefix(
             continue;
         }
 
-        bool promoted = false;
-        if (!path_exists_no_follow_debian(active_path) &&
-            should_promote_multiarch_runtime_entry(name, st)) {
-            if (!mkdir_parent(active_path)) {
-                closedir(dir);
-                std::cerr << Color::RED << "E: Failed to create active runtime directory for "
-                          << active_prefix << "/" << name << Color::RESET << std::endl;
-                return false;
-            }
-            if (rename(source_full_path.c_str(), active_path.c_str()) != 0) {
-                closedir(dir);
-                std::cerr << Color::RED << "E: Failed to promote imported runtime entry "
-                          << source_path << " -> " << active_prefix << "/" << name
-                          << " (" << strerror(errno) << ")" << Color::RESET << std::endl;
-                return false;
-            }
-
-            std::string error;
-            if (!create_payload_symlink_if_missing(source_full_path, active_prefix + "/" + name, &error)) {
-                closedir(dir);
-                std::cerr << Color::RED << "E: Failed to back-link promoted runtime entry "
-                          << source_path << " -> " << active_prefix << "/" << name;
-                if (!error.empty()) std::cerr << " (" << error << ")";
-                std::cerr << Color::RESET << std::endl;
-                return false;
-            }
-
-            promoted = true;
-            VLOG(verbose, "Promoted Debian runtime entry " << source_path
-                 << " -> " << active_prefix << "/" << name);
-        }
-
-        if (promoted) continue;
-
         std::string error;
-        if (!create_payload_symlink_if_missing(active_path, source_path, &error)) {
+        if (!create_payload_symlink_if_missing(compat_path, source_path, &error)) {
             closedir(dir);
-            std::cerr << Color::RED << "E: Failed to create active runtime alias "
-                      << active_prefix << "/" << name << " -> " << source_path;
+            std::cerr << Color::RED << "E: Failed to create runtime compatibility alias "
+                      << compat_prefix << "/" << name << " -> " << source_path;
             if (!error.empty()) std::cerr << " (" << error << ")";
             std::cerr << Color::RESET << std::endl;
             return false;
         }
 
-        VLOG(verbose, "Added Debian multiarch alias " << active_prefix << "/" << name
+        if (!create_payload_symlink_if_missing(legacy_compat_path, compat_prefix + "/" + name, &error)) {
+            closedir(dir);
+            std::cerr << Color::RED << "E: Failed to create legacy runtime compatibility alias "
+                      << legacy_compat_prefix << "/" << name << " -> "
+                      << compat_prefix << "/" << name;
+            if (!error.empty()) std::cerr << " (" << error << ")";
+            std::cerr << Color::RESET << std::endl;
+            return false;
+        }
+
+        VLOG(verbose, "Added Debian runtime compatibility alias " << compat_prefix << "/" << name
              << " -> " << source_path);
+        VLOG(verbose, "Added Debian legacy runtime compatibility alias "
+             << legacy_compat_prefix << "/" << name << " -> "
+             << compat_prefix << "/" << name);
     }
 
     closedir(dir);
@@ -194,17 +177,23 @@ bool normalize_imported_payload_layout(
     bool verbose
 ) {
     struct PrefixMap {
-        const char* source_prefix;
-        const char* active_prefix;
+        const char* canonical_prefix;
+        const char* compat_prefix;
+        const char* legacy_compat_prefix;
     };
 
     const PrefixMap maps[] = {
-        {"/lib/x86_64-linux-gnu", "/lib64"},
-        {"/usr/lib/x86_64-linux-gnu", "/usr/lib64"},
+        {"/lib/x86_64-linux-gnu", "/lib64", "/lib64/x86_64-linux-gnu"},
+        {"/usr/lib/x86_64-linux-gnu", "/usr/lib64", "/usr/lib64/x86_64-linux-gnu"},
     };
 
     for (const auto& map : maps) {
-        if (!normalize_multiarch_payload_prefix(payload_root, map.source_prefix, map.active_prefix, verbose)) {
+        if (!ensure_runtime_compat_payload_aliases(
+                payload_root,
+                map.canonical_prefix,
+                map.compat_prefix,
+                map.legacy_compat_prefix,
+                verbose)) {
             return false;
         }
     }
@@ -846,7 +835,7 @@ bool update_debian_backend_index(
 }
 
 std::string get_imported_gpkg_path(const PackageMetadata& meta) {
-    std::string base = REPO_CACHE_PATH + "imported/v5/"
+    std::string base = REPO_CACHE_PATH + "imported/v6/"
         + cache_safe_component(meta.source_kind) + "/"
         + cache_safe_component(meta.name);
     return base + "_" + safe_repo_filename_component(meta.version) + "_" + cache_safe_component(meta.arch) + EXTENSION;

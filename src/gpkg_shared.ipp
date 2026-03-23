@@ -329,6 +329,17 @@ void queue_triggers_for_package(const std::string& pkg_name) {
     check_triggers(read_installed_file_list(pkg_name));
 }
 
+int run_ldconfig_trigger(bool verbose) {
+    std::vector<std::string> argv = {"gpkg-worker", "--refresh-runtime-linker-state"};
+    if (verbose) argv.push_back("--verbose");
+    if (!ROOT_PREFIX.empty()) {
+        argv.push_back("--root");
+        argv.push_back(ROOT_PREFIX);
+    }
+
+    return decode_command_exit_status(run_command_argv(argv, verbose));
+}
+
 void run_triggers(bool verbose) {
     if (g_pending_triggers.empty()) return;
 
@@ -337,6 +348,21 @@ void run_triggers(bool verbose) {
 
     std::vector<std::string> failed_triggers;
     for (const auto& cmd : g_pending_triggers) {
+        if (cmd == "ldconfig") {
+            if (!is_executable_command_available("gpkg-worker")) {
+                if (verbose) {
+                    std::cout << "[DEBUG] Skipping ldconfig trigger because gpkg-worker is unavailable."
+                              << std::endl;
+                }
+                continue;
+            }
+            if (verbose) std::cout << "[DEBUG] Running trigger via gpkg-worker: " << cmd << std::endl;
+            if (run_ldconfig_trigger(verbose) != 0) {
+                failed_triggers.push_back(cmd);
+            }
+            continue;
+        }
+
         if (!is_executable_command_available(cmd)) {
             if (verbose) {
                 std::cout << "[DEBUG] Skipping trigger because its command is unavailable: "
