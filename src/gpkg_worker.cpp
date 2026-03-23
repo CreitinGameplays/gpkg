@@ -139,7 +139,9 @@ bool looks_like_linker_script_prefix(const std::string& prefix) {
 }
 
 bool looks_like_shared_object_path(const std::string& path) {
-    return path.find(".so") != std::string::npos;
+    if (path.length() >= 3 && path.substr(path.length() - 3) == ".so") return true;
+    if (path.find(".so.") != std::string::npos) return true;
+    return false;
 }
 
 bool validate_elf_file(const std::string& path, off_t size, std::string* error) {

@@ -398,7 +398,7 @@ std::vector<PackageMetadata> load_debian_index_entries(
 
     std::set<std::string> available_packages;
     for (const auto& record : records) available_packages.insert(record.package);
-    std::vector<std::string> system_drop_patterns = build_system_drop_patterns(available_packages);
+    std::vector<std::string> system_drop_patterns = build_system_drop_patterns(policy, available_packages);
     auto provider_map = build_debian_provider_map(records, config.apt_arch);
 
     const size_t worker_count = recommended_parallel_worker_count(records.size());

@@ -91,12 +91,22 @@ std::vector<std::string> load_dependency_entries(const std::string& path) {
     return entries;
 }
 
-std::vector<std::string> load_system_provides() {
-    return load_dependency_entries(SYSTEM_PROVIDES_PATH);
+const std::vector<std::string>& load_system_provides() {
+    const ImportPolicy& policy = get_import_policy();
+    if (!policy.system_provides.empty()) return policy.system_provides;
+
+    static const std::vector<std::string> legacy_system_provides =
+        load_dependency_entries(SYSTEM_PROVIDES_PATH);
+    return legacy_system_provides;
 }
 
-std::vector<std::string> load_upgradeable_system_packages() {
-    return load_dependency_entries(UPGRADEABLE_SYSTEM_PATH);
+const std::vector<std::string>& load_upgradeable_system_packages() {
+    const ImportPolicy& policy = get_import_policy();
+    if (!policy.upgradeable_system.empty()) return policy.upgradeable_system;
+
+    static const std::vector<std::string> legacy_upgradeable_system =
+        load_dependency_entries(UPGRADEABLE_SYSTEM_PATH);
+    return legacy_upgradeable_system;
 }
 
 bool dependency_list_matches(
@@ -215,7 +225,7 @@ bool is_dependency_satisfied_locally(
             VLOG(verbose, dep.name << " is base-provided but marked upgradeable; preferring repository candidate.");
             return false;
         }
-        if (provider_out) *provider_out = SYSTEM_PROVIDES_PATH;
+        if (provider_out) *provider_out = BASE_SYSTEM_PROVIDER;
         return true;
     }
 
@@ -284,8 +294,8 @@ bool resolve_dependencies(
 
     std::string provider_name;
     if (is_dependency_satisfied_locally(requested_dep, installed_cache, verbose, &provider_name)) {
-        if (provider_name == SYSTEM_PROVIDES_PATH) {
-            VLOG(verbose, pkg << " is satisfied by " << SYSTEM_PROVIDES_PATH);
+        if (provider_name == BASE_SYSTEM_PROVIDER) {
+            VLOG(verbose, pkg << " is satisfied by the base-system policy.");
         } else if (provider_name == pkg) {
             std::string installed_ver;
             is_installed(pkg, &installed_ver);

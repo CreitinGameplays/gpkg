@@ -22,6 +22,8 @@ struct PackageOverridePolicy {
 };
 
 struct ImportPolicy {
+    std::vector<std::string> system_provides;
+    std::vector<std::string> upgradeable_system;
     std::vector<std::string> skip_dependency_patterns;
     std::vector<std::string> skip_packages;
     std::map<std::string, std::string> dependency_choices;
@@ -149,6 +151,37 @@ std::vector<std::string> unique_string_list(const std::vector<std::string>& valu
     return result;
 }
 
+std::vector<std::string> normalize_policy_string_entries(const std::vector<std::string>& values) {
+    std::vector<std::string> normalized;
+    normalized.reserve(values.size());
+
+    for (auto value : values) {
+        value = trim(value);
+        if (!value.empty()) normalized.push_back(value);
+    }
+
+    return unique_string_list(normalized);
+}
+
+std::vector<std::string> load_pattern_entries(const std::vector<std::string>& raw_entries) {
+    std::vector<std::string> entries;
+    entries.reserve(raw_entries.size());
+
+    for (auto line : raw_entries) {
+        line = trim(line);
+        if (line.empty()) continue;
+        size_t bracket = line.find('[');
+        if (bracket != std::string::npos) line = trim(line.substr(0, bracket));
+        size_t angle = line.find('<');
+        if (angle != std::string::npos) line = trim(line.substr(0, angle));
+        size_t paren = line.find('(');
+        if (paren != std::string::npos) line = trim(line.substr(0, paren));
+        if (!line.empty()) entries.push_back(line);
+    }
+
+    return unique_string_list(entries);
+}
+
 std::vector<std::string> load_pattern_entries_file(const std::string& path) {
     std::vector<std::string> entries;
     std::ifstream f(path);
@@ -181,9 +214,16 @@ bool should_keep_upgradeable_pattern(
     return !available_packages.count(pattern);
 }
 
-std::vector<std::string> build_system_drop_patterns(const std::set<std::string>& available_packages) {
-    std::vector<std::string> base_patterns = load_pattern_entries_file(SYSTEM_PROVIDES_PATH);
-    std::vector<std::string> upgradeable_patterns = load_pattern_entries_file(UPGRADEABLE_SYSTEM_PATH);
+std::vector<std::string> build_system_drop_patterns(
+    const ImportPolicy& policy,
+    const std::set<std::string>& available_packages
+) {
+    std::vector<std::string> base_patterns = policy.system_provides.empty()
+        ? load_pattern_entries_file(SYSTEM_PROVIDES_PATH)
+        : load_pattern_entries(policy.system_provides);
+    std::vector<std::string> upgradeable_patterns = policy.upgradeable_system.empty()
+        ? load_pattern_entries_file(UPGRADEABLE_SYSTEM_PATH)
+        : load_pattern_entries(policy.upgradeable_system);
     std::vector<std::string> filtered;
 
     for (const auto& pattern : base_patterns) {
@@ -215,6 +255,12 @@ ImportPolicy load_import_policy(bool verbose = false) {
     }
 
     ImportPolicy policy;
+    policy.system_provides = normalize_policy_string_entries(
+        json_string_array(json_object_get(root, "system_provides"))
+    );
+    policy.upgradeable_system = normalize_policy_string_entries(
+        json_string_array(json_object_get(root, "upgradeable_system"))
+    );
     policy.skip_dependency_patterns = json_string_array(json_object_get(root, "skip_dependency_patterns"));
     policy.skip_packages = json_string_array(json_object_get(root, "skip_packages"));
 
