@@ -67,6 +67,146 @@ std::string safe_repo_filename_component(const std::string& value) {
     return safe;
 }
 
+bool path_exists_no_follow_debian(const std::string& path) {
+    struct stat st;
+    return lstat(path.c_str(), &st) == 0;
+}
+
+bool create_payload_symlink_if_missing(
+    const std::string& link_path,
+    const std::string& target_path,
+    std::string* error_out = nullptr
+) {
+    if (error_out) error_out->clear();
+    if (path_exists_no_follow_debian(link_path)) return true;
+    if (!mkdir_parent(link_path)) {
+        if (error_out) *error_out = "failed to create parent directory";
+        return false;
+    }
+    if (symlink(target_path.c_str(), link_path.c_str()) != 0) {
+        if (error_out) *error_out = strerror(errno);
+        return false;
+    }
+    return true;
+}
+
+bool should_promote_multiarch_runtime_entry(
+    const std::string& name,
+    const struct stat& st
+) {
+    if (S_ISDIR(st.st_mode)) return false;
+    return name.rfind("lib", 0) == 0 || name.rfind("ld-linux-", 0) == 0;
+}
+
+bool normalize_multiarch_payload_prefix(
+    const std::string& payload_root,
+    const std::string& source_prefix,
+    const std::string& active_prefix,
+    bool verbose
+) {
+    std::string source_root = payload_root + source_prefix;
+    DIR* dir = opendir(source_root.c_str());
+    if (!dir) {
+        return errno == ENOENT;
+    }
+
+    if (!mkdir_p(payload_root + active_prefix)) {
+        closedir(dir);
+        return false;
+    }
+
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != nullptr) {
+        std::string name = entry->d_name;
+        if (name == "." || name == "..") continue;
+
+        std::string source_full_path = source_root + "/" + name;
+        std::string active_path = payload_root + active_prefix + "/" + name;
+        std::string source_path = source_prefix + "/" + name;
+        struct stat st {};
+        if (lstat(source_full_path.c_str(), &st) != 0) {
+            closedir(dir);
+            std::cerr << Color::RED << "E: Failed to inspect imported payload entry "
+                      << source_path << " (" << strerror(errno) << ")"
+                      << Color::RESET << std::endl;
+            return false;
+        }
+
+        bool promoted = false;
+        if (!path_exists_no_follow_debian(active_path) &&
+            should_promote_multiarch_runtime_entry(name, st)) {
+            if (!mkdir_parent(active_path)) {
+                closedir(dir);
+                std::cerr << Color::RED << "E: Failed to create active runtime directory for "
+                          << active_prefix << "/" << name << Color::RESET << std::endl;
+                return false;
+            }
+            if (rename(source_full_path.c_str(), active_path.c_str()) != 0) {
+                closedir(dir);
+                std::cerr << Color::RED << "E: Failed to promote imported runtime entry "
+                          << source_path << " -> " << active_prefix << "/" << name
+                          << " (" << strerror(errno) << ")" << Color::RESET << std::endl;
+                return false;
+            }
+
+            std::string error;
+            if (!create_payload_symlink_if_missing(source_full_path, active_prefix + "/" + name, &error)) {
+                closedir(dir);
+                std::cerr << Color::RED << "E: Failed to back-link promoted runtime entry "
+                          << source_path << " -> " << active_prefix << "/" << name;
+                if (!error.empty()) std::cerr << " (" << error << ")";
+                std::cerr << Color::RESET << std::endl;
+                return false;
+            }
+
+            promoted = true;
+            VLOG(verbose, "Promoted Debian runtime entry " << source_path
+                 << " -> " << active_prefix << "/" << name);
+        }
+
+        if (promoted) continue;
+
+        std::string error;
+        if (!create_payload_symlink_if_missing(active_path, source_path, &error)) {
+            closedir(dir);
+            std::cerr << Color::RED << "E: Failed to create active runtime alias "
+                      << active_prefix << "/" << name << " -> " << source_path;
+            if (!error.empty()) std::cerr << " (" << error << ")";
+            std::cerr << Color::RESET << std::endl;
+            return false;
+        }
+
+        VLOG(verbose, "Added Debian multiarch alias " << active_prefix << "/" << name
+             << " -> " << source_path);
+    }
+
+    closedir(dir);
+    return true;
+}
+
+bool normalize_imported_payload_layout(
+    const std::string& payload_root,
+    bool verbose
+) {
+    struct PrefixMap {
+        const char* source_prefix;
+        const char* active_prefix;
+    };
+
+    const PrefixMap maps[] = {
+        {"/lib/x86_64-linux-gnu", "/lib64"},
+        {"/usr/lib/x86_64-linux-gnu", "/usr/lib64"},
+    };
+
+    for (const auto& map : maps) {
+        if (!normalize_multiarch_payload_prefix(payload_root, map.source_prefix, map.active_prefix, verbose)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 DebianBackendConfig load_debian_backend_config(bool verbose = false) {
     DebianBackendConfig config;
     std::ifstream f(DEBIAN_CONFIG_PATH);
@@ -555,7 +695,8 @@ std::vector<PackageMetadata> load_debian_index_entries(
 
             const auto& record = records[record_index];
             if (record.filename.empty() || record.sha256.empty()) continue;
-            if (record.essential) {
+            if (record.essential &&
+                !matches_any_pattern(record.package, policy.allow_essential_packages)) {
                 if (skipped_policy) skipped.push_back(record.package + ": Essential: yes");
                 continue;
             }
@@ -696,7 +837,7 @@ bool update_debian_backend_index(
 }
 
 std::string get_imported_gpkg_path(const PackageMetadata& meta) {
-    std::string base = REPO_CACHE_PATH + "imported/"
+    std::string base = REPO_CACHE_PATH + "imported/v3/"
         + cache_safe_component(meta.source_kind) + "/"
         + cache_safe_component(meta.name);
     return base + "_" + safe_repo_filename_component(meta.version) + "_" + cache_safe_component(meta.arch) + EXTENSION;
@@ -1166,6 +1307,11 @@ bool convert_debian_archive_to_gpkg(const PackageMetadata& meta, bool verbose, s
         std::cerr << Color::RED << "E: Failed to extract the prepared Debian payload tar for "
                   << meta.name << format_import_failure_hint(failure_log)
                   << Color::RESET << std::endl;
+        run_command("rm -rf " + shell_quote(temp_root), false);
+        return false;
+    }
+
+    if (!normalize_imported_payload_layout(payload_root, verbose)) {
         run_command("rm -rf " + shell_quote(temp_root), false);
         return false;
     }

@@ -14,6 +14,7 @@
 #include <map>
 #include <iomanip>
 #include <elf.h>
+#include <tuple>
 
 // Configuration
 std::string g_root_prefix = "";
@@ -25,6 +26,8 @@ std::string get_info_dir() {
 const std::string TMP_EXTRACT_PATH = "/tmp/gpkg_worker_extract/";
 
 std::string path_parent_dir(const std::string& full_path);
+bool mkdir_p(const std::string& path);
+bool path_exists_no_follow(const std::string& path);
 bool write_text_file_atomic(const std::string& target_path, const std::string& content, mode_t mode = 0644);
 bool copy_file_atomic(const std::string& source_path, const std::string& target_path);
 
@@ -73,6 +76,132 @@ void refresh_linker_cache_if_available() {
     if (access("/usr/bin/ldconfig", X_OK) == 0) {
         run_command("/usr/bin/ldconfig");
     }
+}
+
+bool is_multiarch_runtime_alias_candidate(const std::string& name) {
+    return (name.rfind("lib", 0) == 0 && name.find(".so") != std::string::npos) ||
+           name.rfind("ld-linux-", 0) == 0;
+}
+
+std::string read_symlink_target(const std::string& path) {
+    char buffer[4096];
+    ssize_t len = readlink(path.c_str(), buffer, sizeof(buffer) - 1);
+    if (len < 0) return "";
+    buffer[len] = '\0';
+    return std::string(buffer);
+}
+
+bool ensure_symlink_target_if_possible(
+    const std::string& link_path,
+    const std::string& target
+) {
+    struct stat st;
+    if (lstat(link_path.c_str(), &st) == 0) {
+        if (!S_ISLNK(st.st_mode)) return true;
+        if (read_symlink_target(link_path) == target) return true;
+        if (unlink(link_path.c_str()) != 0) return false;
+    } else if (errno != ENOENT) {
+        return false;
+    }
+
+    if (!mkdir_p(path_parent_dir(link_path))) return false;
+    return symlink(target.c_str(), link_path.c_str()) == 0;
+}
+
+void sync_multiarch_runtime_aliases_for_prefix(
+    const std::string& active_live_prefix,
+    const std::string& compat_live_prefix
+) {
+    std::string active_dir = g_root_prefix + active_live_prefix;
+    std::string compat_dir = g_root_prefix + compat_live_prefix;
+    if (!mkdir_p(active_dir) || !mkdir_p(compat_dir)) return;
+
+    DIR* active = opendir(active_dir.c_str());
+    if (active) {
+        struct dirent* entry;
+        while ((entry = readdir(active)) != nullptr) {
+            std::string name = entry->d_name;
+            if (name == "." || name == ".." || !is_multiarch_runtime_alias_candidate(name)) continue;
+
+            std::string active_path = active_dir + "/" + name;
+            struct stat st;
+            if (lstat(active_path.c_str(), &st) != 0 || S_ISDIR(st.st_mode)) continue;
+
+            std::string compat_path = compat_dir + "/" + name;
+            if (!ensure_symlink_target_if_possible(compat_path, "../" + name)) {
+                VLOG("Failed to refresh multiarch compat alias for " << compat_path);
+            }
+        }
+        closedir(active);
+    }
+
+    DIR* compat = opendir(compat_dir.c_str());
+    if (compat) {
+        struct dirent* entry;
+        while ((entry = readdir(compat)) != nullptr) {
+            std::string name = entry->d_name;
+            if (name == "." || name == ".." || !is_multiarch_runtime_alias_candidate(name)) continue;
+
+            std::string compat_path = compat_dir + "/" + name;
+            struct stat st;
+            if (lstat(compat_path.c_str(), &st) != 0 || S_ISDIR(st.st_mode)) continue;
+
+            std::string active_path = active_dir + "/" + name;
+            if (!path_exists_no_follow(active_path)) {
+                if (!ensure_symlink_target_if_possible(active_path, compat_live_prefix + "/" + name)) {
+                    VLOG("Failed to backfill active runtime alias for " << active_path);
+                }
+            }
+        }
+        closedir(compat);
+    }
+}
+
+void sync_multiarch_runtime_aliases() {
+    sync_multiarch_runtime_aliases_for_prefix("/lib64", "/lib64/x86_64-linux-gnu");
+    sync_multiarch_runtime_aliases_for_prefix("/usr/lib64", "/usr/lib64/x86_64-linux-gnu");
+}
+
+std::string canonical_existing_path(const std::string& path) {
+    char resolved[4096];
+    if (!realpath(path.c_str(), resolved)) return "";
+    return std::string(resolved);
+}
+
+bool runtime_alias_pair_for_path(
+    const std::string& path,
+    std::string* active_prefix_out,
+    std::string* compat_prefix_out,
+    std::string* name_out
+) {
+    struct PrefixPair {
+        const char* path_prefix;
+        const char* active_prefix;
+        const char* compat_prefix;
+    };
+
+    const PrefixPair pairs[] = {
+        {"/lib64/", "/lib64", "/lib64/x86_64-linux-gnu"},
+        {"/usr/lib64/", "/usr/lib64", "/usr/lib64/x86_64-linux-gnu"},
+        {"/lib/x86_64-linux-gnu/", "/lib64", "/lib64/x86_64-linux-gnu"},
+        {"/usr/lib/x86_64-linux-gnu/", "/usr/lib64", "/usr/lib64/x86_64-linux-gnu"},
+    };
+
+    for (const auto& pair : pairs) {
+        std::string prefix = pair.path_prefix;
+        if (path.rfind(prefix, 0) != 0) continue;
+
+        std::string remainder = path.substr(prefix.size());
+        if (remainder.empty() || remainder.find('/') != std::string::npos) return false;
+        if (!is_multiarch_runtime_alias_candidate(remainder)) return false;
+
+        if (active_prefix_out) *active_prefix_out = pair.active_prefix;
+        if (compat_prefix_out) *compat_prefix_out = pair.compat_prefix;
+        if (name_out) *name_out = remainder;
+        return true;
+    }
+
+    return false;
 }
 
 bool mkdir_p(const std::string& path) {
@@ -1178,6 +1307,7 @@ bool action_remove_safe(const std::string& pkg_name) {
         return false;
     }
 
+    sync_multiarch_runtime_aliases();
     refresh_linker_cache_if_available();
     discard_install_backups(removal_rollback_entries);
 
@@ -1666,6 +1796,7 @@ bool action_install(const std::string& pkg_file) {
         }
     }
 
+    sync_multiarch_runtime_aliases();
     refresh_linker_cache_if_available();
     discard_install_backups(install_rollback_entries);
 
@@ -1691,6 +1822,7 @@ bool action_verify(const std::string& pkg_name) {
 
     std::cout << "Verifying " << pkg_name << "..." << std::endl;
     bool passed = true;
+    std::set<std::tuple<std::string, std::string, std::string>> runtime_alias_candidates;
     for (const auto& f : files) {
         std::string full_path = g_root_prefix + f;
         struct stat st;
@@ -1722,6 +1854,31 @@ bool action_verify(const std::string& pkg_name) {
                      }
                  }
              }
+        }
+
+        std::string active_prefix;
+        std::string compat_prefix;
+        std::string name;
+        if (runtime_alias_pair_for_path(f, &active_prefix, &compat_prefix, &name)) {
+            runtime_alias_candidates.insert(std::make_tuple(active_prefix, compat_prefix, name));
+        }
+    }
+
+    for (const auto& candidate : runtime_alias_candidates) {
+        const std::string& active_prefix = std::get<0>(candidate);
+        const std::string& compat_prefix = std::get<1>(candidate);
+        const std::string& name = std::get<2>(candidate);
+
+        std::string active_path = g_root_prefix + active_prefix + "/" + name;
+        std::string compat_path = g_root_prefix + compat_prefix + "/" + name;
+        if (!path_exists_no_follow(active_path) || !path_exists_no_follow(compat_path)) continue;
+
+        std::string active_real = canonical_existing_path(active_path);
+        std::string compat_real = canonical_existing_path(compat_path);
+        if (active_real.empty() || compat_real.empty() || active_real != compat_real) {
+            std::cerr << "RUNTIME ALIAS MISMATCH: " << active_prefix << "/" << name
+                      << " <-> " << compat_prefix << "/" << name << std::endl;
+            passed = false;
         }
     }
     

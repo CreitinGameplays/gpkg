@@ -118,9 +118,9 @@ bool dependency_list_matches(
     for (const auto& entry : entries) {
         Dependency dep = parse_dependency(entry);
         if (dep.name != pkg) continue;
-        if (op.empty() || dep.version.empty() || version_satisfies(dep.version, op, req_version)) {
-            return true;
-        }
+        if (op.empty()) return true;
+        if (dep.version.empty()) continue;
+        if (version_satisfies(dep.version, op, req_version)) return true;
     }
     return false;
 }

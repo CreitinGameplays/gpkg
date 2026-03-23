@@ -24,6 +24,7 @@ struct PackageOverridePolicy {
 struct ImportPolicy {
     std::vector<std::string> system_provides;
     std::vector<std::string> upgradeable_system;
+    std::vector<std::string> allow_essential_packages;
     std::vector<std::string> skip_dependency_patterns;
     std::vector<std::string> skip_packages;
     std::map<std::string, std::string> dependency_choices;
@@ -260,6 +261,9 @@ ImportPolicy load_import_policy(bool verbose = false) {
     );
     policy.upgradeable_system = normalize_policy_string_entries(
         json_string_array(json_object_get(root, "upgradeable_system"))
+    );
+    policy.allow_essential_packages = normalize_policy_string_entries(
+        json_string_array(json_object_get(root, "allow_essential_packages"))
     );
     policy.skip_dependency_patterns = json_string_array(json_object_get(root, "skip_dependency_patterns"));
     policy.skip_packages = json_string_array(json_object_get(root, "skip_packages"));
