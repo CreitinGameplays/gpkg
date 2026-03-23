@@ -341,6 +341,11 @@ void sort_removal_queue_for_operation(std::vector<std::string>& to_remove, bool 
 
 std::vector<std::string> get_registered_package_names() {
     std::set<std::string> package_names;
+    for (const auto& record : load_package_status_records()) {
+        if (record.package.empty()) continue;
+        if (!package_status_is_installed_like(record.status)) continue;
+        package_names.insert(record.package);
+    }
     for (const auto& pkg : get_installed_packages(".json")) {
         package_names.insert(pkg);
     }

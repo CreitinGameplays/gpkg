@@ -80,12 +80,23 @@ struct CommandCaptureResult {
     std::string log_path;
 };
 
+struct PackageStatusRecord {
+    std::string package;
+    std::string want = "install";
+    std::string flag = "ok";
+    std::string status = "not-installed";
+    std::string version;
+};
+
 CommandCaptureResult run_command_captured(const std::string& cmd, bool verbose, const std::string& log_prefix);
 CommandCaptureResult run_command_captured_argv(
     const std::vector<std::string>& argv,
     bool verbose,
     const std::string& log_prefix
 );
+std::vector<PackageStatusRecord> load_package_status_records();
+bool get_package_status_record(const std::string& pkg_name, PackageStatusRecord* out = nullptr);
+bool package_status_is_installed_like(const std::string& state);
 
 enum class OptionalDependencyMode {
     Auto,

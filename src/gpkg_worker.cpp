@@ -25,7 +25,61 @@ std::string get_info_dir() {
     return g_root_prefix + "/var/lib/gpkg/info/";
 }
 
+std::string get_status_file_path() {
+    return g_root_prefix + "/var/lib/gpkg/status";
+}
+
+struct PackageStatusRecord {
+    std::string package;
+    std::string want = "install";
+    std::string flag = "ok";
+    std::string status = "not-installed";
+    std::string version;
+};
+
 std::string g_tmp_extract_path;
+
+std::vector<PackageStatusRecord> load_package_status_records();
+bool write_package_status_records(const std::vector<PackageStatusRecord>& records);
+bool set_package_status_record(
+    const std::string& pkg_name,
+    const std::string& want,
+    const std::string& flag,
+    const std::string& status,
+    const std::string& version
+);
+bool erase_package_status_record(const std::string& pkg_name);
+bool get_package_status_record(const std::string& pkg_name, PackageStatusRecord* out = nullptr);
+bool restore_package_status_snapshot(
+    const std::string& pkg_name,
+    bool had_record,
+    const PackageStatusRecord& record
+);
+
+struct PackageStatusRollbackGuard {
+    std::string pkg_name;
+    bool active = false;
+    bool had_record = false;
+    PackageStatusRecord record;
+
+    void begin(const std::string& name) {
+        pkg_name = name;
+        record = PackageStatusRecord{};
+        had_record = get_package_status_record(name, &record);
+        active = true;
+    }
+
+    void commit() {
+        active = false;
+    }
+
+    ~PackageStatusRollbackGuard() {
+        if (!active || pkg_name.empty()) return;
+        if (!restore_package_status_snapshot(pkg_name, had_record, record)) {
+            std::cerr << "W: Failed to restore package status for " << pkg_name << "." << std::endl;
+        }
+    }
+};
 
 std::string path_parent_dir(const std::string& full_path);
 bool mkdir_p(const std::string& path);
@@ -38,6 +92,7 @@ bool path_is_directory_or_directory_symlink(const std::string& full_path, const 
 bool remove_live_path_exact(const std::string& live_full_path);
 std::string canonical_existing_path(const std::string& path);
 std::string allocate_sibling_temp_path(const std::string& live_full_path, const std::string& tag, int* fd_out = nullptr);
+std::string get_package_version(const std::string& pkg_name);
 
 // Logging
 bool g_verbose = false;
@@ -49,6 +104,148 @@ std::string trim(const std::string& str) {
     if (std::string::npos == first) return str;
     size_t last = str.find_last_not_of(" \t\n\r");
     return str.substr(first, (last - first + 1));
+}
+
+std::vector<PackageStatusRecord> load_package_status_records() {
+    std::vector<PackageStatusRecord> records;
+    std::ifstream f(get_status_file_path());
+    if (!f) return records;
+
+    PackageStatusRecord current;
+    bool have_content = false;
+    std::string line;
+    auto flush_record = [&]() {
+        if (current.package.empty()) {
+            current = PackageStatusRecord{};
+            have_content = false;
+            return;
+        }
+
+        records.push_back(current);
+        current = PackageStatusRecord{};
+        have_content = false;
+    };
+
+    while (std::getline(f, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty()) {
+            flush_record();
+            continue;
+        }
+
+        size_t colon = line.find(':');
+        if (colon == std::string::npos) continue;
+
+        std::string key = trim(line.substr(0, colon));
+        std::string value = trim(line.substr(colon + 1));
+        if (key.empty()) continue;
+
+        have_content = true;
+        if (key == "Package") {
+            current.package = value;
+        } else if (key == "Status") {
+            std::istringstream iss(value);
+            std::string want;
+            std::string flag;
+            std::string state;
+            if (iss >> want >> flag >> state) {
+                current.want = want;
+                current.flag = flag;
+                current.status = state;
+            }
+        } else if (key == "Version") {
+            current.version = value;
+        }
+    }
+
+    if (have_content) flush_record();
+    return records;
+}
+
+bool write_package_status_records(const std::vector<PackageStatusRecord>& records) {
+    std::vector<PackageStatusRecord> normalized;
+    normalized.reserve(records.size());
+    for (const auto& record : records) {
+        if (record.package.empty()) continue;
+        normalized.push_back(record);
+    }
+
+    std::sort(normalized.begin(), normalized.end(), [](const PackageStatusRecord& left, const PackageStatusRecord& right) {
+        return left.package < right.package;
+    });
+
+    std::ostringstream buffer;
+    for (size_t i = 0; i < normalized.size(); ++i) {
+        const auto& record = normalized[i];
+        buffer << "Package: " << record.package << "\n";
+        buffer << "Status: " << (record.want.empty() ? "install" : record.want)
+               << " " << (record.flag.empty() ? "ok" : record.flag)
+               << " " << (record.status.empty() ? "not-installed" : record.status) << "\n";
+        if (!record.version.empty()) buffer << "Version: " << record.version << "\n";
+        buffer << "\n";
+    }
+
+    if (!mkdir_p(g_root_prefix + "/var/lib/gpkg")) return false;
+    return write_text_file_atomic(get_status_file_path(), buffer.str(), 0644);
+}
+
+bool get_package_status_record(const std::string& pkg_name, PackageStatusRecord* out) {
+    std::vector<PackageStatusRecord> records = load_package_status_records();
+    for (const auto& record : records) {
+        if (record.package != pkg_name) continue;
+        if (out) *out = record;
+        return true;
+    }
+    return false;
+}
+
+bool set_package_status_record(
+    const std::string& pkg_name,
+    const std::string& want,
+    const std::string& flag,
+    const std::string& status,
+    const std::string& version
+) {
+    std::vector<PackageStatusRecord> records = load_package_status_records();
+    for (auto& record : records) {
+        if (record.package != pkg_name) continue;
+        record.want = want;
+        record.flag = flag;
+        record.status = status;
+        record.version = version;
+        return write_package_status_records(records);
+    }
+
+    PackageStatusRecord record;
+    record.package = pkg_name;
+    record.want = want;
+    record.flag = flag;
+    record.status = status;
+    record.version = version;
+    records.push_back(record);
+    return write_package_status_records(records);
+}
+
+bool erase_package_status_record(const std::string& pkg_name) {
+    std::vector<PackageStatusRecord> records = load_package_status_records();
+    size_t original_size = records.size();
+    records.erase(
+        std::remove_if(records.begin(), records.end(), [&](const PackageStatusRecord& record) {
+            return record.package == pkg_name;
+        }),
+        records.end()
+    );
+    if (records.size() == original_size) return true;
+    return write_package_status_records(records);
+}
+
+bool restore_package_status_snapshot(
+    const std::string& pkg_name,
+    bool had_record,
+    const PackageStatusRecord& record
+) {
+    if (!had_record) return erase_package_status_record(pkg_name);
+    return set_package_status_record(pkg_name, record.want, record.flag, record.status, record.version);
 }
 
 std::string shell_quote(const std::string& value) {
@@ -1729,6 +1926,12 @@ bool stage_package_metadata_removal(
 bool action_remove_safe(const std::string& pkg_name) {
     std::cout << "Removing " << pkg_name << "..." << std::endl;
 
+    PackageStatusRollbackGuard status_guard;
+    status_guard.begin(pkg_name);
+    std::string current_version = !status_guard.record.version.empty()
+        ? status_guard.record.version
+        : get_package_version(pkg_name);
+
     std::string prerm = get_info_dir() + pkg_name + ".prerm";
     if (access(prerm.c_str(), X_OK) == 0) {
         if (run_path_with_args(prerm, {"remove"}) != 0) {
@@ -1736,6 +1939,11 @@ bool action_remove_safe(const std::string& pkg_name) {
             std::cerr << "E: prerm script failed." << std::endl;
             return false;
         }
+    }
+
+    if (!set_package_status_record(pkg_name, "deinstall", "ok", "half-installed", current_version)) {
+        std::cerr << "E: Failed to update package status before removal." << std::endl;
+        return false;
     }
 
     std::vector<std::string> undo_cmds = load_registered_undo_commands(pkg_name);
@@ -1789,7 +1997,15 @@ bool action_remove_safe(const std::string& pkg_name) {
                   << pkg_name << "." << std::endl;
         return false;
     }
+
+    if (!set_package_status_record(pkg_name, "deinstall", "ok", "config-files", current_version)) {
+        rollback_remove_transaction(pkg_name, removal_rollback_entries, runtime_sensitive, false);
+        std::cerr << "E: Failed to finalize package status after removal." << std::endl;
+        return false;
+    }
+
     discard_install_backups(removal_rollback_entries);
+    status_guard.commit();
 
     std::cout << "✓ Removed " << pkg_name << std::endl;
     return true;
@@ -1797,6 +2013,17 @@ bool action_remove_safe(const std::string& pkg_name) {
 
 bool action_retire_safe(const std::string& pkg_name) {
     std::cout << "Retiring " << pkg_name << "..." << std::endl;
+
+    PackageStatusRollbackGuard status_guard;
+    status_guard.begin(pkg_name);
+    std::string current_version = !status_guard.record.version.empty()
+        ? status_guard.record.version
+        : get_package_version(pkg_name);
+
+    if (!set_package_status_record(pkg_name, "deinstall", "ok", "half-installed", current_version)) {
+        std::cerr << "E: Failed to update package status before retirement." << std::endl;
+        return false;
+    }
 
     std::vector<std::string> owned_files = read_list_file(pkg_name);
     bool runtime_sensitive = files_touch_runtime_linker_state(owned_files);
@@ -1827,7 +2054,19 @@ bool action_retire_safe(const std::string& pkg_name) {
                   << pkg_name << "." << std::endl;
         return false;
     }
+
+    if (!erase_package_status_record(pkg_name)) {
+        rollback_install_changes(rollback_entries);
+        if (runtime_sensitive) {
+            sync_multiarch_runtime_aliases();
+            refresh_linker_cache_if_available();
+        }
+        std::cerr << "E: Failed to finalize package status after retirement." << std::endl;
+        return false;
+    }
+
     discard_install_backups(rollback_entries);
+    status_guard.commit();
 
     std::cout << "✓ Retired " << pkg_name << std::endl;
     return true;
@@ -2206,6 +2445,11 @@ bool check_collisions(const std::string& pkg_name, const std::vector<std::string
 
 // Helper to get version from installed package
 std::string get_package_version(const std::string& pkg_name) {
+    PackageStatusRecord status_record;
+    if (get_package_status_record(pkg_name, &status_record) && !status_record.version.empty()) {
+        return status_record.version;
+    }
+
     std::string path = get_info_dir() + pkg_name + ".json";
     std::ifstream f(path);
     if (!f) return "";
@@ -2290,6 +2534,9 @@ bool action_install(const std::string& pkg_file) {
         return false;
     }
 
+    PackageStatusRollbackGuard status_guard;
+    status_guard.begin(pkg_name);
+
     // 3. Check Collisions & Detect Upgrade
     if (!check_collisions(pkg_name, new_files)) {
         return false;
@@ -2303,6 +2550,12 @@ bool action_install(const std::string& pkg_file) {
         auto old_files_vec = read_list_file(pkg_name);
         for(const auto& f : old_files_vec) old_files_set.insert(f);
     }
+
+    if (!set_package_status_record(pkg_name, "install", "ok", "half-installed", new_version)) {
+        std::cerr << "E: Failed to record package status before installation." << std::endl;
+        return false;
+    }
+
     std::vector<ReplacedSystemFile> replaced_system_files =
         collect_replaced_system_files(pkg_name, new_files, old_files_set);
     std::vector<InstallRollbackEntry> install_rollback_entries;
@@ -2499,8 +2752,27 @@ bool action_install(const std::string& pkg_file) {
         return false;
     }
 
+    if (!set_package_status_record(pkg_name, "install", "ok", "unpacked", new_version)) {
+        rollback_install_changes(install_rollback_entries);
+        if (runtime_sensitive) {
+            sync_multiarch_runtime_aliases();
+            refresh_linker_cache_if_available();
+        }
+        std::cerr << "E: Failed to record unpacked package state." << std::endl;
+        return false;
+    }
+
     // 7. Postinst
     std::string installed_postinst = get_info_dir() + pkg_name + ".postinst";
+    if (!set_package_status_record(pkg_name, "install", "ok", "half-configured", new_version)) {
+         rollback_install_changes(install_rollback_entries);
+         if (runtime_sensitive) {
+             sync_multiarch_runtime_aliases();
+             refresh_linker_cache_if_available();
+         }
+         std::cerr << "E: Failed to record half-configured package state." << std::endl;
+         return false;
+    }
     if (access(installed_postinst.c_str(), X_OK) == 0) {
          std::vector<std::string> postinst_args = {"configure"};
          if (is_upgrade) postinst_args.push_back(old_version);
@@ -2545,7 +2817,17 @@ bool action_install(const std::string& pkg_file) {
         }
     }
 
+    if (!set_package_status_record(pkg_name, "install", "ok", "installed", new_version)) {
+        rollback_install_changes(install_rollback_entries);
+        if (runtime_sensitive) {
+            sync_multiarch_runtime_aliases();
+            refresh_linker_cache_if_available();
+        }
+        std::cerr << "E: Failed to finalize package status after installation." << std::endl;
+        return false;
+    }
     discard_install_backups(install_rollback_entries);
+    status_guard.commit();
 
     std::cout << "✓ Installed " << pkg_name << " (" << new_version << ")" << std::endl;
     return true;

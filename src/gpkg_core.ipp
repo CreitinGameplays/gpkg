@@ -302,6 +302,81 @@ std::vector<std::string> get_installed_packages(const std::string& extension = "
     return pkgs;
 }
 
+std::vector<PackageStatusRecord> load_package_status_records() {
+    std::vector<PackageStatusRecord> records;
+    std::ifstream f(STATUS_FILE);
+    if (!f) return records;
+
+    PackageStatusRecord current;
+    bool have_content = false;
+    std::string line;
+    auto flush_record = [&]() {
+        if (current.package.empty()) {
+            current = PackageStatusRecord{};
+            have_content = false;
+            return;
+        }
+
+        records.push_back(current);
+        current = PackageStatusRecord{};
+        have_content = false;
+    };
+
+    while (std::getline(f, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty()) {
+            flush_record();
+            continue;
+        }
+
+        size_t colon = line.find(':');
+        if (colon == std::string::npos) continue;
+
+        std::string key = trim(line.substr(0, colon));
+        std::string value = trim(line.substr(colon + 1));
+        if (key.empty()) continue;
+
+        have_content = true;
+        if (key == "Package") {
+            current.package = value;
+        } else if (key == "Status") {
+            std::istringstream iss(value);
+            std::string want;
+            std::string flag;
+            std::string state;
+            if (iss >> want >> flag >> state) {
+                current.want = want;
+                current.flag = flag;
+                current.status = state;
+            }
+        } else if (key == "Version") {
+            current.version = value;
+        }
+    }
+
+    if (have_content) flush_record();
+    return records;
+}
+
+bool get_package_status_record(const std::string& pkg_name, PackageStatusRecord* out) {
+    std::vector<PackageStatusRecord> records = load_package_status_records();
+    for (const auto& record : records) {
+        if (record.package != pkg_name) continue;
+        if (out) *out = record;
+        return true;
+    }
+    return false;
+}
+
+bool package_status_is_installed_like(const std::string& state) {
+    return state == "half-installed" ||
+           state == "unpacked" ||
+           state == "half-configured" ||
+           state == "triggers-awaited" ||
+           state == "triggers-pending" ||
+           state == "installed";
+}
+
 bool get_json_value(const std::string& obj, const std::string& key, std::string& out_val) {
     size_t key_pos = obj.find("\"" + key + "\"");
     if (key_pos == std::string::npos) return false;
@@ -453,9 +528,26 @@ int compare_versions(const std::string& v1, const std::string& v2) {
 }
 
 bool is_installed(const std::string& pkg, std::string* out_version = nullptr) {
+    PackageStatusRecord record;
+    if (get_package_status_record(pkg, &record)) {
+        if (!package_status_is_installed_like(record.status)) return false;
+
+        if (out_version) {
+            if (!record.version.empty()) {
+                *out_version = record.version;
+            } else {
+                std::string info_path = INFO_DIR + pkg + ".json";
+                std::ifstream f(info_path);
+                if (!f) return false;
+                std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+                return get_json_value(content, "version", *out_version);
+            }
+        }
+        return true;
+    }
+
     std::string info_path = INFO_DIR + pkg + ".json";
     if (access(info_path.c_str(), F_OK) != 0) return false;
-
     if (!out_version) return true;
 
     std::ifstream f(info_path);

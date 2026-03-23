@@ -70,6 +70,75 @@ bool ensure_repo_index_available() {
     return false;
 }
 
+bool remove_cache_tree_no_follow(const std::string& path) {
+    struct stat st;
+    if (lstat(path.c_str(), &st) != 0) {
+        return errno == ENOENT;
+    }
+
+    if (S_ISDIR(st.st_mode) && !S_ISLNK(st.st_mode)) {
+        DIR* dir = opendir(path.c_str());
+        if (!dir) return false;
+
+        bool ok = true;
+        struct dirent* entry;
+        while ((entry = readdir(dir)) != nullptr) {
+            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+            if (!remove_cache_tree_no_follow(path + "/" + entry->d_name)) ok = false;
+        }
+        closedir(dir);
+        if (rmdir(path.c_str()) != 0 && errno != ENOENT) ok = false;
+        return ok;
+    }
+
+    return unlink(path.c_str()) == 0 || errno == ENOENT;
+}
+
+bool clear_repo_cache_contents(bool verbose) {
+    struct stat st;
+    if (lstat(REPO_CACHE_PATH.c_str(), &st) != 0) {
+        if (errno == ENOENT) return mkdir_p(REPO_CACHE_PATH);
+        std::cerr << Color::RED << "E: Failed to inspect repo cache directory "
+                  << REPO_CACHE_PATH << ": " << strerror(errno) << Color::RESET << std::endl;
+        return false;
+    }
+
+    if (!S_ISDIR(st.st_mode)) {
+        std::cerr << Color::RED << "E: Repo cache path is not a directory: "
+                  << REPO_CACHE_PATH << Color::RESET << std::endl;
+        return false;
+    }
+
+    DIR* dir = opendir(REPO_CACHE_PATH.c_str());
+    if (!dir) {
+        std::cerr << Color::RED << "E: Failed to open repo cache directory "
+                  << REPO_CACHE_PATH << ": " << strerror(errno) << Color::RESET << std::endl;
+        return false;
+    }
+
+    bool ok = true;
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != nullptr) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+        std::string child = REPO_CACHE_PATH + entry->d_name;
+        VLOG(verbose, "Removing cache entry " << child);
+        if (!remove_cache_tree_no_follow(child)) {
+            ok = false;
+            std::cerr << Color::YELLOW << "W: Failed to remove cache entry "
+                      << child << ": " << strerror(errno) << Color::RESET << std::endl;
+        }
+    }
+    closedir(dir);
+
+    if (!mkdir_p(REPO_CACHE_PATH)) {
+        std::cerr << Color::RED << "E: Failed to ensure repo cache directory exists after cleaning."
+                  << Color::RESET << std::endl;
+        return false;
+    }
+
+    return ok;
+}
+
 int package_source_rank(const PackageMetadata& meta) {
     if (meta.source_kind == "debian") return 0;
     if (meta.source_kind == "gpkg_repo") return 1;
@@ -429,6 +498,9 @@ int handle_add_repo(const std::string& url, bool verbose) {
 int handle_clean(bool verbose) {
     std::cout << "Cleaning package cache..." << std::endl;
     invalidate_repo_package_cache();
-    run_command("rm -rf " + REPO_CACHE_PATH + "*", verbose);
+    if (!clear_repo_cache_contents(verbose)) return 1;
+    std::cout << Color::GREEN
+              << "✓ Removed cached package archives, converted imports, partial downloads, and repo indices."
+              << Color::RESET << std::endl;
     return 0;
 }
