@@ -32,6 +32,13 @@ struct DebianPackageRecord {
     bool essential = false;
 };
 
+struct DebianPackagesCacheState {
+    std::string packages_url;
+    std::string etag;
+    std::string last_modified;
+    long content_length = -1;
+};
+
 std::string sanitize_section_name(const std::string& raw_section) {
     std::string top_level = raw_section;
     size_t slash = top_level.find('/');
@@ -89,6 +96,133 @@ DebianBackendConfig load_debian_backend_config(bool verbose = false) {
                   << " apt_arch=" << config.apt_arch << std::endl;
     }
     return config;
+}
+
+std::string lowercase_copy(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), ::tolower);
+    return value;
+}
+
+std::string extract_http_header_value(
+    const std::string& headers,
+    const std::string& lower_headers,
+    const std::string& header_name
+) {
+    size_t pos = lower_headers.find(header_name);
+    if (pos == std::string::npos) return "";
+
+    size_t start = pos + header_name.size();
+    size_t end = lower_headers.find("\r\n", start);
+    if (end == std::string::npos) return "";
+    return trim(headers.substr(start, end - start));
+}
+
+bool fetch_remote_packages_index_state(
+    const std::string& url,
+    DebianPackagesCacheState& state,
+    bool verbose,
+    std::string* error_out = nullptr
+) {
+    if (error_out) error_out->clear();
+
+    HttpOptions opts;
+    opts.method = "HEAD";
+    opts.include_headers = true;
+    opts.follow_location = true;
+    opts.show_progress = false;
+    opts.verbose = verbose;
+
+    std::stringstream response;
+    if (!HttpRequest(url, response, opts, error_out)) return false;
+
+    std::string headers = response.str();
+    std::string lower_headers = lowercase_copy(headers);
+
+    state = {};
+    state.packages_url = url;
+    state.etag = extract_http_header_value(headers, lower_headers, "etag: ");
+    state.last_modified = extract_http_header_value(headers, lower_headers, "last-modified: ");
+
+    std::string content_length = extract_http_header_value(headers, lower_headers, "content-length: ");
+    if (!content_length.empty()) state.content_length = std::atol(content_length.c_str());
+
+    return true;
+}
+
+std::string get_debian_packages_state_path() {
+    return REPO_CACHE_PATH + "debian/Packages.state";
+}
+
+bool load_debian_packages_cache_state(const std::string& path, DebianPackagesCacheState& state) {
+    std::ifstream f(path);
+    if (!f) return false;
+
+    state = {};
+    std::string line;
+    while (std::getline(f, line)) {
+        line = trim(line);
+        if (line.empty() || line[0] == '#') continue;
+
+        size_t eq = line.find('=');
+        if (eq == std::string::npos) continue;
+
+        std::string key = trim(line.substr(0, eq));
+        std::string value = line.substr(eq + 1);
+        if (key == "PACKAGES_URL") state.packages_url = value;
+        else if (key == "ETAG") state.etag = value;
+        else if (key == "LAST_MODIFIED") state.last_modified = value;
+        else if (key == "CONTENT_LENGTH") state.content_length = std::atol(value.c_str());
+    }
+
+    return !state.packages_url.empty();
+}
+
+bool save_debian_packages_cache_state(const std::string& path, const DebianPackagesCacheState& state) {
+    if (!mkdir_parent(path)) return false;
+
+    std::string temp_path = path + ".tmp";
+    std::ofstream out(temp_path, std::ios::trunc);
+    if (!out) return false;
+
+    out << "PACKAGES_URL=" << state.packages_url << "\n";
+    out << "ETAG=" << state.etag << "\n";
+    out << "LAST_MODIFIED=" << state.last_modified << "\n";
+    out << "CONTENT_LENGTH=" << state.content_length << "\n";
+    out.close();
+
+    if (!out) {
+        remove(temp_path.c_str());
+        return false;
+    }
+
+    if (rename(temp_path.c_str(), path.c_str()) != 0) {
+        remove(temp_path.c_str());
+        return false;
+    }
+
+    return true;
+}
+
+bool remote_packages_index_matches_cache(
+    const DebianPackagesCacheState& cached,
+    const DebianPackagesCacheState& remote
+) {
+    if (cached.packages_url.empty() || remote.packages_url.empty()) return false;
+    if (cached.packages_url != remote.packages_url) return false;
+
+    if (!cached.etag.empty() && !remote.etag.empty()) {
+        return cached.etag == remote.etag;
+    }
+
+    if (!cached.last_modified.empty() && !remote.last_modified.empty()) {
+        if (cached.last_modified != remote.last_modified) return false;
+        if (cached.content_length > 0 && remote.content_length > 0) {
+            return cached.content_length == remote.content_length;
+        }
+        return true;
+    }
+
+    return false;
 }
 
 std::vector<std::map<std::string, std::string>> parse_debian_control_stanzas(const std::string& text) {
@@ -495,21 +629,46 @@ bool update_debian_backend_index(
     DebianBackendConfig config = load_debian_backend_config(verbose);
     std::string packages_gz = get_debian_packages_gz_cache_path();
     std::string packages_txt = get_debian_packages_cache_path();
+    std::string packages_state = get_debian_packages_state_path();
     if (!mkdir_parent(packages_gz)) return false;
 
-    std::string download_error;
-    if (!DownloadFile(config.packages_url, packages_gz, verbose, &download_error)) {
-        std::cerr << Color::YELLOW << "W: Failed to fetch Debian Packages index from "
-                  << config.packages_url;
-        if (!download_error.empty()) std::cerr << " (" << download_error << ")";
-        std::cerr << Color::RESET << std::endl;
-        return false;
+    DebianPackagesCacheState cached_state;
+    bool have_cached_state = load_debian_packages_cache_state(packages_state, cached_state);
+    bool have_packages_txt = access(packages_txt.c_str(), F_OK) == 0;
+
+    DebianPackagesCacheState remote_state;
+    std::string probe_error;
+    bool have_remote_state = fetch_remote_packages_index_state(
+        config.packages_url,
+        remote_state,
+        verbose,
+        &probe_error
+    );
+    bool needs_download = true;
+
+    if (have_packages_txt && have_cached_state && have_remote_state &&
+        remote_packages_index_matches_cache(cached_state, remote_state)) {
+        needs_download = false;
+        VLOG(verbose, "Debian Packages index is unchanged on the server; reusing cached copy.");
+    } else if (verbose && !have_remote_state && !probe_error.empty()) {
+        VLOG(verbose, "Unable to probe Debian Packages metadata; falling back to full download: " << probe_error);
     }
 
-    std::string unpack_cmd = "gunzip -c " + shell_quote(packages_gz) + " > " + shell_quote(packages_txt);
-    if (run_command(unpack_cmd, verbose) != 0) {
-        std::cerr << Color::YELLOW << "W: Failed to unpack Debian Packages index." << Color::RESET << std::endl;
-        return false;
+    if (needs_download) {
+        std::string download_error;
+        if (!DownloadFile(config.packages_url, packages_gz, verbose, &download_error)) {
+            std::cerr << Color::YELLOW << "W: Failed to fetch Debian Packages index from "
+                      << config.packages_url;
+            if (!download_error.empty()) std::cerr << " (" << download_error << ")";
+            std::cerr << Color::RESET << std::endl;
+            return false;
+        }
+
+        std::string unpack_cmd = "gunzip -c " + shell_quote(packages_gz) + " > " + shell_quote(packages_txt);
+        if (run_command(unpack_cmd, verbose) != 0) {
+            std::cerr << Color::YELLOW << "W: Failed to unpack Debian Packages index." << Color::RESET << std::endl;
+            return false;
+        }
     }
 
     std::vector<std::string> skipped_policy;
@@ -521,8 +680,18 @@ bool update_debian_backend_index(
         ++total_packages;
     }
 
-    std::cout << Color::GREEN << "✓ Updated packages index"
-              << " (" << entries.size() << " packages)" << Color::RESET << std::endl;
+    if (needs_download) {
+        if (have_remote_state) {
+            save_debian_packages_cache_state(packages_state, remote_state);
+        } else {
+            remove(packages_state.c_str());
+        }
+        std::cout << Color::GREEN << "✓ Updated packages index"
+                  << " (" << entries.size() << " packages)" << Color::RESET << std::endl;
+    } else {
+        std::cout << Color::GREEN << "✓ Reused cached Debian packages index"
+                  << " (" << entries.size() << " packages)" << Color::RESET << std::endl;
+    }
     return true;
 }
 

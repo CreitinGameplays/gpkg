@@ -15,14 +15,14 @@ LZMA_STATIC := $(firstword \
 	$(wildcard $(PROJECT_ROOT)/rootfs/usr/lib64/x86_64-linux-gnu/liblzma.a) \
 	$(wildcard $(PROJECT_ROOT)/rootfs/usr/lib64/liblzma.a))
 ifeq ($(strip $(GPKG_VERSION)),)
-GPKG_VERSION := $(shell awk '$$2 == "OS_VERSION" { gsub(/"/, "", $$3); print $$3; exit }' $(SYS_INFO_HEADER))
+GPKG_VERSION := $(shell sed -n 's/^#define OS_VERSION "\(.*\)"/\1/p' $(SYS_INFO_HEADER) | head -n1)
 endif
 ifeq ($(strip $(GPKG_CODENAME)),)
-GPKG_CODENAME := $(shell awk '$$2 == "OS_CODENAME" { gsub(/"/, "", $$3); print $$3; exit }' $(SYS_INFO_HEADER))
+GPKG_CODENAME := $(shell sed -n 's/^#define OS_CODENAME "\(.*\)"/\1/p' $(SYS_INFO_HEADER) | head -n1)
 endif
 
 CXXFLAGS += -Wall -Wextra -O2 -I./src -I$(GINIT_DIR)/src -I$(GLOBAL_SRC_DIR)
-CXXFLAGS += -DGPKG_VERSION=\"$(GPKG_VERSION)\" -DGPKG_CODENAME=\"$(GPKG_CODENAME)\"
+CXXFLAGS += '-DGPKG_VERSION="$(GPKG_VERSION)"' '-DGPKG_CODENAME="$(GPKG_CODENAME)"'
 ifneq ($(strip $(TARGET_CXX_VERSION)),)
 CXXFLAGS += -nostdinc++
 CXXFLAGS += -isystem $(ROOTFS)/usr/include/c++/$(TARGET_CXX_VERSION)
