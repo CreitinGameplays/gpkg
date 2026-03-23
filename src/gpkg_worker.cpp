@@ -29,6 +29,10 @@ std::string get_status_file_path() {
     return g_root_prefix + "/var/lib/gpkg/status";
 }
 
+std::string get_conffile_manifest_path(const std::string& pkg_name) {
+    return get_info_dir() + pkg_name + ".conffiles";
+}
+
 struct PackageStatusRecord {
     std::string package;
     std::string want = "install";
@@ -880,6 +884,63 @@ bool is_etc_config_path(const std::string& path) {
     return path.size() > 5 && path.rfind("/etc/", 0) == 0;
 }
 
+std::string canonical_conffile_path_for_owned_entry(const std::string& path) {
+    if (is_etc_config_path(path)) return path;
+
+    const std::string suffix = ".gpkg-new";
+    if (path.size() > suffix.size() &&
+        path.compare(path.size() - suffix.size(), suffix.size(), suffix) == 0) {
+        std::string base = path.substr(0, path.size() - suffix.size());
+        if (is_etc_config_path(base)) return base;
+    }
+
+    return "";
+}
+
+std::vector<std::string> collect_package_conffiles_from_entries(const std::vector<std::string>& entries) {
+    std::vector<std::string> conffiles;
+    std::set<std::string> seen;
+    for (const auto& entry : entries) {
+        std::string canonical = canonical_conffile_path_for_owned_entry(entry);
+        if (canonical.empty()) continue;
+        if (seen.insert(canonical).second) conffiles.push_back(canonical);
+    }
+    return conffiles;
+}
+
+std::vector<std::string> load_package_conffiles(const std::string& pkg_name) {
+    std::vector<std::string> conffiles;
+    std::ifstream in(get_conffile_manifest_path(pkg_name));
+    if (in) {
+        std::string line;
+        while (std::getline(in, line)) {
+            line = trim(line);
+            if (line.empty()) continue;
+            if (std::find(conffiles.begin(), conffiles.end(), line) == conffiles.end()) {
+                conffiles.push_back(line);
+            }
+        }
+        return conffiles;
+    }
+
+    return collect_package_conffiles_from_entries(read_list_file(pkg_name));
+}
+
+bool write_package_conffiles(const std::string& pkg_name, const std::vector<std::string>& conffiles) {
+    std::vector<std::string> normalized = conffiles;
+    std::sort(normalized.begin(), normalized.end());
+    normalized.erase(std::unique(normalized.begin(), normalized.end()), normalized.end());
+
+    std::string path = get_conffile_manifest_path(pkg_name);
+    if (normalized.empty()) {
+        return remove_live_path_exact(path);
+    }
+
+    std::ostringstream out;
+    for (const auto& entry : normalized) out << entry << "\n";
+    return write_text_file_atomic(path, out.str(), 0644);
+}
+
 std::string find_file_owner(const std::string& pkg_name, const std::string& file_path) {
     for (const auto& other : get_installed_packages()) {
         if (other == pkg_name) continue;
@@ -1480,10 +1541,25 @@ bool backup_live_path_if_present(
     }
 
     if (rename(live_full_path.c_str(), backup_full_path.c_str()) != 0) {
-        std::cerr << "E: Failed to move existing path aside for " << live_full_path << ": "
-                  << strerror(errno) << std::endl;
-        unlink(backup_full_path.c_str());
-        return false;
+        if (errno == EXDEV && !path_is_directory_or_directory_symlink(live_full_path, &st)) {
+            if (!copy_path_atomic_no_follow(live_full_path, backup_full_path)) {
+                std::cerr << "E: Failed to copy existing path aside for " << live_full_path << ": "
+                          << strerror(errno) << std::endl;
+                unlink(backup_full_path.c_str());
+                return false;
+            }
+            if (!remove_live_path_exact(live_full_path)) {
+                std::cerr << "E: Failed to remove existing path after copying backup for "
+                          << live_full_path << ": " << strerror(errno) << std::endl;
+                unlink(backup_full_path.c_str());
+                return false;
+            }
+        } else {
+            std::cerr << "E: Failed to move existing path aside for " << live_full_path << ": "
+                      << strerror(errno) << std::endl;
+            unlink(backup_full_path.c_str());
+            return false;
+        }
     }
 
     if (had_existing) *had_existing = true;
@@ -1900,11 +1976,13 @@ bool stage_replaced_system_restore(
 
 bool stage_package_metadata_removal(
     const std::string& pkg_name,
-    std::vector<InstallRollbackEntry>& rollback_entries
+    std::vector<InstallRollbackEntry>& rollback_entries,
+    bool keep_for_config_files = false
 ) {
     std::vector<std::string> metadata_paths = {
         get_info_dir() + pkg_name + ".list",
         get_info_dir() + pkg_name + ".json",
+        get_conffile_manifest_path(pkg_name),
         get_info_dir() + pkg_name + ".undo",
         get_info_dir() + pkg_name + ".preinst",
         get_info_dir() + pkg_name + ".postinst",
@@ -1914,7 +1992,15 @@ bool stage_package_metadata_removal(
         get_replaced_system_dir(pkg_name)
     };
 
+    std::set<std::string> keep_paths;
+    if (keep_for_config_files) {
+        keep_paths.insert(get_info_dir() + pkg_name + ".json");
+        keep_paths.insert(get_conffile_manifest_path(pkg_name));
+        keep_paths.insert(get_info_dir() + pkg_name + ".postrm");
+    }
+
     for (const auto& full_path : metadata_paths) {
+        if (keep_paths.count(full_path) != 0) continue;
         if (!backup_live_path_if_present(full_path, full_path, rollback_entries)) {
             return false;
         }
@@ -1949,11 +2035,17 @@ bool action_remove_safe(const std::string& pkg_name) {
     std::vector<std::string> undo_cmds = load_registered_undo_commands(pkg_name);
 
     std::vector<std::string> owned_files = read_list_file(pkg_name);
+    std::vector<std::string> conffiles = load_package_conffiles(pkg_name);
+    std::set<std::string> conffile_set(conffiles.begin(), conffiles.end());
     bool runtime_sensitive = files_touch_runtime_linker_state(owned_files);
     sort_paths_for_removal(owned_files);
 
     std::vector<InstallRollbackEntry> removal_rollback_entries;
     for (const auto& path : owned_files) {
+        if (conffile_set.count(path) != 0) {
+            VLOG("Keeping conffile during remove: " << path);
+            continue;
+        }
         if (!stage_owned_path_removal(path, removal_rollback_entries)) {
             rollback_remove_transaction(pkg_name, removal_rollback_entries, runtime_sensitive);
             std::cerr << "E: Failed while staging removal of " << path << std::endl;
@@ -1975,6 +2067,14 @@ bool action_remove_safe(const std::string& pkg_name) {
         }
     }
 
+    std::string conffiles_path = get_conffile_manifest_path(pkg_name);
+    if (!prepare_path_for_transaction_write(conffiles_path, conffiles_path, removal_rollback_entries) ||
+        !write_package_conffiles(pkg_name, conffiles)) {
+        rollback_remove_transaction(pkg_name, removal_rollback_entries, runtime_sensitive);
+        std::cerr << "E: Failed to preserve conffile metadata for " << pkg_name << "." << std::endl;
+        return false;
+    }
+
     std::string postrm = get_info_dir() + pkg_name + ".postrm";
     if (access(postrm.c_str(), X_OK) == 0) {
         if (run_path_with_args(postrm, {"remove"}) != 0) {
@@ -1984,7 +2084,7 @@ bool action_remove_safe(const std::string& pkg_name) {
         }
     }
 
-    if (!stage_package_metadata_removal(pkg_name, removal_rollback_entries)) {
+    if (!stage_package_metadata_removal(pkg_name, removal_rollback_entries, true)) {
         rollback_remove_transaction(pkg_name, removal_rollback_entries, runtime_sensitive, false);
         std::cerr << "E: Failed to remove package metadata safely." << std::endl;
         return false;
@@ -2008,6 +2108,59 @@ bool action_remove_safe(const std::string& pkg_name) {
     status_guard.commit();
 
     std::cout << "✓ Removed " << pkg_name << std::endl;
+    return true;
+}
+
+bool action_purge_safe(const std::string& pkg_name) {
+    std::cout << "Purging " << pkg_name << "..." << std::endl;
+
+    PackageStatusRollbackGuard status_guard;
+    status_guard.begin(pkg_name);
+    if (status_guard.had_record &&
+        status_guard.record.status != "config-files" &&
+        status_guard.record.status != "not-installed") {
+        std::cerr << "E: Package " << pkg_name
+                  << " is still installed. Remove it before purging." << std::endl;
+        return false;
+    }
+
+    std::vector<std::string> conffiles = load_package_conffiles(pkg_name);
+    sort_paths_for_removal(conffiles);
+
+    std::vector<InstallRollbackEntry> purge_rollback_entries;
+    for (const auto& path : conffiles) {
+        if (!stage_owned_path_removal(path, purge_rollback_entries)) {
+            rollback_install_changes(purge_rollback_entries);
+            std::cerr << "E: Failed while purging conffile " << path << std::endl;
+            return false;
+        }
+    }
+
+    std::string postrm = get_info_dir() + pkg_name + ".postrm";
+    if (access(postrm.c_str(), X_OK) == 0) {
+        if (run_path_with_args(postrm, {"purge"}) != 0) {
+            rollback_install_changes(purge_rollback_entries);
+            std::cerr << "E: postrm purge script failed." << std::endl;
+            return false;
+        }
+    }
+
+    if (!stage_package_metadata_removal(pkg_name, purge_rollback_entries, false)) {
+        rollback_install_changes(purge_rollback_entries);
+        std::cerr << "E: Failed to purge package metadata safely." << std::endl;
+        return false;
+    }
+
+    if (!erase_package_status_record(pkg_name)) {
+        rollback_install_changes(purge_rollback_entries);
+        std::cerr << "E: Failed to finalize package status after purge." << std::endl;
+        return false;
+    }
+
+    discard_install_backups(purge_rollback_entries);
+    status_guard.commit();
+
+    std::cout << "✓ Purged " << pkg_name << std::endl;
     return true;
 }
 
@@ -2656,6 +2809,7 @@ bool action_install(const std::string& pkg_file) {
     std::vector<std::string> installed_files = new_files;
     apply_preserved_config_metadata(installed_files, preserved_configs);
     prune_non_owned_directory_symlink_entries(installed_files, staged_entries);
+    std::vector<std::string> conffiles = collect_package_conffiles_from_entries(new_files);
 
     // 6. Register in Database
     if (!mkdir_p(get_info_dir())) {
@@ -2693,6 +2847,17 @@ bool action_install(const std::string& pkg_file) {
             refresh_linker_cache_if_available();
         }
         std::cerr << "E: Failed to write installed package metadata." << std::endl;
+        return false;
+    }
+    std::string conffiles_path = get_conffile_manifest_path(pkg_name);
+    if (!prepare_path_for_transaction_write(conffiles_path, conffiles_path, install_rollback_entries) ||
+        !write_package_conffiles(pkg_name, conffiles)) {
+        rollback_install_changes(install_rollback_entries);
+        if (runtime_sensitive) {
+            sync_multiarch_runtime_aliases();
+            refresh_linker_cache_if_available();
+        }
+        std::cerr << "E: Failed to write package conffile metadata." << std::endl;
         return false;
     }
     std::string replaced_manifest_path = get_replaced_system_manifest(pkg_name);
@@ -2918,7 +3083,7 @@ int main(int argc, char* argv[]) {
 
     if (argc < 2) {
 
-        std::cout << "Usage: gpkg-worker [options]\nOptions:\n  --install <file>\n  --remove <pkg>\n  --retire <pkg>\n  --verify <pkg>\n  --register-file <path> --pkg <name>\n  --register-undo <cmd> --pkg <name>\n";
+        std::cout << "Usage: gpkg-worker [options]\nOptions:\n  --install <file>\n  --remove <pkg>\n  --purge <pkg>\n  --retire <pkg>\n  --verify <pkg>\n  --register-file <path> --pkg <name>\n  --register-undo <cmd> --pkg <name>\n";
 
         return 1;
 
@@ -2933,6 +3098,8 @@ int main(int argc, char* argv[]) {
         if (arg == "--install") mode = "install", target = argv[++i];
 
         else if (arg == "--remove") mode = "remove", target = argv[++i];
+
+        else if (arg == "--purge") mode = "purge", target = argv[++i];
 
         else if (arg == "--retire") mode = "retire", target = argv[++i];
 
@@ -2951,6 +3118,8 @@ int main(int argc, char* argv[]) {
     }
 
     if (mode == "remove" && !target.empty()) return action_remove_safe(target) ? 0 : 1;
+
+    if (mode == "purge" && !target.empty()) return action_purge_safe(target) ? 0 : 1;
 
     if (mode == "retire" && !target.empty()) return action_retire_safe(target) ? 0 : 1;
 

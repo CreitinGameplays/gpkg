@@ -24,10 +24,11 @@ void print_help() {
               << "  --recommended-no   Do not install Debian Recommends for this transaction\n"
               << "  --suggested-yes    Force installation of Debian Suggests for this transaction\n"
               << "  --suggested-no     Do not install Debian Suggests for this transaction\n"
+              << "  --autoremove    Remove newly unneeded dependency packages during remove\n"
               << "  -V, --version   Show version\n\n"
               << "Commands:\n"
               << "  install <pkg>   Download and install packages (up to 5 archives in parallel)\n"
-              << "  remove <pkg>    Remove an installed package (--purge to remove unneeded deps)\n"
+              << "  remove <pkg>    Remove an installed package (--purge to purge conffiles too)\n"
               << "  repair          Repair broken dependencies and reinstall damaged packages\n"
               << "  upgrade         Upgrade all installed packages\n"
               << "  update          Update local package indices\n"
@@ -51,6 +52,7 @@ int main(int argc, char* argv[]) {
     bool verbose = false;
     bool assume_yes = false;
     bool purge = false;
+    bool autoremove = false;
     bool repair = false;
     bool reinstall = false;
     bool recommended_yes = false;
@@ -62,6 +64,7 @@ int main(int argc, char* argv[]) {
         if (arg == "-v" || arg == "--verbose") verbose = true;
         else if (arg == "-y" || arg == "--yes") assume_yes = true;
         else if (arg == "--purge") purge = true;
+        else if (arg == "--autoremove") autoremove = true;
         else if (arg == "-r" || arg == "--repair") repair = true;
         else if (arg == "--reinstall") reinstall = true;
         else if (arg == "--recommended-yes") recommended_yes = true;
@@ -128,6 +131,18 @@ int main(int argc, char* argv[]) {
                   << Color::RESET << std::endl;
         return 1;
     }
+    if (purge && action != "remove") {
+        std::cerr << Color::RED
+                  << "E: --purge is only valid with remove."
+                  << Color::RESET << std::endl;
+        return 1;
+    }
+    if (autoremove && action != "remove") {
+        std::cerr << Color::RED
+                  << "E: --autoremove is only valid with remove."
+                  << Color::RESET << std::endl;
+        return 1;
+    }
 
     g_assume_yes = assume_yes;
     g_force_reinstall = reinstall;
@@ -158,7 +173,7 @@ int main(int argc, char* argv[]) {
     TransactionGuard guard(needs_trans, verbose);
 
     std::set<std::string> installed_cache;
-    for (const auto& pkg : get_installed_packages()) {
+    for (const auto& pkg : get_registered_package_names()) {
         installed_cache.insert(pkg);
     }
 
@@ -170,7 +185,7 @@ int main(int argc, char* argv[]) {
     if (action == "upgrade") return handle_upgrade(installed_cache, verbose);
     if (action == "repair") return handle_repair(verbose);
     if (action == "install" && argc > 2) return handle_install(argc, argv, installed_cache, verbose);
-    if (action == "remove" && argc > 2) return handle_remove(argc, argv, verbose, purge);
+    if (action == "remove" && argc > 2) return handle_remove(argc, argv, verbose, purge, autoremove);
     if (action == "search") {
         std::string operand = first_cli_operand(argc, argv, 2);
         if (!operand.empty()) return handle_search(operand, verbose);

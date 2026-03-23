@@ -103,6 +103,15 @@ InstallCommandResult remove_package_by_name(const std::string& pkg_name, bool ve
     return {result.exit_code == 0, result.log_path};
 }
 
+InstallCommandResult purge_package_by_name(const std::string& pkg_name, bool verbose) {
+    CommandCaptureResult result = run_command_captured_argv(
+        build_worker_command_argv("--purge", pkg_name, verbose),
+        verbose,
+        "gpkg-purge"
+    );
+    return {result.exit_code == 0, result.log_path};
+}
+
 std::string get_install_archive_path(const PackageMetadata& meta) {
     if (package_is_debian_source(meta)) return get_imported_gpkg_path(meta);
     return get_cached_package_path(meta);
@@ -341,19 +350,39 @@ void sort_removal_queue_for_operation(std::vector<std::string>& to_remove, bool 
 
 std::vector<std::string> get_registered_package_names() {
     std::set<std::string> package_names;
+    std::map<std::string, std::string> status_by_package;
     for (const auto& record : load_package_status_records()) {
         if (record.package.empty()) continue;
+        status_by_package[record.package] = record.status;
         if (!package_status_is_installed_like(record.status)) continue;
         package_names.insert(record.package);
     }
     for (const auto& pkg : get_installed_packages(".json")) {
+        auto status_it = status_by_package.find(pkg);
+        if (status_it != status_by_package.end() &&
+            !package_status_is_installed_like(status_it->second)) {
+            continue;
+        }
         package_names.insert(pkg);
     }
     for (const auto& pkg : get_installed_packages(".list")) {
+        auto status_it = status_by_package.find(pkg);
+        if (status_it != status_by_package.end() &&
+            !package_status_is_installed_like(status_it->second)) {
+            continue;
+        }
         package_names.insert(pkg);
     }
 
     return std::vector<std::string>(package_names.begin(), package_names.end());
+}
+
+bool package_is_config_files_only(const std::string& pkg_name, std::string* out_version = nullptr) {
+    PackageStatusRecord record;
+    if (!get_package_status_record(pkg_name, &record)) return false;
+    if (record.status != "config-files") return false;
+    if (out_version) *out_version = record.version;
+    return true;
 }
 
 bool verify_installed_package(const std::string& pkg_name, bool verbose, std::string* log_path = nullptr) {
@@ -1438,9 +1467,9 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
     return 0;
 }
 
-int handle_remove(int argc, char* argv[], bool verbose, bool purge) {
+int handle_remove(int argc, char* argv[], bool verbose, bool purge, bool autoremove) {
     if (argc < 3) {
-        std::cerr << "Usage: gpkg remove <package_name> [--purge]" << std::endl;
+        std::cerr << "Usage: gpkg remove <package_name> [--purge] [--autoremove]" << std::endl;
         return 1;
     }
 
@@ -1455,17 +1484,24 @@ int handle_remove(int argc, char* argv[], bool verbose, bool purge) {
     }
     std::string target_pkg = operands.front();
 
-    if (!is_installed(target_pkg)) {
+    bool target_installed = is_installed(target_pkg);
+    bool target_config_files = package_is_config_files_only(target_pkg);
+
+    if (!target_installed && !(purge && target_config_files)) {
         std::cerr << Color::RED << "E: Package '" << target_pkg << "' is not installed."
                   << Color::RESET << std::endl;
         return 1;
     }
 
-    std::vector<std::string> to_remove = {target_pkg};
-    std::set<std::string> removal_set = {target_pkg};
+    std::vector<std::string> to_remove;
+    std::set<std::string> removal_set;
+    if (target_installed) {
+        to_remove.push_back(target_pkg);
+        removal_set.insert(target_pkg);
+    }
 
-    if (purge) {
-        std::cout << "Calculating dependencies for purge..." << std::endl;
+    if (autoremove && target_installed) {
+        std::cout << "Calculating newly unneeded dependencies..." << std::endl;
         bool changed = true;
         while (changed) {
             changed = false;
@@ -1487,11 +1523,30 @@ int handle_remove(int argc, char* argv[], bool verbose, bool purge) {
         }
     }
 
-    sort_removal_queue_for_operation(to_remove, verbose);
+    if (!to_remove.empty()) sort_removal_queue_for_operation(to_remove, verbose);
 
-    std::cout << "The following packages will be REMOVED:" << std::endl;
-    for (const auto& pkg : to_remove) {
-        std::cout << "  " << Color::RED << pkg << Color::RESET << std::endl;
+    std::vector<std::string> to_purge;
+    std::set<std::string> purge_set;
+    if (purge) {
+        if (target_config_files && purge_set.insert(target_pkg).second) {
+            to_purge.push_back(target_pkg);
+        }
+        for (const auto& pkg : to_remove) {
+            if (purge_set.insert(pkg).second) to_purge.push_back(pkg);
+        }
+    }
+
+    if (!to_remove.empty()) {
+        std::cout << "The following packages will be REMOVED:" << std::endl;
+        for (const auto& pkg : to_remove) {
+            std::cout << "  " << Color::RED << pkg << Color::RESET << std::endl;
+        }
+    }
+    if (!to_purge.empty()) {
+        std::cout << "The following packages will be PURGED:" << std::endl;
+        for (const auto& pkg : to_purge) {
+            std::cout << "  " << Color::MAGENTA << pkg << Color::RESET << std::endl;
+        }
     }
 
     if (!ask_confirmation("Do you want to continue?")) {
@@ -1499,29 +1554,55 @@ int handle_remove(int argc, char* argv[], bool verbose, bool purge) {
         return 0;
     }
 
-    std::cout << Color::CYAN << "[*] Removing " << to_remove.size()
-              << " package(s)..." << Color::RESET << std::endl;
-    size_t remove_progress_width = 0;
+    if (!to_remove.empty()) {
+        std::cout << Color::CYAN << "[*] Removing " << to_remove.size()
+                  << " package(s)..." << Color::RESET << std::endl;
+        size_t remove_progress_width = 0;
 
-    for (size_t i = 0; i < to_remove.size(); ++i) {
-        const auto& pkg = to_remove[i];
-        if (!verbose) render_package_progress("current", i, to_remove.size(), pkg, &remove_progress_width);
-        std::vector<std::string> removed_files = read_installed_file_list(pkg);
-        InstallCommandResult result = remove_package_by_name(pkg, verbose);
-        if (!result.success) {
-            if (!verbose) finish_progress_line(&remove_progress_width);
-            std::cerr << Color::RED << "E: Failed to remove " << pkg << Color::RESET << std::endl;
-            if (!verbose && !result.log_path.empty()) {
-                std::cerr << " See " << result.log_path << " for details.";
+        for (size_t i = 0; i < to_remove.size(); ++i) {
+            const auto& pkg = to_remove[i];
+            if (!verbose) render_package_progress("current", i, to_remove.size(), pkg, &remove_progress_width);
+            std::vector<std::string> removed_files = read_installed_file_list(pkg);
+            InstallCommandResult result = remove_package_by_name(pkg, verbose);
+            if (!result.success) {
+                if (!verbose) finish_progress_line(&remove_progress_width);
+                std::cerr << Color::RED << "E: Failed to remove " << pkg << Color::RESET << std::endl;
+                if (!verbose && !result.log_path.empty()) {
+                    std::cerr << " See " << result.log_path << " for details.";
+                }
+                std::cerr << std::endl;
+                return 1;
             }
-            std::cerr << std::endl;
-            return 1;
+            check_triggers(removed_files);
+            if (!verbose) render_package_progress("current", i + 1, to_remove.size(), pkg, &remove_progress_width);
         }
-        check_triggers(removed_files);
-        if (!verbose) render_package_progress("current", i + 1, to_remove.size(), pkg, &remove_progress_width);
+
+        if (!verbose) finish_progress_line(&remove_progress_width);
     }
 
-    if (!verbose) finish_progress_line(&remove_progress_width);
+    if (!to_purge.empty()) {
+        std::cout << Color::CYAN << "[*] Purging " << to_purge.size()
+                  << " package(s)..." << Color::RESET << std::endl;
+        size_t purge_progress_width = 0;
+
+        for (size_t i = 0; i < to_purge.size(); ++i) {
+            const auto& pkg = to_purge[i];
+            if (!verbose) render_package_progress("current", i, to_purge.size(), pkg, &purge_progress_width);
+            InstallCommandResult result = purge_package_by_name(pkg, verbose);
+            if (!result.success) {
+                if (!verbose) finish_progress_line(&purge_progress_width);
+                std::cerr << Color::RED << "E: Failed to purge " << pkg << Color::RESET << std::endl;
+                if (!verbose && !result.log_path.empty()) {
+                    std::cerr << " See " << result.log_path << " for details.";
+                }
+                std::cerr << std::endl;
+                return 1;
+            }
+            if (!verbose) render_package_progress("current", i + 1, to_purge.size(), pkg, &purge_progress_width);
+        }
+
+        if (!verbose) finish_progress_line(&purge_progress_width);
+    }
 
     return 0;
 }

@@ -236,6 +236,7 @@ bool is_known_cli_option(const std::string& arg) {
            arg == "-V" ||
            arg == "--version" ||
            arg == "--purge" ||
+           arg == "--autoremove" ||
            is_optional_dependency_option(arg);
 }
 

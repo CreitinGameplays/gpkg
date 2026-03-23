@@ -132,6 +132,11 @@ bool normalize_multiarch_payload_prefix(
             return false;
         }
 
+        if (!should_promote_multiarch_runtime_entry(name, st)) {
+            VLOG(verbose, "Skipping non-runtime multiarch alias candidate " << source_path);
+            continue;
+        }
+
         bool promoted = false;
         if (!path_exists_no_follow_debian(active_path) &&
             should_promote_multiarch_runtime_entry(name, st)) {
@@ -841,7 +846,7 @@ bool update_debian_backend_index(
 }
 
 std::string get_imported_gpkg_path(const PackageMetadata& meta) {
-    std::string base = REPO_CACHE_PATH + "imported/v4/"
+    std::string base = REPO_CACHE_PATH + "imported/v5/"
         + cache_safe_component(meta.source_kind) + "/"
         + cache_safe_component(meta.name);
     return base + "_" + safe_repo_filename_component(meta.version) + "_" + cache_safe_component(meta.arch) + EXTENSION;
