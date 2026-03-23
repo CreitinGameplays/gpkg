@@ -689,7 +689,7 @@ bool update_debian_backend_index(
         std::cout << Color::GREEN << "✓ Updated packages index"
                   << " (" << entries.size() << " packages)" << Color::RESET << std::endl;
     } else {
-        std::cout << Color::GREEN << "✓ Reused cached Debian packages index"
+        std::cout << Color::GREEN << "✓ Reused cached packages index"
                   << " (" << entries.size() << " packages)" << Color::RESET << std::endl;
     }
     return true;
