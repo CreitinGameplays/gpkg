@@ -36,6 +36,11 @@ else
 GPKG_LDFLAGS += $(LZMA_STATIC)
 endif
 WORKER_LDFLAGS = -lssl -lcrypto -lz -lzstd -ldl -lpthread
+ifeq ($(strip $(LZMA_STATIC)),)
+WORKER_LDFLAGS += -llzma
+else
+WORKER_LDFLAGS += $(LZMA_STATIC)
+endif
 ifneq ($(strip $(TARGET_CXX_VERSION)),)
 GPKG_LDFLAGS += $(ROOTFS)/lib64/ld-linux-x86-64.so.2
 WORKER_LDFLAGS += $(ROOTFS)/lib64/ld-linux-x86-64.so.2

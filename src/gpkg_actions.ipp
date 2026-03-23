@@ -55,6 +55,14 @@ InstallCommandResult install_package_from_file(const std::string& pkg_file, bool
     return {result.exit_code == 0, result.log_path};
 }
 
+InstallCommandResult retire_package_by_name(const std::string& pkg_name, bool verbose) {
+    std::string cmd = "gpkg-worker --retire " + shell_quote(pkg_name);
+    if (verbose) cmd += " --verbose";
+    if (!ROOT_PREFIX.empty()) cmd += " --root " + shell_quote(ROOT_PREFIX);
+    CommandCaptureResult result = run_command_captured(cmd, verbose, "gpkg-retire");
+    return {result.exit_code == 0, result.log_path};
+}
+
 std::string get_install_archive_path(const PackageMetadata& meta) {
     if (package_is_debian_source(meta)) return get_imported_gpkg_path(meta);
     return get_cached_package_path(meta);
@@ -161,10 +169,23 @@ InstallCommandResult install_package_v2(const PackageMetadata& meta, bool verbos
 }
 
 std::string read_package_name_from_archive(const std::string& pkg_file) {
-    std::string control_json = get_command_output(
-        "zstd -dc " + shell_quote(pkg_file) + " | tar -xOf - control.json 2>/dev/null"
-    );
-    if (control_json.empty()) return "";
+    char temp_template[] = "/tmp/gpkg-inspect-XXXXXX";
+    int fd = mkstemp(temp_template);
+    if (fd < 0) return "";
+    close(fd);
+
+    std::string temp_tar = temp_template;
+    std::string decompress_error;
+    if (!GpkgArchive::decompress_zstd_file(pkg_file, temp_tar, &decompress_error)) {
+        unlink(temp_tar.c_str());
+        return "";
+    }
+
+    std::string control_json;
+    std::string tar_error;
+    bool ok = GpkgArchive::tar_read_file(temp_tar, "control.json", control_json, &tar_error);
+    unlink(temp_tar.c_str());
+    if (!ok || control_json.empty()) return "";
 
     std::string pkg_name;
     if (!get_json_value(control_json, "package", pkg_name)) return "";
@@ -333,15 +354,16 @@ bool resolve_upgrade_target_metadata(
     PackageMetadata& out_meta,
     bool verbose
 ) {
+    std::string requested_name = canonicalize_package_name(requested_dep.name, verbose);
     PackageMetadata exact_meta;
-    if (get_repo_package_info(requested_dep.name, exact_meta) &&
+    if (get_repo_package_info(requested_name, exact_meta) &&
         version_satisfies(exact_meta.version, requested_dep.op, requested_dep.version)) {
         out_meta = exact_meta;
         return true;
     }
 
     std::string provider = find_provider(
-        requested_dep.name,
+        requested_name,
         requested_dep.op,
         requested_dep.version,
         verbose
@@ -371,6 +393,12 @@ bool queue_upgrade_target(
 
     std::string current_version;
     bool was_installed = is_installed(meta.name, &current_version);
+    if (!was_installed) {
+        std::string canonical_requested = canonicalize_package_name(requested_dep.name, verbose);
+        if (canonical_requested != requested_dep.name) {
+            was_installed = is_installed(requested_dep.name, &current_version);
+        }
+    }
     if (was_installed && compare_versions(meta.version, current_version) <= 0) {
         VLOG(verbose, meta.name << " is already up to date (" << current_version << ").");
         return true;
@@ -603,9 +631,17 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
         return 0;
     }
 
+    TransactionPlan upgrade_plan;
+    if (!build_transaction_plan(upgrade_queue, installed_cache, verbose, upgrade_plan)) return 1;
+    upgrade_queue = upgrade_plan.install_queue;
+
+    std::set<std::string> planned_names;
+    for (const auto& pkg : upgrade_queue) planned_names.insert(pkg.name);
+
     std::vector<UpgradePlanEntry> installed_upgrades;
     std::vector<UpgradePlanEntry> base_bootstraps;
     for (const auto& entry : explicit_targets) {
+        if (!planned_names.count(entry.meta.name)) continue;
         if (entry.was_installed) installed_upgrades.push_back(entry);
         else base_bootstraps.push_back(entry);
     }
@@ -638,7 +674,14 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
         }
     }
 
-    if (!check_conflicts(upgrade_queue, installed_cache, verbose)) return 1;
+    if (!upgrade_plan.retirements.empty()) {
+        std::cout << "The following installed packages will be retired as replacements:" << std::endl;
+        for (const auto& entry : upgrade_plan.retirements) {
+            std::cout << "  " << Color::YELLOW << entry.installed_name << Color::RESET
+                      << " -> " << Color::GREEN << entry.replacement_name << Color::RESET << std::endl;
+        }
+    }
+
     if (!ask_confirmation("Do you want to continue?")) return 0;
 
     std::cout << Color::CYAN << "[*] Downloading "
@@ -687,6 +730,24 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
         }
 
         queue_triggers_for_package(upgrade_queue[i].name);
+        std::vector<std::string> retirements;
+        if (should_retire_after_install(upgrade_plan, upgrade_queue[i].name, retirements)) {
+            for (const auto& retired_pkg : retirements) {
+                InstallCommandResult retire_result = retire_package_by_name(retired_pkg, verbose);
+                if (!retire_result.success) {
+                    if (!verbose) finish_progress_line(&install_progress_width);
+                    std::cerr << Color::RED << "E: Failed to retire replaced package " << retired_pkg
+                              << Color::RESET;
+                    if (!verbose && !retire_result.log_path.empty()) {
+                        std::cerr << " (see " << retire_result.log_path << ")";
+                    }
+                    std::cerr << std::endl;
+                    failures.push_back(retired_pkg);
+                    break;
+                }
+            }
+            if (!failures.empty()) break;
+        }
         ++installed_count;
         if (!verbose) render_package_progress("current", i + 1, upgrade_queue.size(), upgrade_queue[i].name, &install_progress_width);
     }
@@ -800,8 +861,16 @@ int handle_repair(bool verbose) {
 
     std::vector<std::string> registered_packages = get_registered_package_names();
     std::set<std::string> installed_set(registered_packages.begin(), registered_packages.end());
-    if (!check_conflicts(repair_queue, installed_set, verbose)) {
-        return 1;
+    TransactionPlan repair_plan;
+    if (!build_transaction_plan(repair_queue, installed_set, verbose, repair_plan)) return 1;
+    repair_queue = repair_plan.install_queue;
+
+    if (!repair_plan.retirements.empty()) {
+        std::cout << "The following installed packages will be retired as replacements:" << std::endl;
+        for (const auto& entry : repair_plan.retirements) {
+            std::cout << "  " << Color::YELLOW << entry.installed_name << Color::RESET
+                      << " -> " << Color::GREEN << entry.replacement_name << Color::RESET << std::endl;
+        }
     }
     if (!ask_confirmation("Do you want to continue with the repair?")) return 0;
 
@@ -856,6 +925,24 @@ int handle_repair(bool verbose) {
             break;
         }
         queue_triggers_for_package(repair_queue[i].name);
+        std::vector<std::string> retirements;
+        if (should_retire_after_install(repair_plan, repair_queue[i].name, retirements)) {
+            for (const auto& retired_pkg : retirements) {
+                InstallCommandResult retire_result = retire_package_by_name(retired_pkg, verbose);
+                if (!retire_result.success) {
+                    if (!verbose) finish_progress_line(&install_progress_width);
+                    std::cerr << Color::RED << "E: Failed to retire replaced package " << retired_pkg
+                              << Color::RESET;
+                    if (!verbose && !retire_result.log_path.empty()) {
+                        std::cerr << " (see " << retire_result.log_path << ")";
+                    }
+                    std::cerr << std::endl;
+                    failures.push_back(retired_pkg);
+                    break;
+                }
+            }
+            if (!failures.empty()) break;
+        }
         ++repaired_count;
         if (!verbose) render_package_progress("current", i + 1, repair_queue.size(), repair_queue[i].name, &install_progress_width);
     }
@@ -937,8 +1024,39 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
         }
 
         std::string local_pkg_name = read_package_name_from_archive(local_file);
-        if (!local_pkg_name.empty()) queue_triggers_for_package(local_pkg_name);
+        if (!local_pkg_name.empty()) {
+            queue_triggers_for_package(local_pkg_name);
+
+            PackageMetadata local_meta;
+            if (get_installed_package_metadata(local_pkg_name, local_meta)) {
+                std::vector<PackageMetadata> local_queue = {local_meta};
+                std::vector<std::string> registered = get_registered_package_names();
+                std::set<std::string> installed_now(registered.begin(), registered.end());
+                TransactionPlan local_plan;
+                if (!build_transaction_plan(local_queue, installed_now, verbose, local_plan)) return 1;
+
+                std::vector<std::string> retirements;
+                if (should_retire_after_install(local_plan, local_pkg_name, retirements)) {
+                    for (const auto& retired_pkg : retirements) {
+                        InstallCommandResult retire_result = retire_package_by_name(retired_pkg, verbose);
+                        if (!retire_result.success) {
+                            std::cerr << Color::RED << "E: Failed to retire replaced package "
+                                      << retired_pkg << Color::RESET;
+                            if (!verbose && !retire_result.log_path.empty()) {
+                                std::cerr << " See " << retire_result.log_path << " for details.";
+                            }
+                            std::cerr << std::endl;
+                            return 1;
+                        }
+                    }
+                }
+            }
+        }
     }
+
+    TransactionPlan install_plan;
+    if (!build_transaction_plan(install_queue, installed_cache, verbose, install_plan)) return 1;
+    install_queue = install_plan.install_queue;
 
     if (install_queue.empty()) {
         if (local_files.empty()) std::cout << "Nothing to do." << std::endl;
@@ -951,7 +1069,14 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
                   << " (" << pkg.version << ")" << std::endl;
     }
 
-    if (!check_conflicts(install_queue, installed_cache, verbose)) return 1;
+    if (!install_plan.retirements.empty()) {
+        std::cout << "The following installed packages will be retired as replacements:" << std::endl;
+        for (const auto& entry : install_plan.retirements) {
+            std::cout << "  " << Color::YELLOW << entry.installed_name << Color::RESET
+                      << " -> " << Color::GREEN << entry.replacement_name << Color::RESET << std::endl;
+        }
+    }
+
     if (!ask_confirmation("Do you want to continue?")) return 0;
 
     std::cout << Color::CYAN << "[*] Downloading "
@@ -1005,6 +1130,22 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
             return 1;
         }
         queue_triggers_for_package(install_queue[i].name);
+        std::vector<std::string> retirements;
+        if (should_retire_after_install(install_plan, install_queue[i].name, retirements)) {
+            for (const auto& retired_pkg : retirements) {
+                InstallCommandResult retire_result = retire_package_by_name(retired_pkg, verbose);
+                if (!retire_result.success) {
+                    if (!verbose) finish_progress_line(&install_progress_width);
+                    std::cerr << Color::RED << "E: Failed to retire replaced package " << retired_pkg
+                              << Color::RESET;
+                    if (!verbose && !retire_result.log_path.empty()) {
+                        std::cerr << " See " << retire_result.log_path << " for details.";
+                    }
+                    std::cerr << std::endl;
+                    return 1;
+                }
+            }
+        }
         ++installed_count;
         if (!verbose) render_package_progress("current", i + 1, install_queue.size(), install_queue[i].name, &install_progress_width);
     }

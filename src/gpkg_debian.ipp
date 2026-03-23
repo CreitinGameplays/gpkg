@@ -652,6 +652,7 @@ PackageMetadata build_debian_package_metadata(
     for (const auto& dep : package_override.conflicts_add) meta.conflicts.push_back(dep);
     
     meta.provides = normalize_relation_field_value(record.provides_raw, config.apt_arch);
+    for (const auto& dep : package_override.provides_add) meta.provides.push_back(dep);
     
     meta.replaces = normalize_relation_field_value(record.replaces_raw, config.apt_arch);
     for (const auto& dep : package_override.replaces_add) meta.replaces.push_back(dep);
@@ -805,9 +806,12 @@ bool update_debian_backend_index(
             return false;
         }
 
-        std::string unpack_cmd = "gunzip -c " + shell_quote(packages_gz) + " > " + shell_quote(packages_txt);
-        if (run_command(unpack_cmd, verbose) != 0) {
+        std::string unpack_error;
+        if (!GpkgArchive::decompress_gzip_file(packages_gz, packages_txt, &unpack_error)) {
             std::cerr << Color::YELLOW << "W: Failed to unpack Debian Packages index." << Color::RESET << std::endl;
+            if (verbose && !unpack_error.empty()) {
+                std::cerr << "[DEBUG] Debian Packages unpack error: " << unpack_error << std::endl;
+            }
             return false;
         }
     }
@@ -837,7 +841,7 @@ bool update_debian_backend_index(
 }
 
 std::string get_imported_gpkg_path(const PackageMetadata& meta) {
-    std::string base = REPO_CACHE_PATH + "imported/v3/"
+    std::string base = REPO_CACHE_PATH + "imported/v4/"
         + cache_safe_component(meta.source_kind) + "/"
         + cache_safe_component(meta.name);
     return base + "_" + safe_repo_filename_component(meta.version) + "_" + cache_safe_component(meta.arch) + EXTENSION;
@@ -1133,13 +1137,13 @@ bool materialize_deb_payload_tar(
         return true;
     }
     if (path_has_suffix(archive_path, ".tar.gz") || path_has_suffix(archive_path, ".tgz")) {
-        return decompress_gzip_file(archive_path, tar_path_out, error_out);
+        return GpkgArchive::decompress_gzip_file(archive_path, tar_path_out, error_out);
     }
     if (path_has_suffix(archive_path, ".tar.xz") || path_has_suffix(archive_path, ".tar.lzma")) {
-        return decompress_xz_file(archive_path, tar_path_out, error_out);
+        return GpkgArchive::decompress_xz_file(archive_path, tar_path_out, error_out);
     }
     if (path_has_suffix(archive_path, ".tar.zst") || path_has_suffix(archive_path, ".tar.zstd")) {
-        return decompress_zstd_file(archive_path, tar_path_out, error_out);
+        return GpkgArchive::decompress_zstd_file(archive_path, tar_path_out, error_out);
     }
 
     if (error_out) *error_out = "unsupported Debian payload compression";
@@ -1207,44 +1211,44 @@ bool build_imported_gpkg_archive(
         return false;
     }
 
-    std::string tar_data_cmd = "tar -cf " + shell_quote(data_tar)
-        + " -C " + shell_quote(payload_root) + " .";
-    std::string failure_log;
-    if (!run_quiet_import_command(tar_data_cmd, "gpkg-import-build", &failure_log)) {
+    std::string archive_error;
+    if (!GpkgArchive::tar_create_from_directory(payload_root, data_tar, &archive_error)) {
         std::cerr << Color::RED << "E: Failed to stage the converted payload for "
-                  << meta.name << format_import_failure_hint(failure_log)
-                  << Color::RESET << std::endl;
+                  << meta.name;
+        if (!archive_error.empty()) std::cerr << ": " << archive_error;
+        std::cerr << Color::RESET << std::endl;
         run_command("rm -rf " + shell_quote(temp_root), false);
         return false;
     }
 
-    std::string zstd_data_cmd = "zstd -T0 -f -10 --quiet "
-        + shell_quote(data_tar) + " -o " + shell_quote(data_tar_zst);
-    if (!run_quiet_import_command(zstd_data_cmd, "gpkg-import-build", &failure_log)) {
+    if (!GpkgArchive::compress_zstd_file(data_tar, data_tar_zst, 10, &archive_error)) {
         std::cerr << Color::RED << "E: Failed to compress the converted payload for "
-                  << meta.name << format_import_failure_hint(failure_log)
-                  << Color::RESET << std::endl;
+                  << meta.name;
+        if (!archive_error.empty()) std::cerr << ": " << archive_error;
+        std::cerr << Color::RESET << std::endl;
         run_command("rm -rf " + shell_quote(temp_root), false);
         return false;
     }
 
-    std::string build_tar_cmd = "tar -cf " + shell_quote(final_tar)
-        + " -C " + shell_quote(temp_root) + " control.json data.tar.zst";
-    if (!run_quiet_import_command(build_tar_cmd, "gpkg-import-build", &failure_log)) {
+    std::vector<GpkgArchive::TarSource> top_level_sources = {
+        {"control.json", control_json, GpkgArchive::TarEntryType::Regular, 0644, ""},
+        {"data.tar.zst", data_tar_zst, GpkgArchive::TarEntryType::Regular, 0644, ""},
+    };
+    if (!GpkgArchive::tar_create_from_sources(top_level_sources, final_tar, &archive_error)) {
         std::cerr << Color::RED << "E: Failed to assemble the converted package for "
-                  << meta.name << format_import_failure_hint(failure_log)
-                  << Color::RESET << std::endl;
+                  << meta.name;
+        if (!archive_error.empty()) std::cerr << ": " << archive_error;
+        std::cerr << Color::RESET << std::endl;
         run_command("rm -rf " + shell_quote(temp_root), false);
         return false;
     }
 
-    std::string final_cmd = "zstd -T0 -f -10 --quiet "
-        + shell_quote(final_tar) + " -o " + shell_quote(output_path);
-    bool ok = run_quiet_import_command(final_cmd, "gpkg-import-build", &failure_log);
+    bool ok = GpkgArchive::compress_zstd_file(final_tar, output_path, 10, &archive_error);
     if (!ok) {
         std::cerr << Color::RED << "E: Failed to write the converted package cache entry for "
-                  << meta.name << format_import_failure_hint(failure_log)
-                  << Color::RESET << std::endl;
+                  << meta.name;
+        if (!archive_error.empty()) std::cerr << ": " << archive_error;
+        std::cerr << Color::RESET << std::endl;
     }
     run_command("rm -rf " + shell_quote(temp_root), false);
     return ok;
@@ -1268,12 +1272,12 @@ bool convert_debian_archive_to_gpkg(const PackageMetadata& meta, bool verbose, s
     char* temp_dir = mkdtemp(temp_template);
     if (!temp_dir) return false;
     std::string temp_root = temp_dir;
-    std::string unpack_cmd = "cd " + shell_quote(temp_root) + " && ar x " + shell_quote(deb_path);
-    std::string failure_log;
-    if (!run_quiet_import_command(unpack_cmd, "gpkg-deb-import", &failure_log)) {
+    std::string archive_error;
+    if (!GpkgArchive::extract_ar_archive_to_directory(deb_path, temp_root, &archive_error)) {
         std::cerr << Color::RED << "E: Failed to unpack the Debian archive for "
-                  << meta.name << format_import_failure_hint(failure_log)
-                  << Color::RESET << std::endl;
+                  << meta.name;
+        if (!archive_error.empty()) std::cerr << ": " << archive_error;
+        std::cerr << Color::RESET << std::endl;
         run_command("rm -rf " + shell_quote(temp_root), false);
         return false;
     }
@@ -1301,12 +1305,11 @@ bool convert_debian_archive_to_gpkg(const PackageMetadata& meta, bool verbose, s
         return false;
     }
 
-    std::string extract_cmd = "tar -xf " + shell_quote(payload_tar)
-        + " -C " + shell_quote(payload_root);
-    if (!run_quiet_import_command(extract_cmd, "gpkg-deb-import", &failure_log)) {
+    if (!GpkgArchive::tar_extract_to_directory(payload_tar, payload_root, {}, &archive_error)) {
         std::cerr << Color::RED << "E: Failed to extract the prepared Debian payload tar for "
-                  << meta.name << format_import_failure_hint(failure_log)
-                  << Color::RESET << std::endl;
+                  << meta.name;
+        if (!archive_error.empty()) std::cerr << ": " << archive_error;
+        std::cerr << Color::RESET << std::endl;
         run_command("rm -rf " + shell_quote(temp_root), false);
         return false;
     }

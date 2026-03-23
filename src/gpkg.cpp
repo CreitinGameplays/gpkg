@@ -1,4 +1,5 @@
 #include "gpkg_shared.ipp"
+#include "gpkg_archive.ipp"
 #include "gpkg_core.ipp"
 #include "gpkg_json.ipp"
 #include "gpkg_policy.ipp"

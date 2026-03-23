@@ -15,6 +15,7 @@
 #include <iomanip>
 #include <elf.h>
 #include <tuple>
+#include "gpkg_archive.ipp"
 
 // Configuration
 std::string g_root_prefix = "";
@@ -267,19 +268,39 @@ bool looks_like_linker_script_prefix(const std::string& prefix) {
            prefix.rfind("OUTPUT_FORMAT(", 0) == 0;
 }
 
+std::string path_basename(const std::string& path) {
+    size_t slash = path.find_last_of('/');
+    if (slash == std::string::npos) return path;
+    return path.substr(slash + 1);
+}
+
 bool looks_like_shared_object_path(const std::string& path) {
-    if (path.length() >= 3 && path.substr(path.length() - 3) == ".so") return true;
-    if (path.find(".so.") != std::string::npos) return true;
-    return false;
+    std::string name = path_basename(path);
+    return (name.rfind("lib", 0) == 0 && (name == "lib.so" || name.find(".so") != std::string::npos)) ||
+           name.rfind("ld-linux-", 0) == 0;
+}
+
+bool should_validate_as_elf(const std::string& path, off_t size) {
+    if (looks_like_shared_object_path(path)) return true;
+    if (size < 4) return false;
+
+    unsigned char ident[4];
+    if (!read_file_prefix(path, ident, sizeof(ident))) return false;
+    return ident[EI_MAG0] == ELFMAG0 &&
+           ident[EI_MAG1] == ELFMAG1 &&
+           ident[EI_MAG2] == ELFMAG2 &&
+           ident[EI_MAG3] == ELFMAG3;
 }
 
 bool validate_elf_file(const std::string& path, off_t size, std::string* error) {
+    bool shared_object_candidate = looks_like_shared_object_path(path);
+    if (!should_validate_as_elf(path, size)) return true;
+
     if (size < static_cast<off_t>(EI_NIDENT)) {
-        if (looks_like_shared_object_path(path)) {
-            if (error) *error = "shared object file is too small to be valid";
-            return false;
-        }
-        return true;
+        if (error) *error = shared_object_candidate
+            ? "shared object file is too small to be valid"
+            : "ELF file is too small to be valid";
+        return false;
     }
 
     unsigned char ident[EI_NIDENT];
@@ -292,7 +313,7 @@ bool validate_elf_file(const std::string& path, off_t size, std::string* error) 
           ident[EI_MAG1] == ELFMAG1 &&
           ident[EI_MAG2] == ELFMAG2 &&
           ident[EI_MAG3] == ELFMAG3)) {
-        if (looks_like_shared_object_path(path)) {
+        if (shared_object_candidate) {
             char text_prefix[16] = {0};
             std::ifstream in(path, std::ios::binary);
             if (in) {
@@ -302,7 +323,8 @@ bool validate_elf_file(const std::string& path, off_t size, std::string* error) 
             if (error) *error = "shared object is neither a valid ELF nor a linker script";
             return false;
         }
-        return true;
+        if (error) *error = "missing ELF magic";
+        return false;
     }
 
     if (ident[EI_CLASS] == ELFCLASS64) {
@@ -733,50 +755,40 @@ bool remove_path(const std::string& abs_path) {
 
 // --- Installation Logic ---
 
+std::string normalize_tar_member_path(const std::string& raw_line, bool strip_data);
+
 // Helper to detect if archive has data/ prefix
 bool detect_data_prefix(const std::string& tar_path) {
-    std::string cmd = "tar -tf " + tar_path + " | head -n 5";
-    FILE* pipe = popen(cmd.c_str(), "r");
-    if (!pipe) return false;
-    char buffer[1024];
-    bool has_data = false;
-    while (fgets(buffer, sizeof(buffer), pipe)) {
-        std::string line = trim(buffer);
-        if (line.find("./data/") == 0 || line.find("data/") == 0) {
-            has_data = true;
-            break;
-        }
+    std::vector<GpkgArchive::TarEntry> entries;
+    std::string error;
+    if (!GpkgArchive::tar_list_entries(tar_path, entries, &error)) {
+        VLOG("Failed to inspect tar archive " << tar_path << ": " << error);
+        return false;
     }
-    pclose(pipe);
-    return has_data;
+
+    for (const auto& entry : entries) {
+        std::string normalized = trim(entry.path);
+        if (normalized.rfind("./", 0) == 0) normalized.erase(0, 2);
+        if (normalized.rfind("data/", 0) == 0 || normalized == "data") return true;
+    }
+    return false;
 }
 
 std::vector<std::string> get_tar_contents(const std::string& tar_path, bool strip_data) {
     std::vector<std::string> list;
-    std::string cmd = "tar -tf " + tar_path;
-    FILE* pipe = popen(cmd.c_str(), "r");
-    if (!pipe) return list;
-    char buffer[1024];
-    while (fgets(buffer, sizeof(buffer), pipe)) {
-        std::string line = trim(buffer);
-        if (line.empty() || line == "." || line == "./") continue;
-        
-        if (line.find("./") == 0) line = line.substr(2);
-        
-        if (strip_data) {
-            if (line.find("data/") == 0) {
-                line = line.substr(5);
-            } else {
-                continue; // Skip items not in data/ if stripping is active
-            }
-        }
-
-        // Remove trailing /
-        if (!line.empty() && line.back() == '/') line.pop_back();
-        
-        if (!line.empty()) list.push_back("/" + line); 
+    std::vector<GpkgArchive::TarEntry> entries;
+    std::string error;
+    if (!GpkgArchive::tar_list_entries(tar_path, entries, &error)) {
+        VLOG("Failed to list tar archive " << tar_path << ": " << error);
+        return list;
     }
-    pclose(pipe);
+
+    std::set<std::string> seen;
+    for (const auto& entry : entries) {
+        std::string line = normalize_tar_member_path(entry.path, strip_data);
+        if (line.empty()) continue;
+        if (seen.insert(line).second) list.push_back(line);
+    }
     return list;
 }
 
@@ -1315,6 +1327,36 @@ bool action_remove_safe(const std::string& pkg_name) {
     return true;
 }
 
+bool action_retire_safe(const std::string& pkg_name) {
+    std::cout << "Retiring " << pkg_name << "..." << std::endl;
+
+    std::vector<std::string> owned_files = read_list_file(pkg_name);
+    sort_paths_for_removal(owned_files);
+
+    std::vector<InstallRollbackEntry> rollback_entries;
+    for (const auto& path : owned_files) {
+        if (!find_file_owner(pkg_name, path).empty()) continue;
+        if (!stage_owned_path_removal(path, rollback_entries)) {
+            rollback_install_changes(rollback_entries);
+            std::cerr << "E: Failed while retiring " << path << std::endl;
+            return false;
+        }
+    }
+
+    if (!stage_package_metadata_removal(pkg_name, rollback_entries)) {
+        rollback_install_changes(rollback_entries);
+        std::cerr << "E: Failed to retire package metadata safely." << std::endl;
+        return false;
+    }
+
+    sync_multiarch_runtime_aliases();
+    refresh_linker_cache_if_available();
+    discard_install_backups(rollback_entries);
+
+    std::cout << "✓ Retired " << pkg_name << std::endl;
+    return true;
+}
+
 bool build_staged_install_entries(
     const std::vector<std::string>& new_files,
     const std::string& payload_root,
@@ -1605,21 +1647,35 @@ std::string get_package_version(const std::string& pkg_name) {
 
 bool action_install(const std::string& pkg_file) {
     // 1. Unpack to temp
-    run_command("rm -rf " + TMP_EXTRACT_PATH + " && mkdir -p " + TMP_EXTRACT_PATH);
+    run_command("rm -rf " + TMP_EXTRACT_PATH);
+    if (!mkdir_p(TMP_EXTRACT_PATH)) {
+        std::cerr << "E: Failed to prepare extraction workspace." << std::endl;
+        return false;
+    }
     std::string tmp_tar = TMP_EXTRACT_PATH + "temp.tar";
-    
-    if (run_command("zstd -df " + pkg_file + " -o " + tmp_tar) != 0) {
-        std::cerr << "E: Decompression failed." << std::endl;
+
+    std::string archive_error;
+    if (!GpkgArchive::decompress_zstd_file(pkg_file, tmp_tar, &archive_error)) {
+        std::cerr << "E: Decompression failed.";
+        if (!archive_error.empty()) std::cerr << " " << archive_error;
+        std::cerr << std::endl;
+        return false;
+    }
+
+    if (!GpkgArchive::tar_extract_to_directory(tmp_tar, TMP_EXTRACT_PATH, {}, &archive_error)) {
+        std::cerr << "E: Package extraction failed.";
+        if (!archive_error.empty()) std::cerr << " " << archive_error;
+        std::cerr << std::endl;
         return false;
     }
     
-    run_command("tar -xf " + tmp_tar + " -C " + TMP_EXTRACT_PATH);
-    
     std::string data_tar_zst = TMP_EXTRACT_PATH + "data.tar.zst";
     std::string data_tar = TMP_EXTRACT_PATH + "data.tar";
-    
-    if (run_command("zstd -df " + data_tar_zst + " -o " + data_tar) != 0) {
-         std::cerr << "E: Data decompression failed." << std::endl;
+
+    if (!GpkgArchive::decompress_zstd_file(data_tar_zst, data_tar, &archive_error)) {
+         std::cerr << "E: Data decompression failed.";
+         if (!archive_error.empty()) std::cerr << " " << archive_error;
+         std::cerr << std::endl;
          return false;
     }
 
@@ -1699,11 +1755,11 @@ bool action_install(const std::string& pkg_file) {
         return false;
     }
 
-    std::string extract_cmd = "tar -xf " + data_tar + " -C " + payload_root;
-    if (strip_data) extract_cmd += " --strip-components=1";
-    
-    if (run_command(extract_cmd) != 0) {
+    GpkgArchive::TarExtractOptions extract_options;
+    extract_options.strip_components = strip_data ? 1 : 0;
+    if (!GpkgArchive::tar_extract_to_directory(data_tar, payload_root, extract_options, &archive_error)) {
         std::cerr << "E: Extraction failed." << std::endl;
+        if (!archive_error.empty()) std::cerr << "E: " << archive_error << std::endl;
         return false;
     }
 
@@ -1891,7 +1947,7 @@ int main(int argc, char* argv[]) {
 
     if (argc < 2) {
 
-        std::cout << "Usage: gpkg-worker [options]\nOptions:\n  --install <file>\n  --remove <pkg>\n  --verify <pkg>\n  --register-file <path> --pkg <name>\n  --register-undo <cmd> --pkg <name>\n";
+        std::cout << "Usage: gpkg-worker [options]\nOptions:\n  --install <file>\n  --remove <pkg>\n  --retire <pkg>\n  --verify <pkg>\n  --register-file <path> --pkg <name>\n  --register-undo <cmd> --pkg <name>\n";
 
         return 1;
 
@@ -1906,6 +1962,8 @@ int main(int argc, char* argv[]) {
         if (arg == "--install") mode = "install", target = argv[++i];
 
         else if (arg == "--remove") mode = "remove", target = argv[++i];
+
+        else if (arg == "--retire") mode = "retire", target = argv[++i];
 
         else if (arg == "--verify") mode = "verify", target = argv[++i];
 
@@ -1922,6 +1980,8 @@ int main(int argc, char* argv[]) {
     }
 
     if (mode == "remove" && !target.empty()) return action_remove_safe(target) ? 0 : 1;
+
+    if (mode == "retire" && !target.empty()) return action_retire_safe(target) ? 0 : 1;
 
     if (mode == "install" && !target.empty()) return action_install(target) ? 0 : 1;
 

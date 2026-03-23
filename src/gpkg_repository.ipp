@@ -107,6 +107,7 @@ void populate_package_metadata_from_json(const std::string& obj, PackageMetadata
     get_json_array(obj, "suggests", meta.suggests);
     get_json_array(obj, "conflicts", meta.conflicts);
     get_json_array(obj, "provides", meta.provides);
+    get_json_array(obj, "replaces", meta.replaces);
 }
 
 bool ensure_repo_package_cache_loaded(bool verbose) {
@@ -236,8 +237,12 @@ int handle_update(bool verbose) {
             continue;
         }
 
-        if (run_command("zstd -T0 -df " + dest_zst + " -o " + dest_json, verbose) != 0) {
+        std::string decompress_error;
+        if (!GpkgArchive::decompress_zstd_file(dest_zst, dest_json, &decompress_error)) {
             std::cerr << Color::YELLOW << "W: Failed to decompress index from " << url << Color::RESET << std::endl;
+            if (verbose && !decompress_error.empty()) {
+                std::cerr << "[DEBUG] Repo index decompress error: " << decompress_error << std::endl;
+            }
             remove(dest_zst.c_str());
             continue;
         }
@@ -355,6 +360,7 @@ int handle_show(const std::string& pkg_name, bool verbose) {
     if (!meta.suggests.empty()) print_wrapped_block("  Suggests:    ", join_strings(meta.suggests));
     if (!meta.conflicts.empty()) print_wrapped_block("  Conflicts:   ", join_strings(meta.conflicts));
     if (!meta.provides.empty()) print_wrapped_block("  Provides:    ", join_strings(meta.provides));
+    if (!meta.replaces.empty()) print_wrapped_block("  Replaces:    ", join_strings(meta.replaces));
 
     std::string installed_ver;
     if (is_installed(meta.name, &installed_ver)) {
@@ -393,7 +399,13 @@ int handle_add_repo(const std::string& url, bool verbose) {
         return 1;
     }
 
-    run_command("zstd -df " + tmp_index + " -o /tmp/gpkg_validation.json", verbose);
+    std::string validation_error;
+    if (!GpkgArchive::decompress_zstd_file(tmp_index, "/tmp/gpkg_validation.json", &validation_error)) {
+        std::cerr << Color::RED << "E: Failed to decompress repository index.";
+        if (!validation_error.empty()) std::cerr << " " << validation_error;
+        std::cerr << Color::RESET << std::endl;
+        return 1;
+    }
     std::ifstream f_check("/tmp/gpkg_validation.json");
     std::string content((std::istreambuf_iterator<char>(f_check)), std::istreambuf_iterator<char>());
     if (content.find("\"package\":") == std::string::npos) {

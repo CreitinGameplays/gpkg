@@ -18,6 +18,7 @@ struct PackageOverridePolicy {
     std::vector<std::string> depends_add;
     std::vector<std::string> depends_remove;
     std::vector<std::string> conflicts_add;
+    std::vector<std::string> provides_add;
     std::vector<std::string> replaces_add;
 };
 
@@ -27,6 +28,7 @@ struct ImportPolicy {
     std::vector<std::string> allow_essential_packages;
     std::vector<std::string> skip_dependency_patterns;
     std::vector<std::string> skip_packages;
+    std::map<std::string, std::string> package_aliases;
     std::map<std::string, std::string> dependency_choices;
     std::map<std::string, std::string> dependency_rewrites;
     std::map<std::string, std::string> provider_choices;
@@ -268,6 +270,13 @@ ImportPolicy load_import_policy(bool verbose = false) {
     policy.skip_dependency_patterns = json_string_array(json_object_get(root, "skip_dependency_patterns"));
     policy.skip_packages = json_string_array(json_object_get(root, "skip_packages"));
 
+    const JsonValue* package_aliases = json_object_get(root, "package_aliases");
+    if (package_aliases && package_aliases->is_object()) {
+        for (const auto& entry : package_aliases->object_items) {
+            policy.package_aliases[entry.first] = json_string_or(&entry.second);
+        }
+    }
+
     const JsonValue* dependency_choices = json_object_get(root, "dependency_choices");
     if (dependency_choices && dependency_choices->is_object()) {
         for (const auto& entry : dependency_choices->object_items) {
@@ -305,6 +314,7 @@ ImportPolicy load_import_policy(bool verbose = false) {
             package_override.depends_add = json_string_array(json_object_get(entry.second, "depends_add"));
             package_override.depends_remove = json_string_array(json_object_get(entry.second, "depends_remove"));
             package_override.conflicts_add = json_string_array(json_object_get(entry.second, "conflicts_add"));
+            package_override.provides_add = json_string_array(json_object_get(entry.second, "provides_add"));
             package_override.replaces_add = json_string_array(json_object_get(entry.second, "replaces_add"));
             policy.package_overrides[entry.first] = package_override;
         }
@@ -334,6 +344,16 @@ std::string apply_dependency_rewrite_name(
 ) {
     for (const auto& entry : rewrites) {
         if (wildcard_match(name, entry.first)) return trim(entry.second);
+    }
+    return name;
+}
+
+std::string canonicalize_package_name(const std::string& name, bool verbose = false) {
+    const ImportPolicy& policy = get_import_policy(verbose);
+    for (const auto& entry : policy.package_aliases) {
+        if (!wildcard_match(name, entry.first)) continue;
+        std::string canonical = trim(entry.second);
+        return canonical.empty() ? name : canonical;
     }
     return name;
 }
