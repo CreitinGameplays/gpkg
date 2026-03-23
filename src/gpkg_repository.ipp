@@ -190,7 +190,7 @@ int handle_list_repos() {
     auto urls = get_repo_urls();
     DebianBackendConfig debian = load_debian_backend_config(false);
     std::cout << "Configured package sources:" << std::endl;
-    std::cout << "  1. Debian sid (" << debian.packages_url << ")" << std::endl;
+    std::cout << "  1. Debian testing (" << debian.packages_url << ")" << std::endl;
     if (urls.empty()) {
         std::cout << "  2. No additional S2 repositories configured." << std::endl;
         return 0;

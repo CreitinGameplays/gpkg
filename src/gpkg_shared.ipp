@@ -27,6 +27,7 @@
 #include <string>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
+#include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -65,6 +66,7 @@ const std::string LOCK_FILE = ROOT_PREFIX + "/var/lib/gpkg/lock";
 constexpr size_t MAX_PARALLEL_PACKAGE_DOWNLOADS = 5;
 
 int run_command(const std::string& cmd, bool verbose);
+int decode_command_exit_status(int status);
 std::string shell_quote(const std::string& value);
 
 struct CommandCaptureResult {
@@ -320,7 +322,7 @@ void run_triggers(bool verbose) {
             continue;
         }
         if (verbose) std::cout << "[DEBUG] Running trigger: " << cmd << std::endl;
-        int rc = run_command(cmd, verbose);
+        int rc = decode_command_exit_status(run_command(cmd, verbose));
         if (rc == 127) {
             if (verbose) {
                 std::cout << "[DEBUG] Skipping trigger because its command resolved to shell exit 127: "

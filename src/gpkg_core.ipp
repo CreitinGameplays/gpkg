@@ -470,6 +470,13 @@ int run_command(const std::string& cmd, bool verbose) {
     return system(cmd.c_str());
 }
 
+int decode_command_exit_status(int status) {
+    if (status == -1) return -1;
+    if (WIFEXITED(status)) return WEXITSTATUS(status);
+    if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
+    return status;
+}
+
 std::string shell_quote(const std::string& value) {
     std::string quoted = "'";
     for (char c : value) {
@@ -485,7 +492,7 @@ std::string shell_quote(const std::string& value) {
 
 CommandCaptureResult run_command_captured(const std::string& cmd, bool verbose, const std::string& log_prefix) {
     if (verbose) {
-        return {run_command(cmd, true), ""};
+        return {decode_command_exit_status(run_command(cmd, true)), ""};
     }
 
     std::string prefix = "/tmp/" + log_prefix + "-XXXXXX.log";
@@ -494,11 +501,11 @@ CommandCaptureResult run_command_captured(const std::string& cmd, bool verbose, 
 
     int fd = mkstemps(tmpl.data(), 4);
     if (fd < 0) {
-        return {run_command(cmd, false), ""};
+        return {decode_command_exit_status(run_command(cmd, false)), ""};
     }
     close(fd);
 
     std::string log_path(tmpl.data());
     std::string wrapped = cmd + " >" + shell_quote(log_path) + " 2>&1";
-    return {run_command(wrapped, false), log_path};
+    return {decode_command_exit_status(run_command(wrapped, false)), log_path};
 }

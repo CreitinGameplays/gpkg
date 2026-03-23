@@ -287,18 +287,18 @@ void append_unique_name(std::vector<std::string>& names, const std::string& name
 std::string describe_missing_repair_candidate(const std::string& pkg_name) {
     if (is_upgradeable_system_package(pkg_name)) {
         return pkg_name + ": automatic reinstall is not possible because no repository package is available"
-            " (this is an upgradeable base runtime; make it available from Debian sid or an S2 repo,"
+            " (this is an upgradeable base runtime; make it available from Debian testing or an S2 repo,"
             " then rerun 'gpkg repair' or 'gpkg upgrade')";
     }
 
     if (is_system_provided(pkg_name)) {
         return pkg_name + ": automatic reinstall is not possible because no repository package is available"
             " (GeminiOS considers this base-provided; recover it from the base image or make it available"
-            " from Debian sid or an S2 repo if you want repo-driven repair)";
+            " from Debian testing or an S2 repo if you want repo-driven repair)";
     }
 
     return pkg_name + ": automatic reinstall is not possible because no repository package is available"
-        " (make it available from Debian sid or an S2 repo, then rerun 'gpkg repair')";
+        " (make it available from Debian testing or an S2 repo, then rerun 'gpkg repair')";
 }
 
 struct UpgradePlanEntry {
@@ -481,6 +481,61 @@ bool queue_upgrade_target(
     }
 
     target_walk.erase(meta.name);
+    return true;
+}
+
+bool expand_runtime_upgrade_companions(
+    std::vector<PackageMetadata>& install_queue,
+    const std::set<std::string>& installed_cache,
+    bool verbose
+) {
+    if (install_queue.empty()) return true;
+
+    auto companion_map = load_upgrade_companions();
+    if (companion_map.empty()) return true;
+
+    std::set<std::string> queued_packages;
+    std::set<std::string> explicit_target_names;
+    std::set<std::string> target_walk;
+    std::set<std::string> dependency_visited;
+    std::vector<UpgradePlanEntry> ignored_explicit_targets;
+
+    for (const auto& pkg : install_queue) {
+        std::string canonical_name = canonicalize_package_name(pkg.name, verbose);
+        queued_packages.insert(canonical_name);
+        dependency_visited.insert(canonical_name);
+    }
+
+    std::set<std::string> expanded_roots;
+    for (size_t index = 0; index < install_queue.size(); ++index) {
+        std::string root_name = canonicalize_package_name(install_queue[index].name, verbose);
+        if (!expanded_roots.insert(root_name).second) continue;
+
+        auto it = companion_map.find(root_name);
+        if (it == companion_map.end() || it->second.empty()) continue;
+
+        VLOG(verbose, "Expanding runtime upgrade companions for " << root_name
+                     << ": " << join_strings(it->second));
+        for (const auto& companion_name : it->second) {
+            Dependency companion_dep = parse_dependency(companion_name);
+            if (!queue_upgrade_target(
+                    companion_dep,
+                    companion_map,
+                    install_queue,
+                    ignored_explicit_targets,
+                    queued_packages,
+                    explicit_target_names,
+                    target_walk,
+                    dependency_visited,
+                    installed_cache,
+                    verbose,
+                    g_force_reinstall
+                )) {
+                return false;
+            }
+        }
+    }
+
     return true;
 }
 
@@ -902,6 +957,7 @@ int handle_repair(bool verbose) {
 
     std::vector<std::string> registered_packages = get_registered_package_names();
     std::set<std::string> installed_set(registered_packages.begin(), registered_packages.end());
+    if (!expand_runtime_upgrade_companions(repair_queue, installed_set, verbose)) return 1;
     TransactionPlan repair_plan;
     if (!build_transaction_plan(repair_queue, installed_set, verbose, repair_plan)) return 1;
     repair_queue = repair_plan.install_queue;
@@ -1049,6 +1105,12 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
                       << Color::RESET << std::endl;
             return 1;
         }
+    }
+
+    if (!expand_runtime_upgrade_companions(install_queue, installed_cache, verbose)) {
+        std::cerr << Color::RED << "E: Failed to expand runtime upgrade companion packages."
+                  << Color::RESET << std::endl;
+        return 1;
     }
 
     for (const auto& local_file : local_files) {

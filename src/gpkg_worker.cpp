@@ -6,6 +6,7 @@
 #include <sstream>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <dirent.h>
 #include <cerrno>
@@ -62,22 +63,28 @@ int run_command(const std::string& cmd) {
     return system(cmd.c_str());
 }
 
-void refresh_linker_cache_if_available() {
-    if (access("/sbin/ldconfig", X_OK) == 0) {
-        run_command("/sbin/ldconfig");
-        return;
+int decode_command_exit_status(int status) {
+    if (status == -1) return -1;
+    if (WIFEXITED(status)) return WEXITSTATUS(status);
+    if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
+    return status;
+}
+
+bool refresh_linker_cache_if_available() {
+    const char* candidates[] = {
+        "/sbin/ldconfig",
+        "/usr/sbin/ldconfig",
+        "/bin/ldconfig",
+        "/usr/bin/ldconfig",
+    };
+
+    for (const char* candidate : candidates) {
+        if (access(candidate, X_OK) != 0) continue;
+        int status = run_command(candidate);
+        return decode_command_exit_status(status) == 0;
     }
-    if (access("/usr/sbin/ldconfig", X_OK) == 0) {
-        run_command("/usr/sbin/ldconfig");
-        return;
-    }
-    if (access("/bin/ldconfig", X_OK) == 0) {
-        run_command("/bin/ldconfig");
-        return;
-    }
-    if (access("/usr/bin/ldconfig", X_OK) == 0) {
-        run_command("/usr/bin/ldconfig");
-    }
+
+    return true;
 }
 
 bool is_multiarch_runtime_alias_candidate(const std::string& name) {
@@ -450,6 +457,80 @@ bool validate_elf_file(const std::string& path, off_t size, std::string* error) 
 
     if (error) *error = "ELF file has an unknown class";
     return false;
+}
+
+bool files_touch_runtime_linker_state(const std::vector<std::string>& paths) {
+    for (const auto& path : paths) {
+        if (path.find("/lib64/") != std::string::npos ||
+            path.find("/lib/") != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool compare_regular_files_exact(
+    const std::string& expected_path,
+    const std::string& actual_path,
+    std::string* error = nullptr
+) {
+    if (error) error->clear();
+
+    struct stat expected_st;
+    struct stat actual_st;
+    if (stat(expected_path.c_str(), &expected_st) != 0 || !S_ISREG(expected_st.st_mode)) {
+        if (error) *error = "failed to inspect staged file";
+        return false;
+    }
+    if (stat(actual_path.c_str(), &actual_st) != 0 || !S_ISREG(actual_st.st_mode)) {
+        if (error) *error = "failed to inspect installed file";
+        return false;
+    }
+    if (expected_st.st_size != actual_st.st_size) {
+        if (error) *error = "installed file size differs from staged payload";
+        return false;
+    }
+
+    int expected_fd = open(expected_path.c_str(), O_RDONLY);
+    if (expected_fd < 0) {
+        if (error) *error = "failed to open staged file";
+        return false;
+    }
+
+    int actual_fd = open(actual_path.c_str(), O_RDONLY);
+    if (actual_fd < 0) {
+        close(expected_fd);
+        if (error) *error = "failed to open installed file";
+        return false;
+    }
+
+    char expected_buffer[65536];
+    char actual_buffer[65536];
+    bool ok = true;
+    while (ok) {
+        ssize_t expected_read = read(expected_fd, expected_buffer, sizeof(expected_buffer));
+        ssize_t actual_read = read(actual_fd, actual_buffer, sizeof(actual_buffer));
+        if (expected_read < 0 || actual_read < 0) {
+            if (error) *error = "failed while comparing file contents";
+            ok = false;
+            break;
+        }
+        if (expected_read != actual_read) {
+            if (error) *error = "installed file length differs while reading";
+            ok = false;
+            break;
+        }
+        if (expected_read == 0) break;
+        if (memcmp(expected_buffer, actual_buffer, static_cast<size_t>(expected_read)) != 0) {
+            if (error) *error = "installed file contents differ from staged payload";
+            ok = false;
+            break;
+        }
+    }
+
+    close(expected_fd);
+    close(actual_fd);
+    return ok;
 }
 
 bool is_etc_config_path(const std::string& path) {
@@ -1337,6 +1418,7 @@ bool action_remove_safe(const std::string& pkg_name) {
     }
 
     std::vector<std::string> owned_files = read_list_file(pkg_name);
+    bool runtime_sensitive = files_touch_runtime_linker_state(owned_files);
     sort_paths_for_removal(owned_files);
 
     std::vector<InstallRollbackEntry> removal_rollback_entries;
@@ -1381,7 +1463,14 @@ bool action_remove_safe(const std::string& pkg_name) {
     }
 
     sync_multiarch_runtime_aliases();
-    refresh_linker_cache_if_available();
+    if (runtime_sensitive && !refresh_linker_cache_if_available()) {
+        rollback_install_changes(removal_rollback_entries);
+        sync_multiarch_runtime_aliases();
+        refresh_linker_cache_if_available();
+        std::cerr << "E: ldconfig failed after removing runtime files for "
+                  << pkg_name << "." << std::endl;
+        return false;
+    }
     discard_install_backups(removal_rollback_entries);
 
     std::cout << "✓ Removed " << pkg_name << std::endl;
@@ -1392,6 +1481,7 @@ bool action_retire_safe(const std::string& pkg_name) {
     std::cout << "Retiring " << pkg_name << "..." << std::endl;
 
     std::vector<std::string> owned_files = read_list_file(pkg_name);
+    bool runtime_sensitive = files_touch_runtime_linker_state(owned_files);
     sort_paths_for_removal(owned_files);
 
     std::vector<InstallRollbackEntry> rollback_entries;
@@ -1411,7 +1501,14 @@ bool action_retire_safe(const std::string& pkg_name) {
     }
 
     sync_multiarch_runtime_aliases();
-    refresh_linker_cache_if_available();
+    if (runtime_sensitive && !refresh_linker_cache_if_available()) {
+        rollback_install_changes(rollback_entries);
+        sync_multiarch_runtime_aliases();
+        refresh_linker_cache_if_available();
+        std::cerr << "E: ldconfig failed after retiring runtime files for "
+                  << pkg_name << "." << std::endl;
+        return false;
+    }
     discard_install_backups(rollback_entries);
 
     std::cout << "✓ Retired " << pkg_name << std::endl;
@@ -1606,6 +1703,107 @@ bool apply_staged_install_entries(
     return true;
 }
 
+bool verify_staged_install_entries(
+    const std::vector<StagedInstallEntry>& entries,
+    std::vector<std::string>& issues
+) {
+    issues.clear();
+    std::set<std::tuple<std::string, std::string, std::string>> runtime_alias_candidates;
+
+    for (const auto& entry : entries) {
+        std::string live_full_path = g_root_prefix + entry.path;
+        struct stat live_st;
+        if (lstat(live_full_path.c_str(), &live_st) != 0) {
+            issues.push_back(entry.path + ": installed path is missing");
+            continue;
+        }
+
+        if (entry.is_directory) {
+            if (S_ISDIR(live_st.st_mode)) {
+                std::string active_prefix;
+                std::string compat_prefix;
+                std::string name;
+                if (runtime_alias_pair_for_path(entry.path, &active_prefix, &compat_prefix, &name)) {
+                    runtime_alias_candidates.insert(std::make_tuple(active_prefix, compat_prefix, name));
+                }
+                continue;
+            }
+            if (S_ISLNK(live_st.st_mode) && is_existing_symlink_directory(live_full_path)) continue;
+            issues.push_back(entry.path + ": expected directory after install");
+            continue;
+        }
+
+        if (entry.is_symlink) {
+            if (!S_ISLNK(live_st.st_mode)) {
+                issues.push_back(entry.path + ": expected symlink after install");
+                continue;
+            }
+            if (read_symlink_target(live_full_path) != entry.symlink_target) {
+                issues.push_back(entry.path + ": symlink target differs from staged payload");
+                continue;
+            }
+        } else {
+            if (!S_ISREG(live_st.st_mode)) {
+                issues.push_back(entry.path + ": expected regular file after install");
+                continue;
+            }
+
+            std::string compare_error;
+            if (!compare_regular_files_exact(entry.staged_path, live_full_path, &compare_error)) {
+                issues.push_back(entry.path + ": " + compare_error);
+                continue;
+            }
+
+            std::string elf_error;
+            if (!validate_elf_file(live_full_path, live_st.st_size, &elf_error)) {
+                issues.push_back(entry.path + ": " + elf_error);
+                continue;
+            }
+        }
+
+        std::string active_prefix;
+        std::string compat_prefix;
+        std::string name;
+        if (runtime_alias_pair_for_path(entry.path, &active_prefix, &compat_prefix, &name)) {
+            runtime_alias_candidates.insert(std::make_tuple(active_prefix, compat_prefix, name));
+        }
+    }
+
+    for (const auto& candidate : runtime_alias_candidates) {
+        const std::string& active_prefix = std::get<0>(candidate);
+        const std::string& compat_prefix = std::get<1>(candidate);
+        const std::string& name = std::get<2>(candidate);
+
+        std::string active_path = g_root_prefix + active_prefix + "/" + name;
+        std::string compat_path = g_root_prefix + compat_prefix + "/" + name;
+        if (!path_exists_no_follow(active_path)) {
+            issues.push_back(active_prefix + "/" + name + ": runtime alias source is missing");
+            continue;
+        }
+        if (!path_exists_no_follow(compat_path)) {
+            issues.push_back(compat_prefix + "/" + name + ": runtime alias is missing");
+            continue;
+        }
+
+        std::string active_real = canonical_existing_path(active_path);
+        std::string compat_real = canonical_existing_path(compat_path);
+        if (active_real.empty() || compat_real.empty() || active_real != compat_real) {
+            issues.push_back(active_prefix + "/" + name + ": runtime alias does not resolve consistently");
+            continue;
+        }
+
+        struct stat resolved_st;
+        if (stat(active_real.c_str(), &resolved_st) == 0 && S_ISREG(resolved_st.st_mode)) {
+            std::string elf_error;
+            if (!validate_elf_file(active_real, resolved_st.st_size, &elf_error)) {
+                issues.push_back(active_prefix + "/" + name + ": " + elf_error);
+            }
+        }
+    }
+
+    return issues.empty();
+}
+
 std::vector<std::string> get_staged_replaces() {
     std::vector<std::string> replaced;
     std::ifstream f(TMP_EXTRACT_PATH + "control.json");
@@ -1745,6 +1943,7 @@ bool action_install(const std::string& pkg_file) {
     if (strip_data) VLOG("Detected 'data/' prefix. Will strip components.");
     
     std::vector<std::string> new_files = get_tar_contents(data_tar, strip_data);
+    bool runtime_sensitive = files_touch_runtime_linker_state(new_files);
     
     std::string pkg_name;
     std::string new_version;
@@ -1836,8 +2035,38 @@ bool action_install(const std::string& pkg_file) {
         return false;
     }
 
+    if (runtime_sensitive) {
+        sync_multiarch_runtime_aliases();
+
+        std::vector<std::string> verification_issues;
+        if (!verify_staged_install_entries(staged_entries, verification_issues)) {
+            rollback_install_changes(install_rollback_entries);
+            sync_multiarch_runtime_aliases();
+            refresh_linker_cache_if_available();
+            std::cerr << "E: Installed runtime state failed verification after applying "
+                      << pkg_name << ":" << std::endl;
+            for (const auto& issue : verification_issues) {
+                std::cerr << "  - " << issue << std::endl;
+            }
+            return false;
+        }
+
+        if (!refresh_linker_cache_if_available()) {
+            rollback_install_changes(install_rollback_entries);
+            sync_multiarch_runtime_aliases();
+            refresh_linker_cache_if_available();
+            std::cerr << "E: ldconfig failed after installing runtime files for "
+                      << pkg_name << "." << std::endl;
+            return false;
+        }
+    }
+
     if (!finalize_preserved_config_files(preserved_configs)) {
         rollback_install_changes(install_rollback_entries);
+        if (runtime_sensitive) {
+            sync_multiarch_runtime_aliases();
+            refresh_linker_cache_if_available();
+        }
         return false;
     }
 
@@ -1853,17 +2082,29 @@ bool action_install(const std::string& pkg_file) {
     }
     if (!write_text_file_atomic(get_info_dir() + pkg_name + ".list", list_buffer.str(), 0644)) {
         rollback_install_changes(install_rollback_entries);
+        if (runtime_sensitive) {
+            sync_multiarch_runtime_aliases();
+            refresh_linker_cache_if_available();
+        }
         std::cerr << "E: Failed to write package file manifest." << std::endl;
         return false;
     }
     
     if (!copy_file_atomic(TMP_EXTRACT_PATH + "control.json", get_info_dir() + pkg_name + ".json")) {
         rollback_install_changes(install_rollback_entries);
+        if (runtime_sensitive) {
+            sync_multiarch_runtime_aliases();
+            refresh_linker_cache_if_available();
+        }
         std::cerr << "E: Failed to write installed package metadata." << std::endl;
         return false;
     }
     if (!write_replaced_system_files(pkg_name, replaced_system_files)) {
         rollback_install_changes(install_rollback_entries);
+        if (runtime_sensitive) {
+            sync_multiarch_runtime_aliases();
+            refresh_linker_cache_if_available();
+        }
         return false;
     }
     
@@ -1874,6 +2115,10 @@ bool action_install(const std::string& pkg_file) {
         if(access(src.c_str(), F_OK) == 0) {
              if (!copy_file_atomic(src, get_info_dir() + pkg_name + "." + s)) {
                  rollback_install_changes(install_rollback_entries);
+                 if (runtime_sensitive) {
+                     sync_multiarch_runtime_aliases();
+                     refresh_linker_cache_if_available();
+                 }
                  std::cerr << "E: Failed to install maintainer script " << s << "." << std::endl;
                  return false;
              }
@@ -1913,8 +2158,6 @@ bool action_install(const std::string& pkg_file) {
         }
     }
 
-    sync_multiarch_runtime_aliases();
-    refresh_linker_cache_if_available();
     discard_install_backups(install_rollback_entries);
 
     std::cout << "✓ Installed " << pkg_name << " (" << new_version << ")" << std::endl;

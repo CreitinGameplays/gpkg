@@ -1,4 +1,4 @@
-// Debian sid backend: config loading, metadata import, and .deb to .gpkg conversion.
+// Debian testing backend: config loading, metadata import, and .deb to .gpkg conversion.
 
 #include <cstdint>
 #include <lzma.h>
@@ -6,7 +6,7 @@
 #include <zstd.h>
 
 struct DebianBackendConfig {
-    std::string packages_url = "https://deb.debian.org/debian/dists/sid/main/binary-amd64/Packages.gz";
+    std::string packages_url = "https://deb.debian.org/debian/dists/testing/main/binary-amd64/Packages.gz";
     std::string base_url = "https://deb.debian.org/debian";
     std::string apt_arch = "amd64";
 };
