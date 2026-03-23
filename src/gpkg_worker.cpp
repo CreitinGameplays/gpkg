@@ -342,10 +342,36 @@ std::string path_basename(const std::string& path) {
     return path.substr(slash + 1);
 }
 
+bool shared_object_suffix_is_valid(const std::string& suffix) {
+    if (suffix.empty()) return true;
+
+    size_t pos = 0;
+    while (pos < suffix.size()) {
+        if (suffix[pos] != '.') return false;
+        ++pos;
+
+        size_t start = pos;
+        while (pos < suffix.size() && std::isdigit(static_cast<unsigned char>(suffix[pos]))) {
+            ++pos;
+        }
+        if (pos == start) return false;
+    }
+
+    return true;
+}
+
 bool looks_like_shared_object_path(const std::string& path) {
     std::string name = path_basename(path);
-    return (name.rfind("lib", 0) == 0 && (name == "lib.so" || name.find(".so") != std::string::npos)) ||
-           name.rfind("ld-linux-", 0) == 0;
+
+    size_t so_pos = name.find(".so");
+    if (so_pos != std::string::npos) {
+        bool valid_prefix = name.rfind("lib", 0) == 0 || name.rfind("ld-linux-", 0) == 0;
+        if (valid_prefix && shared_object_suffix_is_valid(name.substr(so_pos + 3))) {
+            return true;
+        }
+    }
+
+    return name == "lib.so";
 }
 
 bool should_validate_as_elf(const std::string& path, off_t size) {
