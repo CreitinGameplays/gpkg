@@ -73,6 +73,7 @@ int run_command_argv(
     int stderr_fd = -1
 );
 int decode_command_exit_status(int status);
+int compare_versions(const std::string& v1, const std::string& v2);
 std::string shell_quote(const std::string& value);
 
 struct CommandCaptureResult {
@@ -268,6 +269,57 @@ std::vector<std::string> read_installed_file_list(const std::string& pkg_name) {
         files.push_back(line.substr(first, last - first + 1));
     }
     return files;
+}
+
+bool installed_file_is_kernel_payload_path(const std::string& path) {
+    return path.rfind("/boot/kernel-", 0) == 0 ||
+           path.rfind("/lib/modules/", 0) == 0;
+}
+
+bool installed_file_list_contains_kernel_payload(const std::vector<std::string>& files) {
+    for (const auto& path : files) {
+        if (installed_file_is_kernel_payload_path(path)) return true;
+    }
+    return false;
+}
+
+std::string extract_kernel_release_from_installed_file_list(const std::vector<std::string>& files) {
+    for (const auto& path : files) {
+        if (path.rfind("/boot/kernel-", 0) == 0) {
+            return path.substr(std::string("/boot/kernel-").size());
+        }
+    }
+
+    const std::string modules_prefix = "/lib/modules/";
+    for (const auto& path : files) {
+        if (path.rfind(modules_prefix, 0) != 0) continue;
+        std::string suffix = path.substr(modules_prefix.size());
+        size_t slash = suffix.find('/');
+        if (slash == std::string::npos) return suffix;
+        if (slash > 0) return suffix.substr(0, slash);
+    }
+
+    return "";
+}
+
+std::string read_running_kernel_release() {
+    std::vector<std::string> candidates;
+    if (!ROOT_PREFIX.empty()) candidates.push_back(ROOT_PREFIX + "/proc/sys/kernel/osrelease");
+    candidates.push_back("/proc/sys/kernel/osrelease");
+
+    for (const auto& path : candidates) {
+        std::ifstream in(path);
+        if (!in) continue;
+        std::string release;
+        std::getline(in, release);
+        size_t first = release.find_first_not_of(" \t\n\r");
+        if (first == std::string::npos) continue;
+        size_t last = release.find_last_not_of(" \t\n\r");
+        release = release.substr(first, last - first + 1);
+        if (!release.empty()) return release;
+    }
+
+    return "";
 }
 
 void release_lock(bool verbose) {

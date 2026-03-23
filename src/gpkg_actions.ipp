@@ -395,6 +395,81 @@ bool verify_installed_package(const std::string& pkg_name, bool verbose, std::st
     return result.exit_code == 0;
 }
 
+struct InstalledKernelPayloadInfo {
+    std::string package;
+    std::string version;
+    std::string release;
+};
+
+bool get_installed_kernel_payload_info(const std::string& pkg_name, InstalledKernelPayloadInfo* out = nullptr) {
+    PackageMetadata meta;
+    if (!get_installed_package_metadata(pkg_name, meta)) return false;
+
+    std::vector<std::string> files = read_installed_file_list(pkg_name);
+    if (!installed_file_list_contains_kernel_payload(files)) return false;
+
+    std::string release = extract_kernel_release_from_installed_file_list(files);
+    if (release.empty()) return false;
+
+    if (out) {
+        out->package = pkg_name;
+        out->version = meta.version;
+        out->release = release;
+    }
+    return true;
+}
+
+std::set<std::string> get_autoremove_protected_kernel_packages(bool verbose) {
+    std::vector<InstalledKernelPayloadInfo> kernels;
+    for (const auto& pkg_name : get_registered_package_names()) {
+        InstalledKernelPayloadInfo info;
+        if (get_installed_kernel_payload_info(pkg_name, &info)) {
+            kernels.push_back(info);
+        }
+    }
+
+    if (kernels.empty()) return {};
+
+    std::sort(kernels.begin(), kernels.end(), [](const InstalledKernelPayloadInfo& left, const InstalledKernelPayloadInfo& right) {
+        int version_cmp = compare_versions(left.version, right.version);
+        if (version_cmp != 0) return version_cmp > 0;
+        if (left.release != right.release) return left.release > right.release;
+        return left.package < right.package;
+    });
+
+    std::string running_release = read_running_kernel_release();
+    std::set<std::string> protected_packages;
+
+    if (!running_release.empty()) {
+        for (const auto& info : kernels) {
+            if (info.release == running_release) protected_packages.insert(info.package);
+        }
+    }
+
+    std::string fallback_release;
+    for (const auto& info : kernels) {
+        if (!running_release.empty() && info.release == running_release) continue;
+        protected_packages.insert(info.package);
+        fallback_release = info.release;
+        break;
+    }
+
+    if (protected_packages.empty()) {
+        protected_packages.insert(kernels.front().package);
+        for (size_t i = 1; i < kernels.size(); ++i) {
+            if (kernels[i].release == kernels.front().release) continue;
+            protected_packages.insert(kernels[i].package);
+            break;
+        }
+    }
+
+    VLOG(verbose, "Kernel autoremove protection active for "
+        << protected_packages.size() << " package(s)"
+        << (running_release.empty() ? "" : " (running release: " + running_release + ")")
+        << (fallback_release.empty() ? "" : ", fallback release: " + fallback_release));
+    return protected_packages;
+}
+
 struct RepairInspection {
     std::vector<std::string> detected_issues;
     std::vector<std::string> unresolved_issues;
@@ -1502,6 +1577,8 @@ int handle_remove(int argc, char* argv[], bool verbose, bool purge, bool autorem
 
     if (autoremove && target_installed) {
         std::cout << "Calculating newly unneeded dependencies..." << std::endl;
+        std::set<std::string> protected_kernel_packages = get_autoremove_protected_kernel_packages(verbose);
+        std::set<std::string> skipped_kernel_packages;
         bool changed = true;
         while (changed) {
             changed = false;
@@ -1513,6 +1590,11 @@ int handle_remove(int argc, char* argv[], bool verbose, bool purge, bool autorem
                 for (const auto& dep_str : meta.depends) {
                     Dependency dep = parse_dependency(dep_str);
                     if (!is_installed(dep.name) || removal_set.count(dep.name)) continue;
+                    if (protected_kernel_packages.count(dep.name) != 0) {
+                        skipped_kernel_packages.insert(dep.name);
+                        VLOG(verbose, "Keeping protected kernel package out of autoremove: " << dep.name);
+                        continue;
+                    }
                     if (is_required_by_others(dep.name, removal_set, verbose)) continue;
 
                     to_remove.push_back(dep.name);
@@ -1520,6 +1602,14 @@ int handle_remove(int argc, char* argv[], bool verbose, bool purge, bool autorem
                     changed = true;
                 }
             }
+        }
+
+        if (!skipped_kernel_packages.empty()) {
+            std::cout << "Keeping protected kernel package(s):";
+            for (const auto& pkg : skipped_kernel_packages) {
+                std::cout << " " << pkg;
+            }
+            std::cout << std::endl;
         }
     }
 

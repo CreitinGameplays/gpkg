@@ -41,6 +41,8 @@ struct PackageStatusRecord {
     std::string version;
 };
 
+struct InstallRollbackEntry;
+
 std::string g_tmp_extract_path;
 
 std::vector<PackageStatusRecord> load_package_status_records();
@@ -102,6 +104,13 @@ bool sync_multiarch_runtime_aliases();
 std::vector<std::string> read_list_file(const std::string& pkg_name);
 std::vector<std::string> get_installed_packages(const std::string& extension = ".list");
 std::string path_basename(const std::string& path);
+std::string read_symlink_target(const std::string& path);
+bool backup_live_path_if_present(
+    const std::string& live_full_path,
+    const std::string& logical_path,
+    std::vector<InstallRollbackEntry>& rollback_entries,
+    bool* had_existing
+);
 
 // Logging
 bool g_verbose = false;
@@ -336,6 +345,254 @@ bool refresh_linker_cache_if_available() {
         return run_path_with_args(candidate, g_root_prefix.empty()
             ? std::vector<std::string>{}
             : std::vector<std::string>{"-r", g_root_prefix}) == 0;
+    }
+
+    return true;
+}
+
+struct ScopedEnvOverrides {
+    struct SavedEntry {
+        std::string name;
+        bool had_value = false;
+        std::string value;
+    };
+
+    std::vector<SavedEntry> saved;
+
+    void set(const std::string& name, const std::string& value) {
+        SavedEntry entry;
+        entry.name = name;
+        const char* current = getenv(name.c_str());
+        if (current) {
+            entry.had_value = true;
+            entry.value = current;
+        }
+        saved.push_back(entry);
+        setenv(name.c_str(), value.c_str(), 1);
+    }
+
+    ~ScopedEnvOverrides() {
+        for (auto it = saved.rbegin(); it != saved.rend(); ++it) {
+            if (it->had_value) setenv(it->name.c_str(), it->value.c_str(), 1);
+            else unsetenv(it->name.c_str());
+        }
+    }
+};
+
+bool file_list_contains_kernel_payload(const std::vector<std::string>& files) {
+    for (const auto& path : files) {
+        if (path.rfind("/boot/kernel-", 0) == 0 ||
+            path.rfind("/lib/modules/", 0) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::string kernel_release_from_file_list(const std::vector<std::string>& files) {
+    for (const auto& path : files) {
+        if (path.rfind("/boot/kernel-", 0) == 0) {
+            return path.substr(std::string("/boot/kernel-").size());
+        }
+    }
+
+    const std::string modules_prefix = "/lib/modules/";
+    for (const auto& path : files) {
+        if (path.rfind(modules_prefix, 0) != 0) continue;
+        std::string suffix = path.substr(modules_prefix.size());
+        size_t slash = suffix.find('/');
+        if (slash == std::string::npos) return suffix;
+        if (slash > 0) return suffix.substr(0, slash);
+    }
+
+    return "";
+}
+
+std::string kernel_image_path_for_release(const std::string& kernel_release) {
+    return kernel_release.empty() ? "" : "/boot/kernel-" + kernel_release;
+}
+
+std::string kernel_image_live_path_for_release(const std::string& kernel_release) {
+    return g_root_prefix + kernel_image_path_for_release(kernel_release);
+}
+
+bool kernel_modules_dir_exists(const std::string& kernel_release) {
+    if (kernel_release.empty()) return false;
+    struct stat st;
+    return stat((g_root_prefix + "/lib/modules/" + kernel_release).c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+bool stage_kernel_boot_symlink_transaction(std::vector<InstallRollbackEntry>& rollback_entries) {
+    std::string live_path = g_root_prefix + "/boot/kernel";
+    return backup_live_path_if_present(live_path, "/boot/kernel", rollback_entries, nullptr);
+}
+
+bool sync_kernel_boot_symlink() {
+    std::string boot_dir = g_root_prefix + "/boot";
+    if (!mkdir_p(boot_dir)) return false;
+
+    DIR* dir = opendir(boot_dir.c_str());
+    if (!dir) {
+        std::cerr << "E: Failed to inspect " << boot_dir << ": " << strerror(errno) << std::endl;
+        return false;
+    }
+
+    std::vector<std::string> kernels;
+    errno = 0;
+    while (dirent* entry = readdir(dir)) {
+        std::string name = entry->d_name;
+        if (name.rfind("kernel-", 0) != 0) continue;
+        std::string full_path = boot_dir + "/" + name;
+        struct stat st;
+        if (lstat(full_path.c_str(), &st) != 0) continue;
+        if (!S_ISREG(st.st_mode) && !S_ISLNK(st.st_mode)) continue;
+        kernels.push_back(name);
+    }
+    int scan_errno = errno;
+    closedir(dir);
+    if (scan_errno != 0) {
+        std::cerr << "E: Failed while scanning " << boot_dir << ": " << strerror(scan_errno) << std::endl;
+        return false;
+    }
+
+    std::string live_link = boot_dir + "/kernel";
+    if (kernels.empty()) {
+        struct stat st;
+        if (lstat(live_link.c_str(), &st) == 0) {
+            if (!remove_live_path_exact(live_link)) {
+                std::cerr << "E: Failed to clear stale /boot/kernel entry." << std::endl;
+                return false;
+            }
+            VLOG("Removed stale /boot/kernel symlink.");
+        }
+        return true;
+    }
+
+    std::sort(kernels.begin(), kernels.end(), [](const std::string& left, const std::string& right) {
+        return ::strverscmp(left.c_str(), right.c_str()) < 0;
+    });
+    const std::string& best = kernels.back();
+
+    std::string current_target;
+    struct stat current_st;
+    if (lstat(live_link.c_str(), &current_st) == 0 && S_ISLNK(current_st.st_mode)) {
+        current_target = read_symlink_target(live_link);
+        if (current_target == best) return true;
+    }
+
+    std::string temp_link = allocate_sibling_temp_path(live_link, "kernel-link");
+    if (temp_link.empty()) {
+        std::cerr << "E: Failed to allocate temporary kernel symlink path." << std::endl;
+        return false;
+    }
+    unlink(temp_link.c_str());
+    if (symlink(best.c_str(), temp_link.c_str()) != 0) {
+        std::cerr << "E: Failed to create temporary /boot/kernel symlink: "
+                  << strerror(errno) << std::endl;
+        unlink(temp_link.c_str());
+        return false;
+    }
+    if (rename(temp_link.c_str(), live_link.c_str()) != 0) {
+        std::cerr << "E: Failed to update /boot/kernel symlink: " << strerror(errno) << std::endl;
+        unlink(temp_link.c_str());
+        return false;
+    }
+
+    VLOG("Updated /boot/kernel -> " << best);
+    return true;
+}
+
+bool run_depmod_for_kernel_release(const std::string& kernel_release, bool full_rebuild = false) {
+    if (kernel_release.empty()) return true;
+    if (!full_rebuild && !kernel_modules_dir_exists(kernel_release)) return true;
+
+    const char* candidates[] = {
+        "/sbin/depmod",
+        "/usr/sbin/depmod",
+        "/bin/depmod",
+        "/usr/bin/depmod",
+    };
+
+    for (const char* candidate : candidates) {
+        if (access(candidate, X_OK) != 0) continue;
+        std::vector<std::string> args = {candidate};
+        if (!g_root_prefix.empty()) {
+            args.push_back("-b");
+            args.push_back(g_root_prefix);
+        }
+        if (full_rebuild) {
+            args.push_back("-a");
+        } else {
+            args.push_back(kernel_release);
+        }
+        return decode_command_exit_status(run_executable(args)) == 0;
+    }
+
+    return true;
+}
+
+std::vector<std::string> list_kernel_hook_scripts(const std::string& hook_dir) {
+    std::vector<std::string> scripts;
+    DIR* dir = opendir(hook_dir.c_str());
+    if (!dir) return scripts;
+
+    errno = 0;
+    while (dirent* entry = readdir(dir)) {
+        std::string name = entry->d_name;
+        if (name.empty() || name == "." || name == ".." || name[0] == '.') continue;
+        std::string full_path = hook_dir + "/" + name;
+        struct stat st;
+        if (lstat(full_path.c_str(), &st) != 0) continue;
+        if (!S_ISREG(st.st_mode) && !S_ISLNK(st.st_mode)) continue;
+        if (access(full_path.c_str(), X_OK) != 0) continue;
+        scripts.push_back(full_path);
+    }
+    closedir(dir);
+    std::sort(scripts.begin(), scripts.end());
+    return scripts;
+}
+
+bool run_kernel_hook_directories(
+    const std::string& hook_name,
+    const std::string& kernel_release,
+    const std::string& image_path,
+    const std::vector<std::string>& maint_args
+) {
+    if (hook_name.empty() || kernel_release.empty() || image_path.empty()) return true;
+    if (!g_root_prefix.empty()) {
+        VLOG("Skipping kernel hook directories in --root mode for " << hook_name << ".");
+        return true;
+    }
+
+    std::vector<std::string> hook_dirs = {
+        "/etc/kernel/" + hook_name + ".d",
+        "/usr/share/kernel/" + hook_name + ".d",
+    };
+
+    std::vector<std::string> scripts;
+    for (const auto& dir : hook_dirs) {
+        auto dir_scripts = list_kernel_hook_scripts(dir);
+        scripts.insert(scripts.end(), dir_scripts.begin(), dir_scripts.end());
+    }
+
+    if (scripts.empty()) return true;
+
+    std::ostringstream maint_params;
+    for (size_t i = 0; i < maint_args.size(); ++i) {
+        if (i != 0) maint_params << " ";
+        maint_params << shell_quote(maint_args[i]);
+    }
+
+    ScopedEnvOverrides env;
+    env.set("DEB_MAINT_PARAMS", maint_params.str());
+    env.set("INITRD", "No");
+
+    for (const auto& script : scripts) {
+        VLOG("Running kernel " << hook_name << " hook: " << script);
+        if (run_path_with_args(script, {kernel_release, image_path}) != 0) {
+            std::cerr << "E: Kernel " << hook_name << " hook failed: " << script << std::endl;
+            return false;
+        }
     }
 
     return true;
@@ -2448,12 +2705,20 @@ bool action_remove_safe(const std::string& pkg_name) {
     std::vector<std::string> undo_cmds = load_registered_undo_commands(pkg_name);
 
     std::vector<std::string> owned_files = read_list_file(pkg_name);
+    bool kernel_payload = file_list_contains_kernel_payload(owned_files);
+    std::string kernel_release = kernel_release_from_file_list(owned_files);
+    std::string kernel_image_path = kernel_image_path_for_release(kernel_release);
     std::vector<std::string> conffiles = load_package_conffiles(pkg_name);
     std::set<std::string> conffile_set(conffiles.begin(), conffiles.end());
     bool runtime_sensitive = files_touch_runtime_linker_state(owned_files);
     sort_paths_for_removal(owned_files);
 
     std::vector<InstallRollbackEntry> removal_rollback_entries;
+    if (kernel_payload && !stage_kernel_boot_symlink_transaction(removal_rollback_entries)) {
+        rollback_remove_transaction(pkg_name, removal_rollback_entries, runtime_sensitive);
+        std::cerr << "E: Failed to stage /boot/kernel rollback before removal." << std::endl;
+        return false;
+    }
     for (const auto& path : owned_files) {
         if (conffile_set.count(path) != 0) {
             VLOG("Keeping conffile during remove: " << path);
@@ -2501,6 +2766,24 @@ bool action_remove_safe(const std::string& pkg_name) {
         rollback_remove_transaction(pkg_name, removal_rollback_entries, runtime_sensitive, false);
         std::cerr << "E: Failed to remove package metadata safely." << std::endl;
         return false;
+    }
+
+    if (kernel_payload) {
+        if (!sync_kernel_boot_symlink()) {
+            rollback_remove_transaction(pkg_name, removal_rollback_entries, runtime_sensitive, false);
+            std::cerr << "E: Failed to update /boot/kernel after removing " << pkg_name << "." << std::endl;
+            return false;
+        }
+        if (!run_depmod_for_kernel_release(kernel_release, true)) {
+            rollback_remove_transaction(pkg_name, removal_rollback_entries, runtime_sensitive, false);
+            std::cerr << "E: depmod failed after removing kernel " << kernel_release << "." << std::endl;
+            return false;
+        }
+        if (!run_kernel_hook_directories("postrm", kernel_release, kernel_image_path, {"remove"})) {
+            rollback_remove_transaction(pkg_name, removal_rollback_entries, runtime_sensitive, false);
+            std::cerr << "E: Kernel postrm hooks failed for " << pkg_name << "." << std::endl;
+            return false;
+        }
     }
 
     sync_multiarch_runtime_aliases();
@@ -3126,6 +3409,9 @@ bool action_install(const std::string& pkg_file) {
     std::vector<ReplacedSystemFile> replaced_system_files =
         collect_replaced_system_files(pkg_name, new_files, old_files_set);
     std::vector<InstallRollbackEntry> install_rollback_entries;
+    bool kernel_payload = file_list_contains_kernel_payload(new_files);
+    std::string kernel_release = kernel_release_from_file_list(new_files);
+    std::string kernel_image_path = kernel_image_path_for_release(kernel_release);
 
     // 4. Preinst
     std::string preinst = g_tmp_extract_path + "scripts/preinst";
@@ -3152,6 +3438,11 @@ bool action_install(const std::string& pkg_file) {
     }
     if (!backup_replaced_system_files(replaced_system_files)) {
         rollback_install_changes(install_rollback_entries);
+        return false;
+    }
+    if (kernel_payload && !stage_kernel_boot_symlink_transaction(install_rollback_entries)) {
+        rollback_install_changes(install_rollback_entries);
+        std::cerr << "E: Failed to stage /boot/kernel rollback before installation." << std::endl;
         return false;
     }
 
@@ -3368,6 +3659,38 @@ bool action_install(const std::string& pkg_file) {
              std::cerr << "E: postinst failed." << std::endl;
              return false;
          }
+    }
+
+    if (kernel_payload) {
+        if (!sync_kernel_boot_symlink()) {
+            rollback_install_changes(install_rollback_entries);
+            if (runtime_sensitive) {
+                sync_multiarch_runtime_aliases();
+                refresh_linker_cache_if_available();
+            }
+            std::cerr << "E: Failed to update /boot/kernel after installing " << pkg_name << "." << std::endl;
+            return false;
+        }
+        if (!run_depmod_for_kernel_release(kernel_release, false)) {
+            rollback_install_changes(install_rollback_entries);
+            if (runtime_sensitive) {
+                sync_multiarch_runtime_aliases();
+                refresh_linker_cache_if_available();
+            }
+            std::cerr << "E: depmod failed after installing kernel " << kernel_release << "." << std::endl;
+            return false;
+        }
+        std::vector<std::string> kernel_postinst_args = {"configure"};
+        if (is_upgrade) kernel_postinst_args.push_back(old_version);
+        if (!run_kernel_hook_directories("postinst", kernel_release, kernel_image_path, kernel_postinst_args)) {
+            rollback_install_changes(install_rollback_entries);
+            if (runtime_sensitive) {
+                sync_multiarch_runtime_aliases();
+                refresh_linker_cache_if_available();
+            }
+            std::cerr << "E: Kernel postinst hooks failed for " << pkg_name << "." << std::endl;
+            return false;
+        }
     }
 
     // 8. Cleanup Orphans (Upgrade only)
