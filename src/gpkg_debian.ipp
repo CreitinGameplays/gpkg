@@ -27,6 +27,7 @@ struct DebianPackageRecord {
     std::string suggests_raw;
     std::string conflicts_raw;
     std::string provides_raw;
+    std::string replaces_raw;
     std::string description;
     bool essential = false;
 };
@@ -179,6 +180,7 @@ std::string package_metadata_to_json(const PackageMetadata& meta) {
     fields.push_back("\"suggests\":" + json_array_from_strings(meta.suggests));
     fields.push_back("\"conflicts\":" + json_array_from_strings(meta.conflicts));
     fields.push_back("\"provides\":" + json_array_from_strings(meta.provides));
+    fields.push_back("\"replaces\":" + json_array_from_strings(meta.replaces));
     fields.push_back(json_string_field("section", meta.section));
     fields.push_back(json_string_field("priority", meta.priority));
     fields.push_back(json_string_field("filename", meta.filename));
@@ -239,6 +241,7 @@ std::vector<DebianPackageRecord> parse_debian_packages_file(
         record.suggests_raw = get_field("Suggests");
         record.conflicts_raw = get_field("Conflicts");
         record.provides_raw = get_field("Provides");
+        record.replaces_raw = get_field("Replaces");
         record.description = debian_description_text(get_field("Description"));
         std::string essential = get_field("Essential");
         record.essential = !essential.empty() && trim(essential) == "yes";
@@ -373,6 +376,7 @@ PackageMetadata build_debian_package_metadata(
     meta.suggests = suggests;
     meta.conflicts = normalize_relation_field_value(record.conflicts_raw, config.apt_arch);
     meta.provides = normalize_relation_field_value(record.provides_raw, config.apt_arch);
+    meta.replaces = normalize_relation_field_value(record.replaces_raw, config.apt_arch);
     meta.package_scope = include_recommends ? "depends+recommends" : "depends";
     meta.installed_from = config.packages_url;
     return meta;

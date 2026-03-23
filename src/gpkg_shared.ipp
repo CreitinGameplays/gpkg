@@ -419,6 +419,7 @@ struct PackageMetadata {
     std::vector<std::string> suggests;
     std::vector<std::string> conflicts;
     std::vector<std::string> provides;
+    std::vector<std::string> replaces;
 };
 
 bool package_scope_contains(const std::string& scope, const std::string& token) {

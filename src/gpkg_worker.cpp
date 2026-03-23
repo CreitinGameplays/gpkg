@@ -765,10 +765,20 @@ bool backup_live_path_if_present(
     }
 
     if (rename(live_full_path.c_str(), backup_full_path.c_str()) != 0) {
-        std::cerr << "E: Failed to move existing path aside for " << live_full_path << ": "
-                  << strerror(errno) << std::endl;
-        unlink(backup_full_path.c_str());
-        return false;
+        if (errno == EXDEV) {
+            std::string cmd = "mv -f " + shell_quote(live_full_path) + " " + shell_quote(backup_full_path);
+            if (run_command(cmd) != 0) {
+                std::cerr << "E: Failed to move existing path aside for " << live_full_path << " (via mv fallback)" << std::endl;
+                // 'mv' failed, potentially leaving a partial copy. Use rm -rf to clean it up since it might be a directory
+                run_command("rm -rf " + shell_quote(backup_full_path));
+                return false;
+            }
+        } else {
+            std::cerr << "E: Failed to move existing path aside for " << live_full_path << ": "
+                      << strerror(errno) << std::endl;
+            unlink(backup_full_path.c_str());
+            return false;
+        }
     }
 
     if (had_existing) *had_existing = true;
@@ -1226,7 +1236,12 @@ void rollback_install_changes(const std::vector<InstallRollbackEntry>& rollback_
     for (auto it = rollback_entries.rbegin(); it != rollback_entries.rend(); ++it) {
         remove_live_path_exact(it->live_full_path);
         if (!it->backup_full_path.empty()) {
-            rename(it->backup_full_path.c_str(), it->live_full_path.c_str());
+            if (rename(it->backup_full_path.c_str(), it->live_full_path.c_str()) != 0) {
+                if (errno == EXDEV) {
+                    std::string cmd = "mv -f " + shell_quote(it->backup_full_path) + " " + shell_quote(it->live_full_path);
+                    run_command(cmd);
+                }
+            }
         }
     }
 }
@@ -1351,6 +1366,31 @@ bool apply_staged_install_entries(
     return true;
 }
 
+std::vector<std::string> get_staged_replaces() {
+    std::vector<std::string> replaced;
+    std::ifstream f(TMP_EXTRACT_PATH + "control.json");
+    if (!f) return replaced;
+    std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    size_t key_pos = content.find("\"replaces\"");
+    if (key_pos == std::string::npos) return replaced;
+    size_t arr_start = content.find("[", key_pos);
+    if (arr_start == std::string::npos) return replaced;
+    size_t arr_end = content.find("]", arr_start);
+    if (arr_end == std::string::npos) return replaced;
+    
+    std::string arr_content = content.substr(arr_start + 1, arr_end - arr_start - 1);
+    std::istringstream iss(arr_content);
+    std::string token;
+    while (std::getline(iss, token, ',')) {
+        size_t q1 = token.find("\"");
+        if (q1 == std::string::npos) continue;
+        size_t q2 = token.find("\"", q1 + 1);
+        if (q2 == std::string::npos) continue;
+        replaced.push_back(token.substr(q1 + 1, q2 - q1 - 1));
+    }
+    return replaced;
+}
+
 bool check_collisions(const std::string& pkg_name, const std::vector<std::string>& new_files) {
     // 1. Get current package's file list (for upgrades)
     std::set<std::string> owned_by_me;
@@ -1377,6 +1417,8 @@ bool check_collisions(const std::string& pkg_name, const std::vector<std::string
     if (collisions.empty()) return true;
 
     bool fatal = false;
+    std::vector<std::string> replaced = get_staged_replaces();
+    
     for (const auto& col : collisions) {
         bool owned = false;
         // Check who owns it
@@ -1385,6 +1427,11 @@ bool check_collisions(const std::string& pkg_name, const std::vector<std::string
             auto other_files = read_list_file(other);
             for (const auto& of : other_files) {
                 if (of == col) {
+                    if (std::find(replaced.begin(), replaced.end(), other) != replaced.end()) {
+                        std::cout << "W: Permitted overwrite of " << col << " because " << pkg_name << " replaces " << other << std::endl;
+                        owned = true;
+                        break;
+                    }
                     std::cerr << "E: Conflict: " << col << " is owned by " << other << std::endl;
                     owned = true;
                     fatal = true;
