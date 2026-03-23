@@ -324,33 +324,48 @@ std::vector<std::string> parse_companion_tokens(const std::string& raw_value) {
     return tokens;
 }
 
+void append_builtin_upgrade_companion(
+    std::map<std::string, std::vector<std::string>>& companions,
+    const std::string& trigger,
+    const std::string& companion
+) {
+    auto& entry = companions[trigger];
+    if (std::find(entry.begin(), entry.end(), companion) == entry.end()) {
+        entry.push_back(companion);
+    }
+}
+
 std::map<std::string, std::vector<std::string>> load_upgrade_companions() {
     std::map<std::string, std::vector<std::string>> companions;
     std::ifstream f(UPGRADE_COMPANIONS_PATH);
-    if (!f) return companions;
+    if (f) {
+        std::string line;
+        while (std::getline(f, line)) {
+            size_t comment = line.find('#');
+            if (comment != std::string::npos) line = line.substr(0, comment);
+            line = trim(line);
+            if (line.empty()) continue;
 
-    std::string line;
-    while (std::getline(f, line)) {
-        size_t comment = line.find('#');
-        if (comment != std::string::npos) line = line.substr(0, comment);
-        line = trim(line);
-        if (line.empty()) continue;
+            size_t sep = line.find(':');
+            if (sep == std::string::npos) sep = line.find('=');
+            if (sep == std::string::npos) continue;
 
-        size_t sep = line.find(':');
-        if (sep == std::string::npos) sep = line.find('=');
-        if (sep == std::string::npos) continue;
+            std::string trigger = trim(line.substr(0, sep));
+            std::string raw_companions = trim(line.substr(sep + 1));
+            if (trigger.empty() || raw_companions.empty()) continue;
 
-        std::string trigger = trim(line.substr(0, sep));
-        std::string raw_companions = trim(line.substr(sep + 1));
-        if (trigger.empty() || raw_companions.empty()) continue;
-
-        auto parsed = parse_companion_tokens(raw_companions);
-        auto& entry = companions[trigger];
-        std::set<std::string> seen(entry.begin(), entry.end());
-        for (const auto& pkg : parsed) {
-            if (seen.insert(pkg).second) entry.push_back(pkg);
+            auto parsed = parse_companion_tokens(raw_companions);
+            auto& entry = companions[trigger];
+            std::set<std::string> seen(entry.begin(), entry.end());
+            for (const auto& pkg : parsed) {
+                if (seen.insert(pkg).second) entry.push_back(pkg);
+            }
         }
     }
+
+    // Keep a small built-in floor for lockstep runtime transitions even if the
+    // image policy files are stale or missing.
+    append_builtin_upgrade_companion(companions, "libc6", "libc-bin");
 
     return companions;
 }
@@ -367,6 +382,36 @@ void append_companion_targets(
     for (const auto& pkg : it->second) {
         if (seen.insert(pkg).second) out.push_back(pkg);
     }
+}
+
+bool runtime_companion_looks_non_runtime(const std::string& pkg_name) {
+    static const std::set<std::string> exact_non_runtime = {
+        "libc-dev-bin",
+        "libc-l10n",
+        "linux-libc-dev",
+        "locales",
+        "rpcsvc-proto",
+    };
+    if (exact_non_runtime.count(pkg_name) != 0) return true;
+    if (pkg_name.rfind("manpages", 0) == 0) return true;
+    if (pkg_name.size() >= 4 && pkg_name.substr(pkg_name.size() - 4) == "-dev") return true;
+    if (pkg_name.find("-dbg") != std::string::npos) return true;
+    if (pkg_name.find("-dbgsym") != std::string::npos) return true;
+    if (pkg_name.find("-doc") != std::string::npos) return true;
+    return false;
+}
+
+bool should_auto_import_base_runtime_companion(
+    const std::string& pkg_name,
+    bool verbose
+) {
+    if (pkg_name == "libc-bin") return true;
+    if (!is_system_provided(pkg_name)) return false;
+    if (runtime_companion_looks_non_runtime(pkg_name)) {
+        VLOG(verbose, "Skipping base-provided non-runtime companion " << pkg_name);
+        return false;
+    }
+    return true;
 }
 
 bool resolve_upgrade_target_metadata(
@@ -518,6 +563,16 @@ bool expand_runtime_upgrade_companions(
                      << ": " << join_strings(it->second));
         for (const auto& companion_name : it->second) {
             Dependency companion_dep = parse_dependency(companion_name);
+            std::string canonical_companion = canonicalize_package_name(companion_dep.name, verbose);
+            bool companion_already_relevant =
+                queued_packages.count(canonical_companion) != 0 ||
+                installed_cache.count(canonical_companion) != 0 ||
+                should_auto_import_base_runtime_companion(canonical_companion, verbose);
+            if (!companion_already_relevant) {
+                VLOG(verbose, "Skipping dormant runtime upgrade companion "
+                             << canonical_companion << " for " << root_name);
+                continue;
+            }
             if (!queue_upgrade_target(
                     companion_dep,
                     companion_map,

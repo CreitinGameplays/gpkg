@@ -32,7 +32,9 @@ bool mkdir_p(const std::string& path);
 bool path_exists_no_follow(const std::string& path);
 bool write_text_file_atomic(const std::string& target_path, const std::string& content, mode_t mode = 0644);
 bool copy_file_atomic(const std::string& source_path, const std::string& target_path);
+bool copy_path_atomic_no_follow(const std::string& source_path, const std::string& target_path);
 std::string canonical_existing_path(const std::string& path);
+std::string allocate_sibling_temp_path(const std::string& live_full_path, const std::string& tag, int* fd_out = nullptr);
 
 // Logging
 bool g_verbose = false;
@@ -80,7 +82,11 @@ bool refresh_linker_cache_if_available() {
 
     for (const char* candidate : candidates) {
         if (access(candidate, X_OK) != 0) continue;
-        int status = run_command(candidate);
+        std::string cmd = candidate;
+        if (!g_root_prefix.empty()) {
+            cmd += " -r " + shell_quote(g_root_prefix);
+        }
+        int status = run_command(cmd);
         return decode_command_exit_status(status) == 0;
     }
 
@@ -585,6 +591,24 @@ struct ReplacedSystemFile {
     std::string backup_path;
 };
 
+bool path_is_directory_or_directory_symlink(
+    const std::string& full_path,
+    const struct stat* lstat_result = nullptr
+) {
+    struct stat local_st;
+    const struct stat* st = lstat_result;
+    if (!st) {
+        if (lstat(full_path.c_str(), &local_st) != 0) return false;
+        st = &local_st;
+    }
+
+    if (S_ISDIR(st->st_mode)) return true;
+    if (!S_ISLNK(st->st_mode)) return false;
+
+    struct stat target_st;
+    return stat(full_path.c_str(), &target_st) == 0 && S_ISDIR(target_st.st_mode);
+}
+
 std::string get_replaced_system_dir(const std::string& pkg_name) {
     return get_info_dir() + pkg_name + ".system-backup";
 }
@@ -602,7 +626,7 @@ bool should_preserve_local_config_file(
     std::string full_path = g_root_prefix + file_path;
     struct stat st;
     if (lstat(full_path.c_str(), &st) != 0) return false;
-    if (S_ISDIR(st.st_mode)) return false;
+    if (path_is_directory_or_directory_symlink(full_path, &st)) return false;
 
     return find_file_owner(pkg_name, file_path).empty();
 }
@@ -720,7 +744,11 @@ bool write_replaced_system_files(
     const std::string& pkg_name,
     const std::vector<ReplacedSystemFile>& entries
 ) {
-    if (entries.empty()) return true;
+    if (entries.empty()) {
+        unlink(get_replaced_system_manifest(pkg_name).c_str());
+        run_command("rm -rf " + shell_quote(get_replaced_system_dir(pkg_name)));
+        return true;
+    }
 
     std::ostringstream out;
     for (const auto& entry : entries) {
@@ -741,7 +769,7 @@ bool should_backup_replaced_system_file(
     std::string full_path = g_root_prefix + file_path;
     struct stat st;
     if (lstat(full_path.c_str(), &st) != 0) return false;
-    if (S_ISDIR(st.st_mode)) return false;
+    if (path_is_directory_or_directory_symlink(full_path, &st)) return false;
     if (should_preserve_local_config_file(pkg_name, file_path)) return false;
     if (owned_by_me.count(file_path)) return false;
     return find_file_owner(pkg_name, file_path).empty();
@@ -781,14 +809,25 @@ bool backup_replaced_system_files(const std::vector<ReplacedSystemFile>& entries
         if (path_exists_no_follow(entry.backup_path)) continue;
 
         std::string source_path = g_root_prefix + entry.path;
+        struct stat st;
+        if (lstat(source_path.c_str(), &st) != 0) {
+            if (errno == ENOENT) continue;
+            std::cerr << "E: Failed to inspect replaced base file " << entry.path
+                      << ": " << strerror(errno) << std::endl;
+            return false;
+        }
+        if (path_is_directory_or_directory_symlink(source_path, &st)) {
+            VLOG("Skipping backup of directory anchor " << entry.path);
+            continue;
+        }
+
         std::string parent_dir = entry.backup_path.substr(0, entry.backup_path.find_last_of('/'));
         if (!mkdir_p(parent_dir)) {
             std::cerr << "E: Failed to create system backup directory " << parent_dir << std::endl;
             return false;
         }
 
-        std::string cmd = "cp -a " + shell_quote(source_path) + " " + shell_quote(entry.backup_path);
-        if (run_command(cmd) != 0) {
+        if (!copy_path_atomic_no_follow(source_path, entry.backup_path)) {
             std::cerr << "E: Failed to back up replaced base file " << entry.path << std::endl;
             return false;
         }
@@ -837,6 +876,11 @@ bool remove_path(const std::string& abs_path) {
         if (errno == ENOENT) return true; // Already gone
         std::cerr << "W: Failed to stat " << full_path << ": " << strerror(errno) << std::endl;
         return false;
+    }
+
+    if (path_is_directory_or_directory_symlink(full_path, &st) && !S_ISDIR(st.st_mode)) {
+        VLOG("Skipping removal of directory symlink: " << full_path);
+        return true;
     }
 
     if (S_ISDIR(st.st_mode)) {
@@ -983,8 +1027,7 @@ bool is_existing_symlink_directory(const std::string& full_path) {
     struct stat link_st;
     if (lstat(full_path.c_str(), &link_st) != 0 || !S_ISLNK(link_st.st_mode)) return false;
 
-    struct stat target_st;
-    return stat(full_path.c_str(), &target_st) == 0 && S_ISDIR(target_st.st_mode);
+    return path_is_directory_or_directory_symlink(full_path, &link_st);
 }
 
 struct StagedInstallEntry {
@@ -996,6 +1039,28 @@ struct StagedInstallEntry {
     std::string symlink_target;
     size_t depth = 0;
 };
+
+void prune_non_owned_directory_symlink_entries(
+    std::vector<std::string>& installed_files,
+    const std::vector<StagedInstallEntry>& staged_entries
+) {
+    std::set<std::string> skipped_paths;
+    for (const auto& entry : staged_entries) {
+        if (!entry.is_directory) continue;
+        if (!is_existing_symlink_directory(g_root_prefix + entry.path)) continue;
+        skipped_paths.insert(entry.path);
+    }
+    if (skipped_paths.empty()) return;
+
+    installed_files.erase(
+        std::remove_if(
+            installed_files.begin(),
+            installed_files.end(),
+            [&](const std::string& path) { return skipped_paths.count(path) != 0; }
+        ),
+        installed_files.end()
+    );
+}
 
 struct InstallRollbackEntry {
     std::string path;
@@ -1024,7 +1089,7 @@ std::string path_basename_component(const std::string& full_path) {
     return full_path.substr(slash + 1);
 }
 
-std::string allocate_sibling_temp_path(const std::string& live_full_path, const std::string& tag, int* fd_out = nullptr) {
+std::string allocate_sibling_temp_path(const std::string& live_full_path, const std::string& tag, int* fd_out) {
     if (fd_out) *fd_out = -1;
 
     std::string parent = path_parent_dir(live_full_path);
@@ -1203,6 +1268,34 @@ bool copy_file_atomic(const std::string& source_path, const std::string& target_
         return false;
     }
     return true;
+}
+
+bool copy_path_atomic_no_follow(const std::string& source_path, const std::string& target_path) {
+    struct stat st;
+    if (lstat(source_path.c_str(), &st) != 0) return false;
+    if (path_is_directory_or_directory_symlink(source_path, &st)) return false;
+
+    if (S_ISLNK(st.st_mode)) {
+        std::string link_target = read_symlink_target(source_path);
+        if (link_target.empty() && st.st_size > 0) return false;
+        if (!mkdir_p(path_parent_dir(target_path))) return false;
+
+        std::string temp_path = allocate_sibling_temp_path(target_path, "gpkg-copy");
+        if (temp_path.empty()) return false;
+
+        if (symlink(link_target.c_str(), temp_path.c_str()) != 0) {
+            unlink(temp_path.c_str());
+            return false;
+        }
+        if (rename(temp_path.c_str(), target_path.c_str()) != 0) {
+            unlink(temp_path.c_str());
+            return false;
+        }
+        return true;
+    }
+
+    if (!S_ISREG(st.st_mode)) return false;
+    return copy_file_atomic(source_path, target_path);
 }
 
 bool activate_live_path_from_source(
@@ -2098,6 +2191,7 @@ bool action_install(const std::string& pkg_file) {
 
     std::vector<std::string> installed_files = new_files;
     apply_preserved_config_metadata(installed_files, preserved_configs);
+    prune_non_owned_directory_symlink_entries(installed_files, staged_entries);
 
     // 6. Register in Database
     run_command("mkdir -p " + get_info_dir());
