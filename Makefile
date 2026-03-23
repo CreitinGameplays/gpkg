@@ -11,11 +11,7 @@ GPKG_VERSION ?=
 GPKG_CODENAME ?=
 LZMA_STATIC := $(firstword \
 	$(wildcard $(ROOTFS)/usr/lib/x86_64-linux-gnu/liblzma.a) \
-	$(wildcard $(ROOTFS)/usr/lib64/x86_64-linux-gnu/liblzma.a) \
-	$(wildcard $(ROOTFS)/usr/lib64/liblzma.a) \
-	$(wildcard $(PROJECT_ROOT)/rootfs/usr/lib/x86_64-linux-gnu/liblzma.a) \
-	$(wildcard $(PROJECT_ROOT)/rootfs/usr/lib64/x86_64-linux-gnu/liblzma.a) \
-	$(wildcard $(PROJECT_ROOT)/rootfs/usr/lib64/liblzma.a))
+	$(wildcard $(PROJECT_ROOT)/rootfs/usr/lib/x86_64-linux-gnu/liblzma.a))
 ifeq ($(strip $(GPKG_VERSION)),)
 GPKG_VERSION := $(shell sed -n 's/^#define OS_VERSION "\(.*\)"/\1/p' $(SYS_INFO_HEADER) | head -n1)
 endif
