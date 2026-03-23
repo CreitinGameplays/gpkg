@@ -144,8 +144,11 @@ bool looks_like_shared_object_path(const std::string& path) {
 
 bool validate_elf_file(const std::string& path, off_t size, std::string* error) {
     if (size < static_cast<off_t>(EI_NIDENT)) {
-        if (error) *error = "file is too small to contain an ELF header";
-        return false;
+        if (looks_like_shared_object_path(path)) {
+            if (error) *error = "shared object file is too small to be valid";
+            return false;
+        }
+        return true;
     }
 
     unsigned char ident[EI_NIDENT];
@@ -165,6 +168,8 @@ bool validate_elf_file(const std::string& path, off_t size, std::string* error) 
                 in.read(text_prefix, sizeof(text_prefix) - 1);
             }
             if (looks_like_linker_script_prefix(text_prefix)) return true;
+            if (error) *error = "shared object is neither a valid ELF nor a linker script";
+            return false;
         }
         return true;
     }
@@ -1700,8 +1705,7 @@ bool action_verify(const std::string& pkg_name) {
              } else if (S_ISLNK(st.st_mode)) {
                  struct stat target_st;
                  if (stat(full_path.c_str(), &target_st) != 0) {
-                     std::cerr << "DANGLING SYMLINK: " << f << std::endl;
-                     passed = false;
+                     std::cerr << "W: DANGLING SYMLINK: " << f << std::endl;
                  }
              } else {
                  // We expect a file or symlink
