@@ -35,6 +35,13 @@ struct ImportPolicy {
     std::map<std::string, PackageOverridePolicy> package_overrides;
 };
 
+void append_unique_policy_value(std::vector<std::string>& values, const std::string& value) {
+    std::string normalized = trim(value);
+    if (normalized.empty()) return;
+    if (std::find(values.begin(), values.end(), normalized) != values.end()) return;
+    values.push_back(normalized);
+}
+
 bool wildcard_match(const std::string& value, const std::string& pattern) {
     return fnmatch(pattern.c_str(), value.c_str(), 0) == 0;
 }
@@ -320,6 +327,24 @@ ImportPolicy load_import_policy(bool verbose = false) {
         }
     }
 
+    for (const auto& entry : policy.package_aliases) {
+        std::string alias = trim(entry.first);
+        std::string canonical = trim(entry.second);
+        if (alias.empty() || canonical.empty() || alias == canonical) continue;
+
+        if (policy.dependency_rewrites.find(alias) == policy.dependency_rewrites.end()) {
+            policy.dependency_rewrites[alias] = canonical;
+        }
+        if (policy.provider_choices.find(alias) == policy.provider_choices.end()) {
+            policy.provider_choices[alias] = canonical;
+        }
+
+        PackageOverridePolicy& override = policy.package_overrides[canonical];
+        append_unique_policy_value(override.replaces_add, alias);
+        append_unique_policy_value(override.conflicts_add, alias);
+        append_unique_policy_value(override.provides_add, alias);
+    }
+
     return policy;
 }
 
@@ -340,10 +365,16 @@ bool is_blocked_import_package(const std::string& package_name, bool verbose = f
 
 std::string apply_dependency_rewrite_name(
     const std::string& name,
-    const std::map<std::string, std::string>& rewrites
+    const std::map<std::string, std::string>& rewrites,
+    const std::map<std::string, std::string>* aliases = nullptr
 ) {
     for (const auto& entry : rewrites) {
         if (wildcard_match(name, entry.first)) return trim(entry.second);
+    }
+    if (aliases) {
+        for (const auto& entry : *aliases) {
+            if (wildcard_match(name, entry.first)) return trim(entry.second);
+        }
     }
     return name;
 }
@@ -429,7 +460,11 @@ std::vector<std::string> normalize_dependency_relation_value(
             if (!parsed.valid) return std::string();
 
             std::string original_name = parsed.name;
-            std::string rewritten_name = apply_dependency_rewrite_name(parsed.name, policy.dependency_rewrites);
+            std::string rewritten_name = apply_dependency_rewrite_name(
+                parsed.name,
+                policy.dependency_rewrites,
+                &policy.package_aliases
+            );
             if (rewritten_name.empty()) {
                 dropped_as_system = true;
                 return std::string();
