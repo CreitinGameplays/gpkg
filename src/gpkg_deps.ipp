@@ -126,13 +126,27 @@ bool dependency_list_matches(
     return false;
 }
 
-bool is_system_provided(const std::string& pkg, const std::string& op = "", const std::string& req_version = "") {
+bool is_system_provided(const std::string& pkg, const std::string& op, const std::string& req_version) {
     if (dependency_list_matches(load_system_provides(), pkg, op, req_version)) return true;
     return dependency_list_matches(load_upgradeable_system_packages(), pkg, op, req_version);
 }
 
 bool is_upgradeable_system_package(const std::string& pkg) {
     return dependency_list_matches(load_upgradeable_system_packages(), pkg);
+}
+
+bool package_is_base_system_provided(const std::string& pkg_name, std::string* reason_out) {
+    if (reason_out) reason_out->clear();
+    if (pkg_name.empty() || !is_system_provided(pkg_name)) return false;
+
+    if (reason_out) {
+        if (is_upgradeable_system_package(pkg_name)) {
+            *reason_out = "it is provided by the GeminiOS base system image and managed as an upgradeable system package";
+        } else {
+            *reason_out = "it is provided by the GeminiOS base system image";
+        }
+    }
+    return true;
 }
 
 bool repo_has_satisfying_dependency(const Dependency& dep, bool verbose) {

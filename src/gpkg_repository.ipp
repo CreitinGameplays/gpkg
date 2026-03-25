@@ -109,6 +109,38 @@ bool clear_repo_cache_contents(bool verbose) {
         return false;
     }
 
+    if (!mkdir_p(REPO_CACHE_PATH + "debian/")) {
+        std::cerr << Color::RED << "E: Failed to ensure Debian cache directory exists inside "
+                  << REPO_CACHE_PATH << Color::RESET << std::endl;
+        return false;
+    }
+
+    bool ok = true;
+
+    const std::vector<std::string> removable_entries = {
+        REPO_CACHE_PATH + "gpkg",
+        REPO_CACHE_PATH + "imported",
+        REPO_CACHE_PATH + "debian/pool",
+        REPO_CACHE_PATH + "Packages.json.tmp",
+    };
+
+    for (const auto& child : removable_entries) {
+        if (lstat(child.c_str(), &st) != 0) {
+            if (errno == ENOENT) continue;
+            ok = false;
+            std::cerr << Color::YELLOW << "W: Failed to remove cache entry "
+                      << child << ": " << strerror(errno) << Color::RESET << std::endl;
+            continue;
+        }
+
+        VLOG(verbose, "Removing cache entry " << child);
+        if (!remove_cache_tree_no_follow(child)) {
+            ok = false;
+            std::cerr << Color::YELLOW << "W: Failed to remove cache entry "
+                      << child << ": " << strerror(errno) << Color::RESET << std::endl;
+        }
+    }
+
     DIR* dir = opendir(REPO_CACHE_PATH.c_str());
     if (!dir) {
         std::cerr << Color::RED << "E: Failed to open repo cache directory "
@@ -116,12 +148,13 @@ bool clear_repo_cache_contents(bool verbose) {
         return false;
     }
 
-    bool ok = true;
     struct dirent* entry;
     while ((entry = readdir(dir)) != nullptr) {
         if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
-        std::string child = REPO_CACHE_PATH + entry->d_name;
-        VLOG(verbose, "Removing cache entry " << child);
+        std::string name = entry->d_name;
+        if (name.rfind("repo_index_", 0) != 0) continue;
+        std::string child = REPO_CACHE_PATH + name;
+        VLOG(verbose, "Removing stale repository index fragment " << child);
         if (!remove_cache_tree_no_follow(child)) {
             ok = false;
             std::cerr << Color::YELLOW << "W: Failed to remove cache entry "
@@ -391,6 +424,8 @@ int handle_search(const std::string& query, bool verbose) {
             } else {
                 status_str = Color::BLUE + " [installed: " + installed_ver + "]" + Color::RESET;
             }
+        } else if (package_is_base_system_provided(meta.name)) {
+            status_str = Color::BLUE + " [base system]" + Color::RESET;
         }
 
         std::cout << Color::GREEN << meta.name << Color::RESET
@@ -434,6 +469,8 @@ int handle_show(const std::string& pkg_name, bool verbose) {
     std::string installed_ver;
     if (is_installed(meta.name, &installed_ver)) {
         std::cout << "  Installed:   yes (" << installed_ver << ")" << std::endl;
+    } else if (package_is_base_system_provided(meta.name)) {
+        std::cout << "  Installed:   base system" << std::endl;
     } else {
         std::cout << "  Installed:   no" << std::endl;
     }
@@ -500,7 +537,7 @@ int handle_clean(bool verbose) {
     invalidate_repo_package_cache();
     if (!clear_repo_cache_contents(verbose)) return 1;
     std::cout << Color::GREEN
-              << "✓ Removed cached package archives, converted imports, partial downloads, and repo indices."
+              << "✓ Removed cached package archives, converted imports, and partial downloads. Kept package indices."
               << Color::RESET << std::endl;
     return 0;
 }

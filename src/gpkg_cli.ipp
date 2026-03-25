@@ -16,6 +16,7 @@ void print_help() {
     std::cout << "Usage: gpkg <command> [args] [options]\n"
               << "GeminiOS Package Manager " << GPKG_VERSION << " (" << GPKG_CODENAME << ")\n\n"
               << "Options:\n"
+              << "  -h, --help      Show this help text\n"
               << "  -v, --verbose   Show detailed logging information\n"
               << "  -y, --yes       Assume yes for confirmation prompts\n"
               << "  -r, --repair    Repair broken dependencies and damaged installs\n"
@@ -71,7 +72,9 @@ int main(int argc, char* argv[]) {
         else if (arg == "--recommended-no") recommended_no = true;
         else if (arg == "--suggested-yes") suggested_yes = true;
         else if (arg == "--suggested-no") suggested_no = true;
-        else if (arg == "-V" || arg == "--version") {
+        else if (arg == "-h" || arg == "--help") {
+            action = "help";
+        } else if (arg == "-V" || arg == "--version") {
             if (action.empty()) action = "version";
         } else if (!arg.empty() && arg[0] == '-') {
             std::cerr << Color::RED
@@ -177,6 +180,10 @@ int main(int argc, char* argv[]) {
         installed_cache.insert(pkg);
     }
 
+    if (action == "help") {
+        print_help();
+        return 0;
+    }
     if (action == "version") {
         print_version();
         return 0;

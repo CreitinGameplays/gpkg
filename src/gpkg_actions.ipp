@@ -9,11 +9,16 @@ enum class PlannedPackageKind {
     NewInstall,
     Upgrade,
     Reinstall,
+    BaseSystemUpgrade,
 };
 
 PlannedPackageKind classify_planned_package(const PackageMetadata& meta, std::string* current_version = nullptr) {
     std::string installed_version;
     if (!is_installed(meta.name, &installed_version)) {
+        if (package_is_base_system_provided(meta.name)) {
+            if (current_version) *current_version = "base system";
+            return PlannedPackageKind::BaseSystemUpgrade;
+        }
         if (current_version) current_version->clear();
         return PlannedPackageKind::NewInstall;
     }
@@ -383,6 +388,35 @@ bool package_is_config_files_only(const std::string& pkg_name, std::string* out_
     if (record.status != "config-files") return false;
     if (out_version) *out_version = record.version;
     return true;
+}
+
+bool package_is_removal_protected(const std::string& pkg_name, std::string* reason_out = nullptr) {
+    if (reason_out) reason_out->clear();
+    if (pkg_name.empty()) return false;
+
+    const ImportPolicy& policy = get_import_policy(false);
+    if (matches_any_pattern(pkg_name, policy.allow_essential_packages)) {
+        if (reason_out) *reason_out = "it is marked essential by GeminiOS policy";
+        return true;
+    }
+
+    if (is_upgradeable_system_package(pkg_name)) {
+        if (reason_out) *reason_out = "it is part of the GeminiOS upgradeable base system";
+        return true;
+    }
+
+    PackageMetadata meta;
+    if (get_installed_package_metadata(pkg_name, meta)) {
+        std::string priority = meta.priority;
+        std::transform(priority.begin(), priority.end(), priority.begin(),
+                       [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+        if (priority == "required") {
+            if (reason_out) *reason_out = "its package priority is 'required'";
+            return true;
+        }
+    }
+
+    return false;
 }
 
 bool verify_installed_package(const std::string& pkg_name, bool verbose, std::string* log_path = nullptr) {
@@ -1562,8 +1596,24 @@ int handle_remove(int argc, char* argv[], bool verbose, bool purge, bool autorem
     bool target_installed = is_installed(target_pkg);
     bool target_config_files = package_is_config_files_only(target_pkg);
 
+    std::string protection_reason;
+    if (!target_installed && !(purge && target_config_files) &&
+        package_is_base_system_provided(target_pkg, &protection_reason)) {
+        std::cerr << Color::RED << "E: Refusing to remove '" << target_pkg << "' because "
+                  << protection_reason << "."
+                  << Color::RESET << std::endl;
+        return 1;
+    }
+
     if (!target_installed && !(purge && target_config_files)) {
         std::cerr << Color::RED << "E: Package '" << target_pkg << "' is not installed."
+                  << Color::RESET << std::endl;
+        return 1;
+    }
+
+    if (package_is_removal_protected(target_pkg, &protection_reason)) {
+        std::cerr << Color::RED << "E: Refusing to remove '" << target_pkg << "' because "
+                  << protection_reason << "."
                   << Color::RESET << std::endl;
         return 1;
     }
@@ -1579,6 +1629,7 @@ int handle_remove(int argc, char* argv[], bool verbose, bool purge, bool autorem
         std::cout << "Calculating newly unneeded dependencies..." << std::endl;
         std::set<std::string> protected_kernel_packages = get_autoremove_protected_kernel_packages(verbose);
         std::set<std::string> skipped_kernel_packages;
+        std::map<std::string, std::string> skipped_protected_packages;
         bool changed = true;
         while (changed) {
             changed = false;
@@ -1590,6 +1641,12 @@ int handle_remove(int argc, char* argv[], bool verbose, bool purge, bool autorem
                 for (const auto& dep_str : meta.depends) {
                     Dependency dep = parse_dependency(dep_str);
                     if (!is_installed(dep.name) || removal_set.count(dep.name)) continue;
+                    std::string dep_protection_reason;
+                    if (package_is_removal_protected(dep.name, &dep_protection_reason)) {
+                        skipped_protected_packages[dep.name] = dep_protection_reason;
+                        VLOG(verbose, "Keeping protected system package out of autoremove: " << dep.name);
+                        continue;
+                    }
                     if (protected_kernel_packages.count(dep.name) != 0) {
                         skipped_kernel_packages.insert(dep.name);
                         VLOG(verbose, "Keeping protected kernel package out of autoremove: " << dep.name);
@@ -1610,6 +1667,12 @@ int handle_remove(int argc, char* argv[], bool verbose, bool purge, bool autorem
                 std::cout << " " << pkg;
             }
             std::cout << std::endl;
+        }
+        if (!skipped_protected_packages.empty()) {
+            std::cout << "Keeping protected system package(s):" << std::endl;
+            for (const auto& entry : skipped_protected_packages) {
+                std::cout << "  " << entry.first << " (" << entry.second << ")" << std::endl;
+            }
         }
     }
 

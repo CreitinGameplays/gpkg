@@ -2278,23 +2278,23 @@ bool backup_live_path_if_present(
     }
 
     if (rename(live_full_path.c_str(), backup_full_path.c_str()) != 0) {
-        if (errno == EXDEV && !path_is_directory_or_directory_symlink(live_full_path, &st)) {
+        if (errno == EXDEV) {
             if (!copy_path_atomic_no_follow(live_full_path, backup_full_path)) {
                 std::cerr << "E: Failed to copy existing path aside for " << live_full_path << ": "
                           << strerror(errno) << std::endl;
-                unlink(backup_full_path.c_str());
+                remove_tree_no_follow(backup_full_path);
                 return false;
             }
-            if (!remove_live_path_exact(live_full_path)) {
+            if (!remove_tree_no_follow(live_full_path)) {
                 std::cerr << "E: Failed to remove existing path after copying backup for "
                           << live_full_path << ": " << strerror(errno) << std::endl;
-                unlink(backup_full_path.c_str());
+                remove_tree_no_follow(backup_full_path);
                 return false;
             }
         } else {
             std::cerr << "E: Failed to move existing path aside for " << live_full_path << ": "
                       << strerror(errno) << std::endl;
-            unlink(backup_full_path.c_str());
+            remove_tree_no_follow(backup_full_path);
             return false;
         }
     }
@@ -2369,6 +2369,53 @@ bool copy_regular_file_contents(const std::string& source_path, int dest_fd) {
     return true;
 }
 
+bool copy_directory_tree_no_follow(const std::string& source_path, const std::string& target_path) {
+    struct stat st;
+    if (lstat(source_path.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) return false;
+
+    if (!mkdir_p(path_parent_dir(target_path))) return false;
+    if (mkdir(target_path.c_str(), st.st_mode & 07777) != 0) {
+        if (errno != EEXIST) return false;
+
+        struct stat target_st;
+        if (lstat(target_path.c_str(), &target_st) != 0 || !S_ISDIR(target_st.st_mode)) {
+            return false;
+        }
+    }
+    chmod(target_path.c_str(), st.st_mode & 07777);
+
+    DIR* dir = opendir(source_path.c_str());
+    if (!dir) return false;
+
+    bool ok = true;
+    int saved_errno = 0;
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != nullptr) {
+        std::string name = entry->d_name;
+        if (name == "." || name == "..") continue;
+
+        std::string child_source = source_path + "/" + name;
+        std::string child_target = target_path + "/" + name;
+        if (!copy_path_atomic_no_follow(child_source, child_target)) {
+            ok = false;
+            saved_errno = errno;
+            break;
+        }
+    }
+    closedir(dir);
+
+    if (!ok) {
+        if (!remove_tree_no_follow(target_path) && errno != ENOENT) {
+            std::cerr << "W: Failed to discard partial directory copy " << target_path
+                      << ": " << strerror(errno) << std::endl;
+        }
+        if (saved_errno != 0) errno = saved_errno;
+        return false;
+    }
+
+    return true;
+}
+
 bool write_text_file_atomic(const std::string& target_path, const std::string& content, mode_t mode) {
     if (!mkdir_p(path_parent_dir(target_path))) return false;
 
@@ -2432,7 +2479,6 @@ bool copy_file_atomic(const std::string& source_path, const std::string& target_
 bool copy_path_atomic_no_follow(const std::string& source_path, const std::string& target_path) {
     struct stat st;
     if (lstat(source_path.c_str(), &st) != 0) return false;
-    if (path_is_directory_or_directory_symlink(source_path, &st)) return false;
 
     if (S_ISLNK(st.st_mode)) {
         std::string link_target = read_symlink_target(source_path);
@@ -2451,6 +2497,10 @@ bool copy_path_atomic_no_follow(const std::string& source_path, const std::strin
             return false;
         }
         return true;
+    }
+
+    if (S_ISDIR(st.st_mode)) {
+        return copy_directory_tree_no_follow(source_path, target_path);
     }
 
     if (!S_ISREG(st.st_mode)) return false;

@@ -133,6 +133,10 @@ bool mkdir_p(const std::string& path) {
     return true;
 }
 
+bool is_system_provided(const std::string& pkg, const std::string& op = "", const std::string& req_version = "");
+bool is_upgradeable_system_package(const std::string& pkg);
+bool package_is_base_system_provided(const std::string& pkg_name, std::string* reason_out = nullptr);
+
 std::string first_command_token(const std::string& cmd) {
     size_t start = cmd.find_first_not_of(" \t\n\r");
     if (start == std::string::npos) return "";
@@ -227,7 +231,9 @@ bool is_optional_dependency_option(const std::string& arg) {
 }
 
 bool is_known_cli_option(const std::string& arg) {
-    return arg == "-v" ||
+    return arg == "-h" ||
+           arg == "--help" ||
+           arg == "-v" ||
            arg == "--verbose" ||
            arg == "-y" ||
            arg == "--yes" ||
