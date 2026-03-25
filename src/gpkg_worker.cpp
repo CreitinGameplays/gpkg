@@ -711,6 +711,73 @@ const RuntimeAliasFamily k_runtime_alias_families[] = {
     {"/usr/lib/x86_64-linux-gnu", "/usr/lib64", "/usr/lib64/x86_64-linux-gnu"},
 };
 
+struct MultiarchLogicalPrefixMap {
+    const char* path_prefix;
+    const char* canonical_prefix;
+};
+
+const MultiarchLogicalPrefixMap k_multiarch_logical_prefix_maps[] = {
+    {"/lib64/x86_64-linux-gnu", "/lib/x86_64-linux-gnu"},
+    {"/lib64", "/lib/x86_64-linux-gnu"},
+    {"/lib/x86_64-linux-gnu", "/lib/x86_64-linux-gnu"},
+    {"/usr/lib64/x86_64-linux-gnu", "/usr/lib/x86_64-linux-gnu"},
+    {"/usr/lib64", "/usr/lib/x86_64-linux-gnu"},
+    {"/usr/lib/x86_64-linux-gnu", "/usr/lib/x86_64-linux-gnu"},
+};
+
+std::string canonical_multiarch_logical_path(const std::string& path) {
+    for (const auto& map : k_multiarch_logical_prefix_maps) {
+        std::string prefix = map.path_prefix;
+        if (path == prefix) return map.canonical_prefix;
+        if (path.rfind(prefix + "/", 0) != 0) continue;
+        return std::string(map.canonical_prefix) + path.substr(prefix.size());
+    }
+    return path;
+}
+
+std::vector<std::string> normalize_owned_manifest_paths(const std::vector<std::string>& paths) {
+    std::vector<std::string> normalized;
+    std::set<std::string> seen;
+    for (const auto& path : paths) {
+        std::string canonical_path = canonical_multiarch_logical_path(path);
+        if (!seen.insert(canonical_path).second) continue;
+        normalized.push_back(canonical_path);
+    }
+    return normalized;
+}
+
+std::set<std::string> build_normalized_owned_path_set(const std::vector<std::string>& paths) {
+    std::set<std::string> normalized;
+    for (const auto& path : paths) {
+        normalized.insert(canonical_multiarch_logical_path(path));
+    }
+    return normalized;
+}
+
+std::vector<std::string> collapse_multiarch_install_alias_paths(const std::vector<std::string>& paths) {
+    std::set<std::string> raw_paths(paths.begin(), paths.end());
+    std::vector<std::string> collapsed;
+    std::set<std::string> seen;
+
+    for (const auto& path : paths) {
+        std::string canonical_path = canonical_multiarch_logical_path(path);
+        std::string selected_path = path;
+
+        // If the payload already carries the canonical multiarch path, install and own
+        // that single logical entry. GeminiOS already exposes the compat prefixes as
+        // directory symlinks into the canonical tree, so keeping both payload aliases
+        // would overwrite the same on-disk object multiple times.
+        if (canonical_path != path && raw_paths.count(canonical_path) != 0) {
+            selected_path = canonical_path;
+        }
+
+        if (!seen.insert(selected_path).second) continue;
+        collapsed.push_back(selected_path);
+    }
+
+    return collapsed;
+}
+
 std::vector<std::string> runtime_alias_family_prefixes(const RuntimeAliasFamily& family) {
     return {family.canonical_prefix, family.compat_prefix, family.legacy_compat_prefix};
 }
@@ -747,7 +814,7 @@ std::map<std::string, std::string> build_runtime_file_owner_index() {
         for (const auto& owned_path : read_list_file(pkg_name)) {
             if (!runtime_alias_managed_prefix(owned_path)) continue;
             if (!is_multiarch_runtime_alias_candidate(path_basename(owned_path))) continue;
-            owner_index.emplace(owned_path, pkg_name);
+            owner_index.emplace(canonical_multiarch_logical_path(owned_path), pkg_name);
         }
     }
     return owner_index;
@@ -1101,11 +1168,7 @@ bool runtime_alias_pair_for_path(
 }
 
 std::string canonical_runtime_logical_path(const std::string& path) {
-    std::string active_prefix;
-    std::string compat_prefix;
-    std::string name;
-    if (!runtime_alias_pair_for_path(path, &active_prefix, &compat_prefix, &name)) return path;
-    return active_prefix + "/" + name;
+    return canonical_multiarch_logical_path(path);
 }
 
 bool runtime_symlink_target_equivalent(
@@ -1612,11 +1675,12 @@ bool write_package_conffiles(const std::string& pkg_name, const std::vector<std:
 }
 
 std::string find_file_owner(const std::string& pkg_name, const std::string& file_path) {
+    std::string canonical_file_path = canonical_multiarch_logical_path(file_path);
     for (const auto& other : get_installed_packages()) {
         if (other == pkg_name) continue;
         auto other_files = read_list_file(other);
         for (const auto& owned_path : other_files) {
-            if (owned_path == file_path) return other;
+            if (canonical_multiarch_logical_path(owned_path) == canonical_file_path) return other;
         }
     }
     return "";
@@ -1837,7 +1901,7 @@ bool should_backup_replaced_system_file(
     if (lstat(full_path.c_str(), &st) != 0) return false;
     if (path_is_directory_or_directory_symlink(full_path, &st)) return false;
     if (should_preserve_local_config_file(pkg_name, file_path)) return false;
-    if (owned_by_me.count(file_path)) return false;
+    if (owned_by_me.count(canonical_multiarch_logical_path(file_path))) return false;
     return find_file_owner(pkg_name, file_path).empty();
 }
 
@@ -1848,18 +1912,21 @@ std::vector<ReplacedSystemFile> collect_replaced_system_files(
 ) {
     std::vector<ReplacedSystemFile> entries = load_replaced_system_files(pkg_name);
     std::set<std::string> tracked_paths;
-    for (const auto& entry : entries) tracked_paths.insert(entry.path);
+    for (const auto& entry : entries) {
+        tracked_paths.insert(canonical_multiarch_logical_path(entry.path));
+    }
 
     size_t next_index = entries.size();
     for (const auto& file : new_files) {
-        if (tracked_paths.count(file)) continue;
+        std::string canonical_file = canonical_multiarch_logical_path(file);
+        if (tracked_paths.count(canonical_file)) continue;
         if (!should_backup_replaced_system_file(pkg_name, file, owned_by_me)) continue;
 
         ReplacedSystemFile entry;
-        entry.path = file;
+        entry.path = canonical_file;
         entry.backup_path = get_replaced_system_dir(pkg_name) + "/" + std::to_string(next_index++);
         entries.push_back(entry);
-        tracked_paths.insert(file);
+        tracked_paths.insert(canonical_file);
     }
 
     return entries;
@@ -2704,11 +2771,11 @@ bool action_remove_safe(const std::string& pkg_name) {
 
     std::vector<std::string> undo_cmds = load_registered_undo_commands(pkg_name);
 
-    std::vector<std::string> owned_files = read_list_file(pkg_name);
+    std::vector<std::string> owned_files = normalize_owned_manifest_paths(read_list_file(pkg_name));
     bool kernel_payload = file_list_contains_kernel_payload(owned_files);
     std::string kernel_release = kernel_release_from_file_list(owned_files);
     std::string kernel_image_path = kernel_image_path_for_release(kernel_release);
-    std::vector<std::string> conffiles = load_package_conffiles(pkg_name);
+    std::vector<std::string> conffiles = normalize_owned_manifest_paths(load_package_conffiles(pkg_name));
     std::set<std::string> conffile_set(conffiles.begin(), conffiles.end());
     bool runtime_sensitive = files_touch_runtime_linker_state(owned_files);
     sort_paths_for_removal(owned_files);
@@ -2820,7 +2887,7 @@ bool action_purge_safe(const std::string& pkg_name) {
         return false;
     }
 
-    std::vector<std::string> conffiles = load_package_conffiles(pkg_name);
+    std::vector<std::string> conffiles = normalize_owned_manifest_paths(load_package_conffiles(pkg_name));
     sort_paths_for_removal(conffiles);
 
     std::vector<InstallRollbackEntry> purge_rollback_entries;
@@ -2874,7 +2941,7 @@ bool action_retire_safe(const std::string& pkg_name) {
         return false;
     }
 
-    std::vector<std::string> owned_files = read_list_file(pkg_name);
+    std::vector<std::string> owned_files = normalize_owned_manifest_paths(read_list_file(pkg_name));
     bool runtime_sensitive = files_touch_runtime_linker_state(owned_files);
     sort_paths_for_removal(owned_files);
 
@@ -3238,24 +3305,23 @@ std::vector<std::string> get_staged_replaces() {
 
 bool check_collisions(const std::string& pkg_name, const std::vector<std::string>& new_files) {
     // 1. Get current package's file list (for upgrades)
-    std::set<std::string> owned_by_me;
-    auto existing_files = read_list_file(pkg_name);
-    for(const auto& f : existing_files) owned_by_me.insert(f);
+    std::set<std::string> owned_by_me = build_normalized_owned_path_set(read_list_file(pkg_name));
 
     std::vector<std::string> collisions;
 
     for (const auto& file : new_files) {
-        std::string full_path = g_root_prefix + file;
+        std::string canonical_file = canonical_multiarch_logical_path(file);
+        std::string full_path = g_root_prefix + canonical_file;
         if (access(full_path.c_str(), F_OK) == 0) {
              struct stat st;
              if (stat(full_path.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) continue;
-             if (should_preserve_local_config_file(pkg_name, file)) continue;
-             if (owned_by_me.count(file)) continue;
+             if (should_preserve_local_config_file(pkg_name, canonical_file)) continue;
+             if (owned_by_me.count(canonical_file)) continue;
              
              // Special case: Ignore /usr/share/info/dir as it's a shared directory index
-             if (file == "/usr/share/info/dir") continue;
+             if (canonical_file == "/usr/share/info/dir") continue;
 
-             collisions.push_back(file);
+             collisions.push_back(canonical_file);
         }
     }
 
@@ -3271,7 +3337,7 @@ bool check_collisions(const std::string& pkg_name, const std::vector<std::string
             if (other == pkg_name) continue;
             auto other_files = read_list_file(other);
             for (const auto& of : other_files) {
-                if (of == col) {
+                if (canonical_multiarch_logical_path(of) == col) {
                     if (std::find(replaced.begin(), replaced.end(), other) != replaced.end()) {
                         std::cout << "W: Permitted overwrite of " << col << " because " << pkg_name << " replaces " << other << std::endl;
                         owned = true;
@@ -3355,7 +3421,8 @@ bool action_install(const std::string& pkg_file) {
     bool strip_data = detect_data_prefix(data_tar);
     if (strip_data) VLOG("Detected 'data/' prefix. Will strip components.");
     
-    std::vector<std::string> new_files = get_tar_contents(data_tar, strip_data);
+    std::vector<std::string> new_files = collapse_multiarch_install_alias_paths(
+        get_tar_contents(data_tar, strip_data));
     bool runtime_sensitive = files_touch_runtime_linker_state(new_files);
     
     std::string pkg_name;
@@ -3397,8 +3464,7 @@ bool action_install(const std::string& pkg_file) {
     std::set<std::string> old_files_set;
     if (!old_version.empty()) {
         is_upgrade = true;
-        auto old_files_vec = read_list_file(pkg_name);
-        for(const auto& f : old_files_vec) old_files_set.insert(f);
+        old_files_set = build_normalized_owned_path_set(read_list_file(pkg_name));
     }
 
     if (!set_package_status_record(pkg_name, "install", "ok", "half-installed", new_version)) {
@@ -3511,9 +3577,10 @@ bool action_install(const std::string& pkg_file) {
         return false;
     }
 
-    std::vector<std::string> installed_files = new_files;
+    std::vector<std::string> installed_files = normalize_owned_manifest_paths(new_files);
     apply_preserved_config_metadata(installed_files, preserved_configs);
     prune_non_owned_directory_symlink_entries(installed_files, staged_entries);
+    installed_files = normalize_owned_manifest_paths(installed_files);
     std::vector<std::string> conffiles = collect_package_conffiles_from_entries(new_files);
 
     // 6. Register in Database
@@ -3743,7 +3810,7 @@ bool action_verify(const std::string& pkg_name) {
         return false;
     }
 
-    std::vector<std::string> files = read_list_file(pkg_name);
+    std::vector<std::string> files = normalize_owned_manifest_paths(read_list_file(pkg_name));
     if (files.empty()) {
         std::cerr << "E: Package " << pkg_name << " not found or empty." << std::endl;
         return false;
