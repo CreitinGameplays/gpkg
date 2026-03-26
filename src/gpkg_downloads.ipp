@@ -164,6 +164,18 @@ size_t get_cached_package_bytes(const PackageMetadata& meta) {
     return file_size_if_exists(get_cached_package_path(meta));
 }
 
+long get_declared_archive_size_bytes(const PackageMetadata& meta) {
+    if (meta.size.empty()) return -1;
+
+    char* end = nullptr;
+    errno = 0;
+    unsigned long parsed = std::strtoul(meta.size.c_str(), &end, 10);
+    if (errno != 0 || end == meta.size.c_str()) return -1;
+    return parsed > static_cast<unsigned long>(std::numeric_limits<long>::max())
+        ? -1
+        : static_cast<long>(parsed);
+}
+
 bool fetch_package_archive(
     const PackageMetadata& meta,
     size_t index,
@@ -236,6 +248,7 @@ bool fetch_package_archive(
 
     const int max_fetch_attempts = 2;
     std::string last_error;
+    long known_remote_size = get_declared_archive_size_bytes(meta);
     for (int attempt = 1; attempt <= max_fetch_attempts; ++attempt) {
         if (!quiet) {
             std::cout << "Downloading (" << index << "/" << total << ") " << meta.name;
@@ -254,7 +267,8 @@ bool fetch_package_archive(
                 &download_error,
                 network_progress,
                 progress_callback,
-                &transferred
+                &transferred,
+                known_remote_size
             )) {
             remove(local_path.c_str());
             last_error = "failed to download from " + url;
