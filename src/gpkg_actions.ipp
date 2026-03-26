@@ -71,9 +71,15 @@ void finish_progress_line(size_t* last_render_width) {
     *last_render_width = 0;
 }
 
-std::vector<std::string> build_worker_command_argv(const std::string& mode, const std::string& value, bool verbose) {
+std::vector<std::string> build_worker_command_argv(
+    const std::string& mode,
+    const std::string& value,
+    bool verbose,
+    bool defer_runtime_refresh = false
+) {
     std::vector<std::string> argv = {"gpkg-worker", mode, value};
     if (verbose) argv.push_back("--verbose");
+    if (defer_runtime_refresh) argv.push_back("--defer-runtime-linker-refresh");
     if (!ROOT_PREFIX.empty()) {
         argv.push_back("--root");
         argv.push_back(ROOT_PREFIX);
@@ -83,7 +89,7 @@ std::vector<std::string> build_worker_command_argv(const std::string& mode, cons
 
 InstallCommandResult install_package_from_file(const std::string& pkg_file, bool verbose) {
     CommandCaptureResult result = run_command_captured_argv(
-        build_worker_command_argv("--install", pkg_file, verbose),
+        build_worker_command_argv("--install", pkg_file, verbose, true),
         verbose,
         "gpkg-install"
     );
@@ -92,7 +98,7 @@ InstallCommandResult install_package_from_file(const std::string& pkg_file, bool
 
 InstallCommandResult retire_package_by_name(const std::string& pkg_name, bool verbose) {
     CommandCaptureResult result = run_command_captured_argv(
-        build_worker_command_argv("--retire", pkg_name, verbose),
+        build_worker_command_argv("--retire", pkg_name, verbose, true),
         verbose,
         "gpkg-retire"
     );
@@ -101,7 +107,7 @@ InstallCommandResult retire_package_by_name(const std::string& pkg_name, bool ve
 
 InstallCommandResult remove_package_by_name(const std::string& pkg_name, bool verbose) {
     CommandCaptureResult result = run_command_captured_argv(
-        build_worker_command_argv("--remove", pkg_name, verbose),
+        build_worker_command_argv("--remove", pkg_name, verbose, true),
         verbose,
         "gpkg-remove"
     );
@@ -110,7 +116,7 @@ InstallCommandResult remove_package_by_name(const std::string& pkg_name, bool ve
 
 InstallCommandResult purge_package_by_name(const std::string& pkg_name, bool verbose) {
     CommandCaptureResult result = run_command_captured_argv(
-        build_worker_command_argv("--purge", pkg_name, verbose),
+        build_worker_command_argv("--purge", pkg_name, verbose, true),
         verbose,
         "gpkg-purge"
     );
@@ -1856,6 +1862,7 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
         std::vector<std::string> retirements;
         if (should_retire_after_install(upgrade_plan, upgrade_queue[i].name, retirements)) {
             for (const auto& retired_pkg : retirements) {
+                std::vector<std::string> retired_files = read_installed_file_list(retired_pkg);
                 InstallCommandResult retire_result = retire_package_by_name(retired_pkg, verbose);
                 if (!retire_result.success) {
                     if (!verbose) finish_progress_line(&install_progress_width);
@@ -1868,6 +1875,7 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
                     failures.push_back(retired_pkg);
                     break;
                 }
+                check_triggers(retired_files);
                 if (!erase_package_auto_installed_state(retired_pkg)) {
                     if (!verbose) finish_progress_line(&install_progress_width);
                     std::cerr << Color::RED << "E: Failed to update gpkg auto-install state for "
@@ -2071,6 +2079,7 @@ int handle_repair(bool verbose) {
         std::vector<std::string> retirements;
         if (should_retire_after_install(repair_plan, repair_queue[i].name, retirements)) {
             for (const auto& retired_pkg : retirements) {
+                std::vector<std::string> retired_files = read_installed_file_list(retired_pkg);
                 InstallCommandResult retire_result = retire_package_by_name(retired_pkg, verbose);
                 if (!retire_result.success) {
                     if (!verbose) finish_progress_line(&install_progress_width);
@@ -2083,6 +2092,7 @@ int handle_repair(bool verbose) {
                     failures.push_back(retired_pkg);
                     break;
                 }
+                check_triggers(retired_files);
                 if (!erase_package_auto_installed_state(retired_pkg)) {
                     if (!verbose) finish_progress_line(&install_progress_width);
                     std::cerr << Color::RED << "E: Failed to update gpkg auto-install state for "
@@ -2201,6 +2211,7 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
                 std::vector<std::string> retirements;
                 if (should_retire_after_install(local_plan, local_pkg_name, retirements)) {
                     for (const auto& retired_pkg : retirements) {
+                        std::vector<std::string> retired_files = read_installed_file_list(retired_pkg);
                         InstallCommandResult retire_result = retire_package_by_name(retired_pkg, verbose);
                         if (!retire_result.success) {
                             std::cerr << Color::RED << "E: Failed to retire replaced package "
@@ -2211,6 +2222,7 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
                             std::cerr << std::endl;
                             return 1;
                         }
+                        check_triggers(retired_files);
                         if (!erase_package_auto_installed_state(retired_pkg)) {
                             std::cerr << Color::RED << "E: Failed to update gpkg auto-install state for "
                                       << retired_pkg << Color::RESET << std::endl;
@@ -2362,6 +2374,7 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
         std::vector<std::string> retirements;
         if (should_retire_after_install(install_plan, install_queue[i].name, retirements)) {
             for (const auto& retired_pkg : retirements) {
+                std::vector<std::string> retired_files = read_installed_file_list(retired_pkg);
                 InstallCommandResult retire_result = retire_package_by_name(retired_pkg, verbose);
                 if (!retire_result.success) {
                     if (!verbose) finish_progress_line(&install_progress_width);
@@ -2373,6 +2386,7 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
                     std::cerr << std::endl;
                     return 1;
                 }
+                check_triggers(retired_files);
                 if (!erase_package_auto_installed_state(retired_pkg)) {
                     if (!verbose) finish_progress_line(&install_progress_width);
                     std::cerr << Color::RED << "E: Failed to update gpkg auto-install state for "

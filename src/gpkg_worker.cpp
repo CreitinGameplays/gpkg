@@ -118,6 +118,9 @@ bool backup_live_path_if_present(
 // Logging
 bool g_verbose = false;
 size_t g_parallel_jobs = 0;
+bool g_defer_runtime_linker_refresh = false;
+std::vector<PackageStatusRecord> g_status_records_cache;
+bool g_status_records_cache_loaded = false;
 #define VLOG(msg) do { if (g_verbose) std::cout << "[WORKER] " << msg << std::endl; } while(0)
 
 // Utils
@@ -162,7 +165,7 @@ size_t parallel_worker_count_for_tasks(size_t task_count) {
     return std::max<size_t>(1, std::min(task_count, jobs));
 }
 
-std::vector<PackageStatusRecord> load_package_status_records() {
+std::vector<PackageStatusRecord> read_package_status_records_from_disk() {
     std::vector<PackageStatusRecord> records;
     std::ifstream f(get_status_file_path());
     if (!f) return records;
@@ -218,6 +221,18 @@ std::vector<PackageStatusRecord> load_package_status_records() {
     return records;
 }
 
+std::vector<PackageStatusRecord>& mutable_package_status_records() {
+    if (!g_status_records_cache_loaded) {
+        g_status_records_cache = read_package_status_records_from_disk();
+        g_status_records_cache_loaded = true;
+    }
+    return g_status_records_cache;
+}
+
+std::vector<PackageStatusRecord> load_package_status_records() {
+    return mutable_package_status_records();
+}
+
 bool write_package_status_records(const std::vector<PackageStatusRecord>& records) {
     std::vector<PackageStatusRecord> normalized;
     normalized.reserve(records.size());
@@ -242,11 +257,14 @@ bool write_package_status_records(const std::vector<PackageStatusRecord>& record
     }
 
     if (!mkdir_p(g_root_prefix + "/var/lib/gpkg")) return false;
-    return write_text_file_atomic(get_status_file_path(), buffer.str(), 0644);
+    if (!write_text_file_atomic(get_status_file_path(), buffer.str(), 0644)) return false;
+    g_status_records_cache = normalized;
+    g_status_records_cache_loaded = true;
+    return true;
 }
 
 bool get_package_status_record(const std::string& pkg_name, PackageStatusRecord* out) {
-    std::vector<PackageStatusRecord> records = load_package_status_records();
+    const auto& records = mutable_package_status_records();
     for (const auto& record : records) {
         if (record.package != pkg_name) continue;
         if (out) *out = record;
@@ -262,7 +280,7 @@ bool set_package_status_record(
     const std::string& status,
     const std::string& version
 ) {
-    std::vector<PackageStatusRecord> records = load_package_status_records();
+    auto& records = mutable_package_status_records();
     for (auto& record : records) {
         if (record.package != pkg_name) continue;
         record.want = want;
@@ -283,7 +301,7 @@ bool set_package_status_record(
 }
 
 bool erase_package_status_record(const std::string& pkg_name) {
-    std::vector<PackageStatusRecord> records = load_package_status_records();
+    auto& records = mutable_package_status_records();
     size_t original_size = records.size();
     records.erase(
         std::remove_if(records.begin(), records.end(), [&](const PackageStatusRecord& record) {
@@ -386,6 +404,12 @@ bool refresh_linker_cache_if_available() {
     }
 
     return true;
+}
+
+bool finalize_runtime_linker_state_for_success(bool runtime_sensitive) {
+    if (!runtime_sensitive) return true;
+    if (g_defer_runtime_linker_refresh) return true;
+    return refresh_linker_cache_if_available();
 }
 
 struct ScopedEnvOverrides {
@@ -2939,7 +2963,7 @@ bool action_remove_safe(const std::string& pkg_name) {
     }
 
     sync_multiarch_runtime_aliases();
-    if (runtime_sensitive && !refresh_linker_cache_if_available()) {
+    if (!finalize_runtime_linker_state_for_success(runtime_sensitive)) {
         rollback_remove_transaction(pkg_name, removal_rollback_entries, runtime_sensitive, false);
         std::cerr << "E: ldconfig failed after removing runtime files for "
                   << pkg_name << "." << std::endl;
@@ -3047,7 +3071,7 @@ bool action_retire_safe(const std::string& pkg_name) {
     }
 
     sync_multiarch_runtime_aliases();
-    if (runtime_sensitive && !refresh_linker_cache_if_available()) {
+    if (!finalize_runtime_linker_state_for_success(runtime_sensitive)) {
         rollback_install_changes(rollback_entries);
         sync_multiarch_runtime_aliases();
         refresh_linker_cache_if_available();
@@ -3744,7 +3768,7 @@ bool action_install(const std::string& pkg_file) {
         return false;
     }
 
-    if (runtime_sensitive && !refresh_linker_cache_if_available()) {
+    if (!finalize_runtime_linker_state_for_success(runtime_sensitive)) {
         rollback_install_changes(install_rollback_entries);
         sync_multiarch_runtime_aliases();
         refresh_linker_cache_if_available();
@@ -4067,7 +4091,7 @@ int main(int argc, char* argv[]) {
 
     if (argc < 2) {
 
-        std::cout << "Usage: gpkg-worker [options]\nOptions:\n  --install <file>\n  --remove <pkg>\n  --purge <pkg>\n  --retire <pkg>\n  --verify <pkg>\n  --refresh-runtime-linker-state\n  --register-file <path> --pkg <name>\n  --register-undo <cmd> --pkg <name>\n  --jobs <n>\n";
+        std::cout << "Usage: gpkg-worker [options]\nOptions:\n  --install <file>\n  --remove <pkg>\n  --purge <pkg>\n  --retire <pkg>\n  --verify <pkg>\n  --refresh-runtime-linker-state\n  --register-file <path> --pkg <name>\n  --register-undo <cmd> --pkg <name>\n  --jobs <n>\n  --defer-runtime-linker-refresh\n";
 
         return 1;
 
@@ -4107,6 +4131,8 @@ int main(int argc, char* argv[]) {
             }
             g_parallel_jobs = parsed_jobs;
         }
+
+        else if (arg == "--defer-runtime-linker-refresh") g_defer_runtime_linker_refresh = true;
 
         else if (arg == "-v" || arg == "--verbose") g_verbose = true;
 
