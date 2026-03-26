@@ -16,6 +16,9 @@
 #include <iomanip>
 #include <elf.h>
 #include <tuple>
+#include <atomic>
+#include <mutex>
+#include <thread>
 #include "gpkg_archive.ipp"
 
 // Configuration
@@ -114,6 +117,7 @@ bool backup_live_path_if_present(
 
 // Logging
 bool g_verbose = false;
+size_t g_parallel_jobs = 0;
 #define VLOG(msg) do { if (g_verbose) std::cout << "[WORKER] " << msg << std::endl; } while(0)
 
 // Utils
@@ -122,6 +126,40 @@ std::string trim(const std::string& str) {
     if (std::string::npos == first) return str;
     size_t last = str.find_last_not_of(" \t\n\r");
     return str.substr(first, (last - first + 1));
+}
+
+bool parse_parallel_jobs_value(const std::string& text, size_t* out) {
+    if (out) *out = 0;
+
+    std::string trimmed = trim(text);
+    if (trimmed.empty()) return false;
+
+    char* end = nullptr;
+    errno = 0;
+    unsigned long value = std::strtoul(trimmed.c_str(), &end, 10);
+    if (errno != 0 || end == trimmed.c_str()) return false;
+    while (end && *end != '\0' && std::isspace(static_cast<unsigned char>(*end))) ++end;
+    if (end && *end != '\0') return false;
+    if (value == 0) return false;
+
+    if (out) *out = static_cast<size_t>(value);
+    return true;
+}
+
+size_t detected_parallel_jobs() {
+    const char* env_jobs = std::getenv("GPKG_WORKER_JOBS");
+    size_t parsed = 0;
+    if (env_jobs && parse_parallel_jobs_value(env_jobs, &parsed)) return parsed;
+
+    unsigned int hardware = std::thread::hardware_concurrency();
+    if (hardware == 0) return 1;
+    return static_cast<size_t>(hardware);
+}
+
+size_t parallel_worker_count_for_tasks(size_t task_count) {
+    if (task_count == 0) return 1;
+    size_t jobs = g_parallel_jobs > 0 ? g_parallel_jobs : detected_parallel_jobs();
+    return std::max<size_t>(1, std::min(task_count, jobs));
 }
 
 std::vector<PackageStatusRecord> load_package_status_records() {
@@ -2101,39 +2139,36 @@ bool remove_path(const std::string& abs_path) {
 
 std::string normalize_tar_member_path(const std::string& raw_line, bool strip_data);
 
-// Helper to detect if archive has data/ prefix
-bool detect_data_prefix(const std::string& tar_path) {
+struct TarPayloadInspection {
+    bool strip_data = false;
+    std::vector<std::string> paths;
+};
+
+TarPayloadInspection inspect_tar_payload(const std::string& tar_path) {
+    TarPayloadInspection inspection;
     std::vector<GpkgArchive::TarEntry> entries;
     std::string error;
     if (!GpkgArchive::tar_list_entries(tar_path, entries, &error)) {
         VLOG("Failed to inspect tar archive " << tar_path << ": " << error);
-        return false;
+        return inspection;
     }
 
     for (const auto& entry : entries) {
         std::string normalized = trim(entry.path);
         if (normalized.rfind("./", 0) == 0) normalized.erase(0, 2);
-        if (normalized.rfind("data/", 0) == 0 || normalized == "data") return true;
-    }
-    return false;
-}
-
-std::vector<std::string> get_tar_contents(const std::string& tar_path, bool strip_data) {
-    std::vector<std::string> list;
-    std::vector<GpkgArchive::TarEntry> entries;
-    std::string error;
-    if (!GpkgArchive::tar_list_entries(tar_path, entries, &error)) {
-        VLOG("Failed to list tar archive " << tar_path << ": " << error);
-        return list;
+        if (normalized.rfind("data/", 0) == 0 || normalized == "data") {
+            inspection.strip_data = true;
+            break;
+        }
     }
 
     std::set<std::string> seen;
     for (const auto& entry : entries) {
-        std::string line = normalize_tar_member_path(entry.path, strip_data);
+        std::string line = normalize_tar_member_path(entry.path, inspection.strip_data);
         if (line.empty()) continue;
-        if (seen.insert(line).second) list.push_back(line);
+        if (seen.insert(line).second) inspection.paths.push_back(line);
     }
-    return list;
+    return inspection;
 }
 
 std::string normalize_tar_member_path(const std::string& raw_line, bool strip_data) {
@@ -3044,43 +3079,94 @@ bool build_staged_install_entries(
     std::vector<StagedInstallEntry>& entries
 ) {
     entries.clear();
+    if (new_files.empty()) return true;
 
-    for (const auto& path : new_files) {
-        std::string staged_path = payload_root + path;
-        struct stat st;
-        if (lstat(staged_path.c_str(), &st) != 0) {
-            if (errno == ENOENT) continue;
-            std::cerr << "E: Failed to inspect staged payload entry " << staged_path
-                      << ": " << strerror(errno) << std::endl;
-            return false;
-        }
+    const size_t worker_count = parallel_worker_count_for_tasks(new_files.size());
+    VLOG("Inspecting staged payload with up to " << worker_count << " worker(s).");
 
-        StagedInstallEntry entry;
-        entry.path = path;
-        entry.staged_path = staged_path;
-        entry.is_directory = S_ISDIR(st.st_mode);
-        entry.is_symlink = S_ISLNK(st.st_mode);
-        entry.mode = st.st_mode;
-        entry.depth = path_depth(path);
+    std::vector<StagedInstallEntry> discovered(new_files.size());
+    std::vector<unsigned char> present(new_files.size(), 0);
+    std::atomic<size_t> next_index{0};
+    std::atomic<bool> failed{false};
+    std::string error_message;
+    std::mutex error_mutex;
 
-        if (entry.is_symlink) {
-            std::vector<char> target(static_cast<size_t>(st.st_size) + 2, '\0');
-            ssize_t len = readlink(staged_path.c_str(), target.data(), target.size() - 1);
-            if (len < 0) {
-                std::cerr << "E: Failed to read staged symlink " << staged_path << ": "
-                          << strerror(errno) << std::endl;
-                return false;
+    auto worker = [&]() {
+        while (!failed.load(std::memory_order_relaxed)) {
+            size_t index = next_index.fetch_add(1);
+            if (index >= new_files.size()) return;
+
+            const std::string& path = new_files[index];
+            std::string staged_path = payload_root + path;
+            struct stat st {};
+            if (lstat(staged_path.c_str(), &st) != 0) {
+                if (errno == ENOENT) continue;
+                std::lock_guard<std::mutex> lock(error_mutex);
+                if (error_message.empty()) {
+                    error_message = "E: Failed to inspect staged payload entry " + staged_path +
+                        ": " + std::string(strerror(errno));
+                }
+                failed.store(true, std::memory_order_relaxed);
+                return;
             }
-            target[static_cast<size_t>(len)] = '\0';
-            entry.symlink_target.assign(target.data(), static_cast<size_t>(len));
-        }
 
-        if (!entry.is_directory && !entry.is_symlink && !S_ISREG(st.st_mode)) {
-            std::cerr << "E: Unsupported staged payload entry type for " << path << std::endl;
-            return false;
-        }
+            StagedInstallEntry entry;
+            entry.path = path;
+            entry.staged_path = staged_path;
+            entry.is_directory = S_ISDIR(st.st_mode);
+            entry.is_symlink = S_ISLNK(st.st_mode);
+            entry.mode = st.st_mode;
+            entry.depth = path_depth(path);
 
-        entries.push_back(entry);
+            if (entry.is_symlink) {
+                std::vector<char> target(static_cast<size_t>(st.st_size) + 2, '\0');
+                ssize_t len = readlink(staged_path.c_str(), target.data(), target.size() - 1);
+                if (len < 0) {
+                    std::lock_guard<std::mutex> lock(error_mutex);
+                    if (error_message.empty()) {
+                        error_message = "E: Failed to read staged symlink " + staged_path +
+                            ": " + std::string(strerror(errno));
+                    }
+                    failed.store(true, std::memory_order_relaxed);
+                    return;
+                }
+                target[static_cast<size_t>(len)] = '\0';
+                entry.symlink_target.assign(target.data(), static_cast<size_t>(len));
+            }
+
+            if (!entry.is_directory && !entry.is_symlink && !S_ISREG(st.st_mode)) {
+                std::lock_guard<std::mutex> lock(error_mutex);
+                if (error_message.empty()) {
+                    error_message = "E: Unsupported staged payload entry type for " + path;
+                }
+                failed.store(true, std::memory_order_relaxed);
+                return;
+            }
+
+            discovered[index] = std::move(entry);
+            present[index] = 1;
+        }
+    };
+
+    std::vector<std::thread> workers;
+    workers.reserve(worker_count > 0 ? worker_count - 1 : 0);
+    for (size_t worker_index = 1; worker_index < worker_count; ++worker_index) {
+        workers.emplace_back(worker);
+    }
+    worker();
+    for (auto& thread : workers) {
+        thread.join();
+    }
+
+    if (failed.load(std::memory_order_relaxed)) {
+        if (!error_message.empty()) std::cerr << error_message << std::endl;
+        return false;
+    }
+
+    entries.reserve(new_files.size());
+    for (size_t index = 0; index < discovered.size(); ++index) {
+        if (present[index] == 0) continue;
+        entries.push_back(std::move(discovered[index]));
     }
 
     std::sort(entries.begin(), entries.end(), [](const StagedInstallEntry& left, const StagedInstallEntry& right) {
@@ -3232,64 +3318,103 @@ bool verify_staged_install_entries(
 ) {
     issues.clear();
     std::set<std::tuple<std::string, std::string, std::string>> runtime_alias_candidates;
+    if (!entries.empty()) {
+        const size_t worker_count = parallel_worker_count_for_tasks(entries.size());
+        VLOG("Verifying installed payload with up to " << worker_count << " worker(s).");
 
-    for (const auto& entry : entries) {
-        std::string live_full_path = g_root_prefix + entry.path;
-        struct stat live_st;
-        if (lstat(live_full_path.c_str(), &live_st) != 0) {
-            issues.push_back(entry.path + ": installed path is missing");
-            continue;
-        }
+        std::atomic<size_t> next_index{0};
+        std::vector<std::vector<std::string>> worker_issues(worker_count);
+        std::vector<std::set<std::tuple<std::string, std::string, std::string>>> worker_aliases(worker_count);
 
-        if (entry.is_directory) {
-            if (S_ISDIR(live_st.st_mode)) {
+        auto worker = [&](size_t worker_index) {
+            auto& local_issues = worker_issues[worker_index];
+            auto& local_aliases = worker_aliases[worker_index];
+
+            while (true) {
+                size_t index = next_index.fetch_add(1);
+                if (index >= entries.size()) return;
+
+                const auto& entry = entries[index];
+                std::string live_full_path = g_root_prefix + entry.path;
+                struct stat live_st {};
+                if (lstat(live_full_path.c_str(), &live_st) != 0) {
+                    local_issues.push_back(entry.path + ": installed path is missing");
+                    continue;
+                }
+
+                if (entry.is_directory) {
+                    if (S_ISDIR(live_st.st_mode)) {
+                        std::string active_prefix;
+                        std::string compat_prefix;
+                        std::string name;
+                        if (runtime_alias_pair_for_path(entry.path, &active_prefix, &compat_prefix, &name)) {
+                            local_aliases.insert(std::make_tuple(active_prefix, compat_prefix, name));
+                        }
+                        continue;
+                    }
+                    if (S_ISLNK(live_st.st_mode) && is_existing_symlink_directory(live_full_path)) continue;
+                    local_issues.push_back(entry.path + ": expected directory after install");
+                    continue;
+                }
+
+                if (entry.is_symlink) {
+                    if (!S_ISLNK(live_st.st_mode)) {
+                        local_issues.push_back(entry.path + ": expected symlink after install");
+                        continue;
+                    }
+                    std::string live_target = read_symlink_target(live_full_path);
+                    if (!runtime_symlink_target_equivalent(entry.path, entry.symlink_target, live_target)) {
+                        local_issues.push_back(entry.path + ": symlink target differs from staged payload");
+                        continue;
+                    }
+                } else {
+                    if (!S_ISREG(live_st.st_mode)) {
+                        local_issues.push_back(entry.path + ": expected regular file after install");
+                        continue;
+                    }
+
+                    std::string compare_error;
+                    if (!compare_regular_files_exact(entry.staged_path, live_full_path, &compare_error)) {
+                        local_issues.push_back(entry.path + ": " + compare_error);
+                        continue;
+                    }
+
+                    std::string elf_error;
+                    if (!validate_elf_file(live_full_path, live_st.st_size, &elf_error)) {
+                        local_issues.push_back(entry.path + ": " + elf_error);
+                        continue;
+                    }
+                }
+
                 std::string active_prefix;
                 std::string compat_prefix;
                 std::string name;
                 if (runtime_alias_pair_for_path(entry.path, &active_prefix, &compat_prefix, &name)) {
-                    runtime_alias_candidates.insert(std::make_tuple(active_prefix, compat_prefix, name));
+                    local_aliases.insert(std::make_tuple(active_prefix, compat_prefix, name));
                 }
-                continue;
             }
-            if (S_ISLNK(live_st.st_mode) && is_existing_symlink_directory(live_full_path)) continue;
-            issues.push_back(entry.path + ": expected directory after install");
-            continue;
+        };
+
+        std::vector<std::thread> workers;
+        workers.reserve(worker_count > 0 ? worker_count - 1 : 0);
+        for (size_t worker_index = 1; worker_index < worker_count; ++worker_index) {
+            workers.emplace_back(worker, worker_index);
+        }
+        worker(0);
+        for (auto& thread : workers) {
+            thread.join();
         }
 
-        if (entry.is_symlink) {
-            if (!S_ISLNK(live_st.st_mode)) {
-                issues.push_back(entry.path + ": expected symlink after install");
-                continue;
-            }
-            std::string live_target = read_symlink_target(live_full_path);
-            if (!runtime_symlink_target_equivalent(entry.path, entry.symlink_target, live_target)) {
-                issues.push_back(entry.path + ": symlink target differs from staged payload");
-                continue;
-            }
-        } else {
-            if (!S_ISREG(live_st.st_mode)) {
-                issues.push_back(entry.path + ": expected regular file after install");
-                continue;
-            }
-
-            std::string compare_error;
-            if (!compare_regular_files_exact(entry.staged_path, live_full_path, &compare_error)) {
-                issues.push_back(entry.path + ": " + compare_error);
-                continue;
-            }
-
-            std::string elf_error;
-            if (!validate_elf_file(live_full_path, live_st.st_size, &elf_error)) {
-                issues.push_back(entry.path + ": " + elf_error);
-                continue;
-            }
-        }
-
-        std::string active_prefix;
-        std::string compat_prefix;
-        std::string name;
-        if (runtime_alias_pair_for_path(entry.path, &active_prefix, &compat_prefix, &name)) {
-            runtime_alias_candidates.insert(std::make_tuple(active_prefix, compat_prefix, name));
+        for (size_t worker_index = 0; worker_index < worker_count; ++worker_index) {
+            issues.insert(
+                issues.end(),
+                worker_issues[worker_index].begin(),
+                worker_issues[worker_index].end()
+            );
+            runtime_alias_candidates.insert(
+                worker_aliases[worker_index].begin(),
+                worker_aliases[worker_index].end()
+            );
         }
     }
 
@@ -3468,11 +3593,12 @@ bool action_install(const std::string& pkg_file) {
     }
 
     // 2. Get File List & Pkg Name
-    bool strip_data = detect_data_prefix(data_tar);
+    TarPayloadInspection payload_inspection = inspect_tar_payload(data_tar);
+    bool strip_data = payload_inspection.strip_data;
     if (strip_data) VLOG("Detected 'data/' prefix. Will strip components.");
     
     std::vector<std::string> new_files = collapse_multiarch_install_alias_paths(
-        get_tar_contents(data_tar, strip_data));
+        payload_inspection.paths);
     bool runtime_sensitive = files_touch_runtime_linker_state(new_files);
     
     std::string pkg_name;
@@ -3941,7 +4067,7 @@ int main(int argc, char* argv[]) {
 
     if (argc < 2) {
 
-        std::cout << "Usage: gpkg-worker [options]\nOptions:\n  --install <file>\n  --remove <pkg>\n  --purge <pkg>\n  --retire <pkg>\n  --verify <pkg>\n  --refresh-runtime-linker-state\n  --register-file <path> --pkg <name>\n  --register-undo <cmd> --pkg <name>\n";
+        std::cout << "Usage: gpkg-worker [options]\nOptions:\n  --install <file>\n  --remove <pkg>\n  --purge <pkg>\n  --retire <pkg>\n  --verify <pkg>\n  --refresh-runtime-linker-state\n  --register-file <path> --pkg <name>\n  --register-undo <cmd> --pkg <name>\n  --jobs <n>\n";
 
         return 1;
 
@@ -3972,6 +4098,15 @@ int main(int argc, char* argv[]) {
         else if (arg == "--pkg") pkg_name = argv[++i];
 
         else if (arg == "--root") g_root_prefix = argv[++i];
+
+        else if (arg == "--jobs") {
+            size_t parsed_jobs = 0;
+            if (i + 1 >= argc || !parse_parallel_jobs_value(argv[++i], &parsed_jobs)) {
+                std::cerr << "Invalid value for --jobs.\n";
+                return 1;
+            }
+            g_parallel_jobs = parsed_jobs;
+        }
 
         else if (arg == "-v" || arg == "--verbose") g_verbose = true;
 

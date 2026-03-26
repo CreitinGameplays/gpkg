@@ -21,6 +21,7 @@ struct DebianPackageRecord {
     std::string filename;
     std::string sha256;
     std::string size;
+    std::string installed_size;
     std::string depends_raw;
     std::string pre_depends_raw;
     std::string recommends_raw;
@@ -459,6 +460,7 @@ std::string package_metadata_to_json(const PackageMetadata& meta) {
     fields.push_back(json_string_field("debian_version", meta.debian_version));
     fields.push_back(json_string_field("installed_from", meta.installed_from));
     fields.push_back(json_string_field("size", meta.size));
+    fields.push_back(json_string_field("installed_size_bytes", meta.installed_size_bytes));
     if (!meta.sha256.empty()) fields.push_back(json_string_field("sha256", meta.sha256));
     if (!meta.sha512.empty()) fields.push_back(json_string_field("sha512", meta.sha512));
 
@@ -503,6 +505,7 @@ std::vector<DebianPackageRecord> parse_debian_packages_file(
         record.filename = get_field("Filename");
         record.sha256 = get_field("SHA256");
         record.size = get_field("Size");
+        record.installed_size = get_field("Installed-Size");
         record.pre_depends_raw = get_field("Pre-Depends");
         record.depends_raw = get_field("Depends");
         record.recommends_raw = get_field("Recommends");
@@ -521,6 +524,22 @@ std::vector<DebianPackageRecord> parse_debian_packages_file(
     }
 
     return parsed;
+}
+
+std::string debian_installed_size_kib_to_bytes_string(const std::string& kib_text) {
+    std::string trimmed = trim(kib_text);
+    if (trimmed.empty()) return "";
+
+    char* end = nullptr;
+    errno = 0;
+    unsigned long long kib = std::strtoull(trimmed.c_str(), &end, 10);
+    if (errno != 0 || end == trimmed.c_str()) return "";
+    while (end && *end != '\0' && std::isspace(static_cast<unsigned char>(*end))) ++end;
+    if (end && *end != '\0') return "";
+
+    constexpr unsigned long long kBytesPerKib = 1024ULL;
+    if (kib > std::numeric_limits<unsigned long long>::max() / kBytesPerKib) return "";
+    return std::to_string(kib * kBytesPerKib);
 }
 
 std::map<std::string, std::vector<std::string>> build_debian_provider_map(
@@ -639,6 +658,7 @@ PackageMetadata build_debian_package_metadata(
     meta.section = sanitize_section_name(package_override.section.empty() ? record.section : package_override.section);
     meta.priority = record.priority;
     meta.size = record.size;
+    meta.installed_size_bytes = debian_installed_size_kib_to_bytes_string(record.installed_size);
     meta.depends = depends;
     meta.recommends = recommends;
     meta.suggests = suggests;

@@ -377,6 +377,159 @@ bool package_status_is_installed_like(const std::string& state) {
            state == "installed";
 }
 
+bool write_package_auto_state_records(const std::vector<PackageAutoStateRecord>& records) {
+    std::vector<PackageAutoStateRecord> normalized;
+    normalized.reserve(records.size());
+    for (const auto& record : records) {
+        if (record.package.empty() || !record.auto_installed) continue;
+        normalized.push_back(record);
+    }
+
+    std::sort(normalized.begin(), normalized.end(), [](const PackageAutoStateRecord& left, const PackageAutoStateRecord& right) {
+        return left.package < right.package;
+    });
+    normalized.erase(
+        std::unique(normalized.begin(), normalized.end(), [](const PackageAutoStateRecord& left, const PackageAutoStateRecord& right) {
+            return left.package == right.package;
+        }),
+        normalized.end()
+    );
+
+    if (normalized.empty()) {
+        return unlink(EXTENDED_STATES_FILE.c_str()) == 0 || errno == ENOENT;
+    }
+
+    if (!mkdir_p(ROOT_PREFIX + "/var/lib/gpkg")) return false;
+
+    std::string pattern = ROOT_PREFIX + "/var/lib/gpkg/.extended_states.XXXXXX";
+    std::vector<char> tmpl(pattern.begin(), pattern.end());
+    tmpl.push_back('\0');
+    int fd = mkstemp(tmpl.data());
+    if (fd < 0) return false;
+
+    std::ostringstream out;
+    for (const auto& record : normalized) {
+        out << "Package: " << record.package << "\n";
+        out << "Auto-Installed: 1\n\n";
+    }
+    std::string content = out.str();
+
+    bool ok = true;
+    ssize_t remaining = static_cast<ssize_t>(content.size());
+    const char* cursor = content.data();
+    while (remaining > 0) {
+        ssize_t written = write(fd, cursor, static_cast<size_t>(remaining));
+        if (written < 0) {
+            ok = false;
+            break;
+        }
+        remaining -= written;
+        cursor += written;
+    }
+    if (ok && fsync(fd) != 0) ok = false;
+    close(fd);
+
+    if (!ok) {
+        unlink(tmpl.data());
+        return false;
+    }
+    if (rename(tmpl.data(), EXTENDED_STATES_FILE.c_str()) != 0) {
+        unlink(tmpl.data());
+        return false;
+    }
+    return true;
+}
+
+std::vector<PackageAutoStateRecord> load_package_auto_state_records() {
+    std::vector<PackageAutoStateRecord> records;
+    std::ifstream f(EXTENDED_STATES_FILE);
+    if (!f) return records;
+
+    PackageAutoStateRecord current;
+    bool have_content = false;
+    std::string line;
+    auto flush_record = [&]() {
+        if (current.package.empty()) {
+            current = PackageAutoStateRecord{};
+            have_content = false;
+            return;
+        }
+
+        if (current.auto_installed) records.push_back(current);
+        current = PackageAutoStateRecord{};
+        have_content = false;
+    };
+
+    while (std::getline(f, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty()) {
+            flush_record();
+            continue;
+        }
+
+        size_t colon = line.find(':');
+        if (colon == std::string::npos) continue;
+
+        std::string key = trim(line.substr(0, colon));
+        std::string value = trim(line.substr(colon + 1));
+        if (key.empty()) continue;
+
+        have_content = true;
+        if (key == "Package") {
+            current.package = value;
+        } else if (key == "Auto-Installed") {
+            current.auto_installed =
+                value == "1" || value == "yes" || value == "true" || value == "True";
+        }
+    }
+
+    if (have_content) flush_record();
+    return records;
+}
+
+bool get_package_auto_installed_state(const std::string& pkg_name, bool* out_auto) {
+    if (out_auto) *out_auto = false;
+    for (const auto& record : load_package_auto_state_records()) {
+        if (record.package != pkg_name) continue;
+        if (out_auto) *out_auto = record.auto_installed;
+        return true;
+    }
+    return false;
+}
+
+bool set_package_auto_installed_state(const std::string& pkg_name, bool auto_installed) {
+    std::vector<PackageAutoStateRecord> records = load_package_auto_state_records();
+    bool found = false;
+    for (auto& record : records) {
+        if (record.package != pkg_name) continue;
+        record.auto_installed = auto_installed;
+        found = true;
+        break;
+    }
+
+    if (!found && auto_installed) {
+        PackageAutoStateRecord record;
+        record.package = pkg_name;
+        record.auto_installed = true;
+        records.push_back(record);
+    }
+
+    return write_package_auto_state_records(records);
+}
+
+bool erase_package_auto_installed_state(const std::string& pkg_name) {
+    std::vector<PackageAutoStateRecord> records = load_package_auto_state_records();
+    size_t original_size = records.size();
+    records.erase(
+        std::remove_if(records.begin(), records.end(), [&](const PackageAutoStateRecord& record) {
+            return record.package == pkg_name;
+        }),
+        records.end()
+    );
+    if (records.size() == original_size) return true;
+    return write_package_auto_state_records(records);
+}
+
 bool get_json_value(const std::string& obj, const std::string& key, std::string& out_val) {
     size_t key_pos = obj.find("\"" + key + "\"");
     if (key_pos == std::string::npos) return false;

@@ -32,6 +32,7 @@ bool get_installed_package_metadata(const std::string& pkg_name, PackageMetadata
     get_json_value(content, "package_scope", out_meta.package_scope);
     get_json_value(content, "installed_from", out_meta.installed_from);
     get_json_value(content, "size", out_meta.size);
+    get_json_value(content, "installed_size_bytes", out_meta.installed_size_bytes);
     get_json_array(content, "depends", out_meta.depends);
     get_json_array(content, "recommends", out_meta.recommends);
     get_json_array(content, "suggests", out_meta.suggests);

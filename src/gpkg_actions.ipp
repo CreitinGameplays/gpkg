@@ -117,6 +117,10 @@ InstallCommandResult purge_package_by_name(const std::string& pkg_name, bool ver
     return {result.exit_code == 0, result.log_path};
 }
 
+bool package_is_config_files_only(const std::string& pkg_name, std::string* out_version = nullptr);
+bool package_is_removal_protected(const std::string& pkg_name, std::string* reason_out = nullptr);
+std::set<std::string> get_autoremove_protected_kernel_packages(bool verbose);
+
 std::string get_install_archive_path(const PackageMetadata& meta) {
     if (package_is_debian_source(meta)) return get_imported_gpkg_path(meta);
     return get_cached_package_path(meta);
@@ -220,6 +224,234 @@ bool prepare_install_archives(
 
 InstallCommandResult install_package_v2(const PackageMetadata& meta, bool verbose) {
     return install_package_from_file(get_install_archive_path(meta), verbose);
+}
+
+bool parse_decimal_u64(const std::string& text, uint64_t* out) {
+    if (out) *out = 0;
+
+    std::string trimmed = trim(text);
+    if (trimmed.empty()) return false;
+
+    char* end = nullptr;
+    errno = 0;
+    unsigned long long value = std::strtoull(trimmed.c_str(), &end, 10);
+    if (errno != 0 || end == trimmed.c_str()) return false;
+    while (end && *end != '\0' && std::isspace(static_cast<unsigned char>(*end))) ++end;
+    if (end && *end != '\0') return false;
+
+    if (out) *out = static_cast<uint64_t>(value);
+    return true;
+}
+
+std::string installed_conffile_manifest_path(const std::string& pkg_name) {
+    return INFO_DIR + pkg_name + ".conffiles";
+}
+
+uint64_t saturating_add_u64(uint64_t left, uint64_t right) {
+    if (right > std::numeric_limits<uint64_t>::max() - left) {
+        return std::numeric_limits<uint64_t>::max();
+    }
+    return left + right;
+}
+
+int64_t saturating_add_i64(int64_t left, int64_t right) {
+    if (right > 0 && left > std::numeric_limits<int64_t>::max() - right) {
+        return std::numeric_limits<int64_t>::max();
+    }
+    if (right < 0 && left < std::numeric_limits<int64_t>::min() - right) {
+        return std::numeric_limits<int64_t>::min();
+    }
+    return left + right;
+}
+
+int64_t signed_disk_delta(uint64_t added, uint64_t removed) {
+    if (added >= removed) {
+        uint64_t delta = added - removed;
+        if (delta > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+            return std::numeric_limits<int64_t>::max();
+        }
+        return static_cast<int64_t>(delta);
+    }
+
+    uint64_t freed = removed - added;
+    if (freed > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+        return std::numeric_limits<int64_t>::min() + 1;
+    }
+    return -static_cast<int64_t>(freed);
+}
+
+bool estimate_declared_installed_bytes(const PackageMetadata& meta, uint64_t* bytes_out, bool* approximate_out = nullptr) {
+    if (bytes_out) *bytes_out = 0;
+    if (approximate_out) *approximate_out = false;
+
+    uint64_t parsed = 0;
+    if (parse_decimal_u64(meta.installed_size_bytes, &parsed)) {
+        if (bytes_out) *bytes_out = parsed;
+        return true;
+    }
+    if (parse_decimal_u64(meta.size, &parsed)) {
+        if (bytes_out) *bytes_out = parsed;
+        if (approximate_out) *approximate_out = true;
+        return true;
+    }
+
+    if (approximate_out) *approximate_out = true;
+    return false;
+}
+
+uint64_t measure_live_path_bytes_no_follow(const std::string& full_path) {
+    struct stat st {};
+    if (lstat(full_path.c_str(), &st) != 0) return 0;
+
+    if (S_ISDIR(st.st_mode) && !S_ISLNK(st.st_mode)) return 0;
+
+    if (st.st_size <= 0) return 0;
+    return static_cast<uint64_t>(st.st_size);
+}
+
+uint64_t measure_manifest_payload_bytes(
+    const std::vector<std::string>& paths,
+    const std::set<std::string>* exclude_paths = nullptr
+) {
+    std::set<std::string> seen;
+    uint64_t total = 0;
+    for (const auto& path : paths) {
+        if (path.empty()) continue;
+        if (exclude_paths && exclude_paths->count(path) != 0) continue;
+        if (!seen.insert(path).second) continue;
+        total = saturating_add_u64(total, measure_live_path_bytes_no_follow(ROOT_PREFIX + path));
+    }
+    return total;
+}
+
+uint64_t estimate_current_installed_payload_bytes(
+    const std::string& pkg_name,
+    bool include_conffiles,
+    bool* approximate_out = nullptr
+) {
+    if (approximate_out) *approximate_out = false;
+
+    std::vector<std::string> installed_files = read_installed_file_list(pkg_name);
+    std::set<std::string> excluded_paths;
+    if (!include_conffiles) {
+        std::vector<std::string> conffiles = load_dependency_entries(installed_conffile_manifest_path(pkg_name));
+        excluded_paths.insert(conffiles.begin(), conffiles.end());
+    }
+
+    uint64_t measured = measure_manifest_payload_bytes(
+        installed_files,
+        excluded_paths.empty() ? nullptr : &excluded_paths
+    );
+    if (measured != 0) return measured;
+
+    PackageMetadata installed_meta;
+    if (get_installed_package_metadata(pkg_name, installed_meta)) {
+        bool declared_approximate = false;
+        uint64_t declared = 0;
+        if (estimate_declared_installed_bytes(installed_meta, &declared, &declared_approximate)) {
+            if (approximate_out) *approximate_out = declared_approximate;
+            return declared;
+        }
+    }
+
+    if (approximate_out) *approximate_out = true;
+    return 0;
+}
+
+uint64_t estimate_current_purge_only_bytes(const std::string& pkg_name, bool* approximate_out = nullptr) {
+    if (approximate_out) *approximate_out = false;
+
+    std::vector<std::string> conffiles = load_dependency_entries(installed_conffile_manifest_path(pkg_name));
+    uint64_t measured = measure_manifest_payload_bytes(conffiles);
+    if (measured != 0) return measured;
+
+    if (approximate_out) *approximate_out = true;
+    return 0;
+}
+
+struct TransactionDiskEstimate {
+    int64_t net_bytes = 0;
+    bool approximate = false;
+};
+
+TransactionDiskEstimate estimate_install_transaction_disk_change(
+    const std::vector<PackageMetadata>& packages,
+    bool include_retirement_uncertainty
+) {
+    TransactionDiskEstimate estimate;
+    estimate.approximate = include_retirement_uncertainty;
+
+    for (const auto& pkg : packages) {
+        uint64_t target_bytes = 0;
+        bool target_approximate = false;
+        if (!estimate_declared_installed_bytes(pkg, &target_bytes, &target_approximate)) {
+            target_approximate = true;
+        }
+
+        uint64_t current_bytes = 0;
+        bool current_approximate = false;
+        if (is_installed(pkg.name)) {
+            current_bytes = estimate_current_installed_payload_bytes(pkg.name, true, &current_approximate);
+        } else if (package_is_base_system_provided(pkg.name)) {
+            current_approximate = true;
+        }
+
+        estimate.approximate = estimate.approximate || target_approximate || current_approximate;
+        estimate.net_bytes = saturating_add_i64(
+            estimate.net_bytes,
+            signed_disk_delta(target_bytes, current_bytes)
+        );
+    }
+
+    return estimate;
+}
+
+TransactionDiskEstimate estimate_removal_transaction_disk_change(
+    const std::vector<std::string>& to_remove,
+    const std::vector<std::string>& to_purge
+) {
+    TransactionDiskEstimate estimate;
+    std::set<std::string> removed_packages(to_remove.begin(), to_remove.end());
+
+    for (const auto& pkg : to_remove) {
+        bool approximate = false;
+        uint64_t bytes = estimate_current_installed_payload_bytes(pkg, false, &approximate);
+        estimate.approximate = estimate.approximate || approximate;
+        estimate.net_bytes = saturating_add_i64(estimate.net_bytes, signed_disk_delta(0, bytes));
+    }
+
+    for (const auto& pkg : to_purge) {
+        bool approximate = false;
+        uint64_t bytes = estimate_current_purge_only_bytes(pkg, &approximate);
+        if (removed_packages.count(pkg) == 0) {
+            estimate.approximate = estimate.approximate || approximate;
+            estimate.net_bytes = saturating_add_i64(estimate.net_bytes, signed_disk_delta(0, bytes));
+            continue;
+        }
+
+        estimate.approximate = estimate.approximate || approximate;
+        estimate.net_bytes = saturating_add_i64(estimate.net_bytes, signed_disk_delta(0, bytes));
+    }
+
+    return estimate;
+}
+
+void print_transaction_disk_change_summary(const TransactionDiskEstimate& estimate) {
+    if (estimate.net_bytes == 0) return;
+
+    uint64_t absolute = estimate.net_bytes < 0
+        ? static_cast<uint64_t>(-(estimate.net_bytes + 1)) + 1
+        : static_cast<uint64_t>(estimate.net_bytes);
+
+    std::cout << "After this operation, ";
+    if (estimate.approximate) std::cout << "about ";
+    std::cout << format_total_bytes(absolute);
+    if (estimate.net_bytes > 0) {
+        std::cout << " of additional disk space will be used.";
+    } else {
+        std::cout << " of disk space will be freed.";
+    }
+    std::cout << std::endl;
 }
 
 std::string read_package_name_from_archive(const std::string& pkg_file) {
@@ -382,7 +614,241 @@ std::vector<std::string> get_registered_package_names() {
     return std::vector<std::string>(package_names.begin(), package_names.end());
 }
 
-bool package_is_config_files_only(const std::string& pkg_name, std::string* out_version = nullptr) {
+std::set<std::string> get_registered_installed_package_set(const std::set<std::string>& excluding = {}) {
+    std::set<std::string> installed;
+    for (const auto& pkg : get_registered_package_names()) {
+        if (excluding.count(pkg) != 0) continue;
+        if (!is_installed(pkg)) continue;
+        installed.insert(pkg);
+    }
+    return installed;
+}
+
+bool update_package_auto_install_state_after_install(
+    const std::string& pkg_name,
+    bool should_be_manual,
+    const std::set<std::string>& previously_registered
+) {
+    if (pkg_name.empty()) return true;
+    if (should_be_manual) return set_package_auto_installed_state(pkg_name, false);
+    if (previously_registered.count(pkg_name) != 0) return true;
+    return set_package_auto_installed_state(pkg_name, true);
+}
+
+std::string resolve_requested_package_for_manual_marking(
+    const std::string& requested_name,
+    const std::vector<PackageMetadata>& planned_queue,
+    const std::set<std::string>& installed_cache,
+    bool verbose
+) {
+    Dependency requested_dep{canonicalize_package_name(requested_name, verbose), "", ""};
+    for (const auto& meta : planned_queue) {
+        if (package_metadata_satisfies_dependency(meta.name, meta, requested_dep)) {
+            return meta.name;
+        }
+    }
+
+    std::string provider_name;
+    if (find_installed_dependency_provider(requested_dep, installed_cache, &provider_name)) {
+        return provider_name;
+    }
+
+    std::string installed_ver;
+    if (is_installed(requested_dep.name, &installed_ver)) return requested_dep.name;
+    return "";
+}
+
+std::set<std::string> compute_needed_installed_packages(
+    const std::set<std::string>& installed_cache,
+    const std::set<std::string>& protected_kernel_packages,
+    bool verbose
+) {
+    (void)verbose;
+    std::set<std::string> needed;
+    std::vector<std::string> queue;
+
+    for (const auto& pkg : installed_cache) {
+        std::string protection_reason;
+        bool auto_installed = false;
+        get_package_auto_installed_state(pkg, &auto_installed);
+        if (!auto_installed ||
+            package_is_removal_protected(pkg, &protection_reason) ||
+            protected_kernel_packages.count(pkg) != 0) {
+            if (needed.insert(pkg).second) queue.push_back(pkg);
+        }
+    }
+
+    for (size_t index = 0; index < queue.size(); ++index) {
+        PackageMetadata meta;
+        if (!get_installed_package_metadata(queue[index], meta)) continue;
+
+        for (const auto& dep_str : collect_transaction_dependency_edges(meta)) {
+            Dependency dep = parse_dependency(dep_str);
+            if (dep.name.empty()) continue;
+
+            std::string provider_name;
+            if (!find_installed_dependency_provider(dep, installed_cache, &provider_name)) continue;
+            if (provider_name.empty()) continue;
+            if (needed.insert(provider_name).second) queue.push_back(provider_name);
+        }
+    }
+
+    return needed;
+}
+
+std::vector<std::string> collect_autoremove_packages(
+    const std::set<std::string>& preplanned_removals,
+    bool verbose,
+    std::set<std::string>* kept_kernel_packages_out = nullptr,
+    std::map<std::string, std::string>* kept_protected_packages_out = nullptr
+) {
+    std::set<std::string> protected_kernel_packages = get_autoremove_protected_kernel_packages(verbose);
+    if (kept_kernel_packages_out) kept_kernel_packages_out->clear();
+    if (kept_protected_packages_out) kept_protected_packages_out->clear();
+
+    std::set<std::string> remaining_installed = get_registered_installed_package_set(preplanned_removals);
+    std::set<std::string> needed = compute_needed_installed_packages(
+        remaining_installed,
+        protected_kernel_packages,
+        verbose
+    );
+
+    std::vector<std::string> removable;
+    for (const auto& pkg : remaining_installed) {
+        bool auto_installed = false;
+        if (!get_package_auto_installed_state(pkg, &auto_installed) || !auto_installed) continue;
+
+        std::string protection_reason;
+        if (package_is_removal_protected(pkg, &protection_reason)) {
+            if (kept_protected_packages_out) (*kept_protected_packages_out)[pkg] = protection_reason;
+            continue;
+        }
+        if (protected_kernel_packages.count(pkg) != 0) {
+            if (kept_kernel_packages_out) kept_kernel_packages_out->insert(pkg);
+            continue;
+        }
+        if (needed.count(pkg) != 0) continue;
+        removable.push_back(pkg);
+    }
+
+    if (!removable.empty()) sort_removal_queue_for_operation(removable, verbose);
+    return removable;
+}
+
+std::vector<std::string> collect_autoremove_purge_only_packages(
+    const std::set<std::string>& already_selected,
+    bool verbose
+) {
+    std::set<std::string> protected_kernel_packages = get_autoremove_protected_kernel_packages(verbose);
+    std::vector<std::string> purge_only;
+    for (const auto& record : load_package_auto_state_records()) {
+        if (!record.auto_installed || record.package.empty()) continue;
+        if (already_selected.count(record.package) != 0) continue;
+        if (!package_is_config_files_only(record.package)) continue;
+
+        std::string protection_reason;
+        if (package_is_removal_protected(record.package, &protection_reason)) continue;
+        if (protected_kernel_packages.count(record.package) != 0) continue;
+        purge_only.push_back(record.package);
+    }
+
+    std::sort(purge_only.begin(), purge_only.end());
+    purge_only.erase(std::unique(purge_only.begin(), purge_only.end()), purge_only.end());
+    return purge_only;
+}
+
+int execute_removal_plan(
+    const std::vector<std::string>& to_remove,
+    const std::vector<std::string>& to_purge,
+    bool verbose
+) {
+    if (to_remove.empty() && to_purge.empty()) {
+        std::cout << "Nothing to do." << std::endl;
+        return 0;
+    }
+
+    if (!to_remove.empty()) {
+        std::cout << "The following packages will be REMOVED:" << std::endl;
+        for (const auto& pkg : to_remove) {
+            std::cout << "  " << Color::RED << pkg << Color::RESET << std::endl;
+        }
+    }
+    if (!to_purge.empty()) {
+        std::cout << "The following packages will be PURGED:" << std::endl;
+        for (const auto& pkg : to_purge) {
+            std::cout << "  " << Color::MAGENTA << pkg << Color::RESET << std::endl;
+        }
+    }
+
+    print_transaction_disk_change_summary(
+        estimate_removal_transaction_disk_change(to_remove, to_purge)
+    );
+
+    if (!ask_confirmation("Do you want to continue?")) {
+        std::cout << "Abort." << std::endl;
+        return 0;
+    }
+
+    if (!to_remove.empty()) {
+        std::cout << Color::CYAN << "[*] Removing " << to_remove.size()
+                  << " package(s)..." << Color::RESET << std::endl;
+        size_t remove_progress_width = 0;
+
+        for (size_t i = 0; i < to_remove.size(); ++i) {
+            const auto& pkg = to_remove[i];
+            if (!verbose) render_package_progress("current", i, to_remove.size(), pkg, &remove_progress_width);
+            std::vector<std::string> removed_files = read_installed_file_list(pkg);
+            InstallCommandResult result = remove_package_by_name(pkg, verbose);
+            if (!result.success) {
+                if (!verbose) finish_progress_line(&remove_progress_width);
+                std::cerr << Color::RED << "E: Failed to remove " << pkg << Color::RESET << std::endl;
+                if (!verbose && !result.log_path.empty()) {
+                    std::cerr << " See " << result.log_path << " for details.";
+                }
+                std::cerr << std::endl;
+                return 1;
+            }
+            check_triggers(removed_files);
+            if (!verbose) render_package_progress("current", i + 1, to_remove.size(), pkg, &remove_progress_width);
+        }
+
+        if (!verbose) finish_progress_line(&remove_progress_width);
+    }
+
+    if (!to_purge.empty()) {
+        std::cout << Color::CYAN << "[*] Purging " << to_purge.size()
+                  << " package(s)..." << Color::RESET << std::endl;
+        size_t purge_progress_width = 0;
+
+        for (size_t i = 0; i < to_purge.size(); ++i) {
+            const auto& pkg = to_purge[i];
+            if (!verbose) render_package_progress("current", i, to_purge.size(), pkg, &purge_progress_width);
+            InstallCommandResult result = purge_package_by_name(pkg, verbose);
+            if (!result.success) {
+                if (!verbose) finish_progress_line(&purge_progress_width);
+                std::cerr << Color::RED << "E: Failed to purge " << pkg << Color::RESET << std::endl;
+                if (!verbose && !result.log_path.empty()) {
+                    std::cerr << " See " << result.log_path << " for details.";
+                }
+                std::cerr << std::endl;
+                return 1;
+            }
+            if (!erase_package_auto_installed_state(pkg)) {
+                if (!verbose) finish_progress_line(&purge_progress_width);
+                std::cerr << Color::RED << "E: Failed to update gpkg auto-install state for "
+                          << pkg << Color::RESET << std::endl;
+                return 1;
+            }
+            if (!verbose) render_package_progress("current", i + 1, to_purge.size(), pkg, &purge_progress_width);
+        }
+
+        if (!verbose) finish_progress_line(&purge_progress_width);
+    }
+
+    return 0;
+}
+
+bool package_is_config_files_only(const std::string& pkg_name, std::string* out_version) {
     PackageStatusRecord record;
     if (!get_package_status_record(pkg_name, &record)) return false;
     if (record.status != "config-files") return false;
@@ -390,7 +856,7 @@ bool package_is_config_files_only(const std::string& pkg_name, std::string* out_
     return true;
 }
 
-bool package_is_removal_protected(const std::string& pkg_name, std::string* reason_out = nullptr) {
+bool package_is_removal_protected(const std::string& pkg_name, std::string* reason_out) {
     if (reason_out) reason_out->clear();
     if (pkg_name.empty()) return false;
 
@@ -1067,6 +1533,13 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
         }
     }
 
+    print_transaction_disk_change_summary(
+        estimate_install_transaction_disk_change(
+            upgrade_queue,
+            !upgrade_plan.retirements.empty()
+        )
+    );
+
     if (!ask_confirmation("Do you want to continue?")) return 0;
 
     std::cout << Color::CYAN << "[*] Downloading "
@@ -1115,6 +1588,17 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
         }
 
         queue_triggers_for_package(upgrade_queue[i].name);
+        if (!update_package_auto_install_state_after_install(
+                upgrade_queue[i].name,
+                explicit_target_names.count(upgrade_queue[i].name) != 0 &&
+                    installed_cache.count(upgrade_queue[i].name) == 0,
+                installed_cache)) {
+            if (!verbose) finish_progress_line(&install_progress_width);
+            std::cerr << Color::RED << "E: Failed to update gpkg auto-install state for "
+                      << upgrade_queue[i].name << Color::RESET << std::endl;
+            failures.push_back(upgrade_queue[i].name);
+            break;
+        }
         std::vector<std::string> retirements;
         if (should_retire_after_install(upgrade_plan, upgrade_queue[i].name, retirements)) {
             for (const auto& retired_pkg : retirements) {
@@ -1127,6 +1611,13 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
                         std::cerr << " (see " << retire_result.log_path << ")";
                     }
                     std::cerr << std::endl;
+                    failures.push_back(retired_pkg);
+                    break;
+                }
+                if (!erase_package_auto_installed_state(retired_pkg)) {
+                    if (!verbose) finish_progress_line(&install_progress_width);
+                    std::cerr << Color::RED << "E: Failed to update gpkg auto-install state for "
+                              << retired_pkg << Color::RESET << std::endl;
                     failures.push_back(retired_pkg);
                     break;
                 }
@@ -1313,6 +1804,16 @@ int handle_repair(bool verbose) {
             break;
         }
         queue_triggers_for_package(repair_queue[i].name);
+        if (!update_package_auto_install_state_after_install(
+                repair_queue[i].name,
+                false,
+                installed_set)) {
+            if (!verbose) finish_progress_line(&install_progress_width);
+            std::cerr << Color::RED << "E: Failed to update gpkg auto-install state for "
+                      << repair_queue[i].name << Color::RESET << std::endl;
+            failures.push_back(repair_queue[i].name);
+            break;
+        }
         std::vector<std::string> retirements;
         if (should_retire_after_install(repair_plan, repair_queue[i].name, retirements)) {
             for (const auto& retired_pkg : retirements) {
@@ -1325,6 +1826,13 @@ int handle_repair(bool verbose) {
                         std::cerr << " (see " << retire_result.log_path << ")";
                     }
                     std::cerr << std::endl;
+                    failures.push_back(retired_pkg);
+                    break;
+                }
+                if (!erase_package_auto_installed_state(retired_pkg)) {
+                    if (!verbose) finish_progress_line(&install_progress_width);
+                    std::cerr << Color::RED << "E: Failed to update gpkg auto-install state for "
+                              << retired_pkg << Color::RESET << std::endl;
                     failures.push_back(retired_pkg);
                     break;
                 }
@@ -1365,6 +1873,7 @@ int handle_repair(bool verbose) {
 int handle_install(int argc, char* argv[], const std::set<std::string>& installed_cache, bool verbose) {
     std::vector<PackageMetadata> install_queue;
     std::vector<std::string> local_files;
+    std::vector<std::string> repo_operands;
     std::vector<std::string> operands = collect_cli_operands(argc, argv, 2);
     std::set<std::string> visited;
     bool needs_repo_index = false;
@@ -1380,6 +1889,7 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
         if (arg.length() > 5 && arg.substr(arg.length() - 5) == ".gpkg" && access(arg.c_str(), F_OK) == 0) {
             local_files.push_back(arg);
         } else {
+            repo_operands.push_back(arg);
             needs_repo_index = true;
         }
     }
@@ -1419,6 +1929,11 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
 
         std::string local_pkg_name = read_package_name_from_archive(local_file);
         if (!local_pkg_name.empty()) {
+            if (!set_package_auto_installed_state(local_pkg_name, false)) {
+                std::cerr << Color::RED << "E: Failed to update gpkg auto-install state for "
+                          << local_pkg_name << Color::RESET << std::endl;
+                return 1;
+            }
             queue_triggers_for_package(local_pkg_name);
 
             PackageMetadata local_meta;
@@ -1442,6 +1957,11 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
                             std::cerr << std::endl;
                             return 1;
                         }
+                        if (!erase_package_auto_installed_state(retired_pkg)) {
+                            std::cerr << Color::RED << "E: Failed to update gpkg auto-install state for "
+                                      << retired_pkg << Color::RESET << std::endl;
+                            return 1;
+                        }
                     }
                 }
             }
@@ -1452,7 +1972,25 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
     if (!build_transaction_plan(install_queue, installed_cache, verbose, install_plan)) return 1;
     install_queue = install_plan.install_queue;
 
+    std::set<std::string> explicit_manual_targets;
+    for (const auto& arg : repo_operands) {
+        std::string resolved = resolve_requested_package_for_manual_marking(
+            arg,
+            install_queue,
+            installed_cache,
+            verbose
+        );
+        if (!resolved.empty()) explicit_manual_targets.insert(resolved);
+    }
+
     if (install_queue.empty()) {
+        for (const auto& pkg_name : explicit_manual_targets) {
+            if (!update_package_auto_install_state_after_install(pkg_name, true, installed_cache)) {
+                std::cerr << Color::RED << "E: Failed to update gpkg auto-install state for "
+                          << pkg_name << Color::RESET << std::endl;
+                return 1;
+            }
+        }
         if (local_files.empty()) std::cout << "Nothing to do." << std::endl;
         return 0;
     }
@@ -1497,6 +2035,13 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
                       << " -> " << Color::GREEN << entry.replacement_name << Color::RESET << std::endl;
         }
     }
+
+    print_transaction_disk_change_summary(
+        estimate_install_transaction_disk_change(
+            install_queue,
+            !install_plan.retirements.empty()
+        )
+    );
 
     if (!ask_confirmation("Do you want to continue?")) return 0;
 
@@ -1551,6 +2096,15 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
             return 1;
         }
         queue_triggers_for_package(install_queue[i].name);
+        if (!update_package_auto_install_state_after_install(
+                install_queue[i].name,
+                explicit_manual_targets.count(install_queue[i].name) != 0,
+                installed_cache)) {
+            if (!verbose) finish_progress_line(&install_progress_width);
+            std::cerr << Color::RED << "E: Failed to update gpkg auto-install state for "
+                      << install_queue[i].name << Color::RESET << std::endl;
+            return 1;
+        }
         std::vector<std::string> retirements;
         if (should_retire_after_install(install_plan, install_queue[i].name, retirements)) {
             for (const auto& retired_pkg : retirements) {
@@ -1563,6 +2117,12 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
                         std::cerr << " See " << retire_result.log_path << " for details.";
                     }
                     std::cerr << std::endl;
+                    return 1;
+                }
+                if (!erase_package_auto_installed_state(retired_pkg)) {
+                    if (!verbose) finish_progress_line(&install_progress_width);
+                    std::cerr << Color::RED << "E: Failed to update gpkg auto-install state for "
+                              << retired_pkg << Color::RESET << std::endl;
                     return 1;
                 }
             }
@@ -1627,38 +2187,16 @@ int handle_remove(int argc, char* argv[], bool verbose, bool purge, bool autorem
 
     if (autoremove && target_installed) {
         std::cout << "Calculating newly unneeded dependencies..." << std::endl;
-        std::set<std::string> protected_kernel_packages = get_autoremove_protected_kernel_packages(verbose);
         std::set<std::string> skipped_kernel_packages;
         std::map<std::string, std::string> skipped_protected_packages;
-        bool changed = true;
-        while (changed) {
-            changed = false;
-            std::vector<std::string> current_removals = to_remove;
-            for (const auto& pkg : current_removals) {
-                PackageMetadata meta;
-                if (!get_installed_package_metadata(pkg, meta)) continue;
-
-                for (const auto& dep_str : meta.depends) {
-                    Dependency dep = parse_dependency(dep_str);
-                    if (!is_installed(dep.name) || removal_set.count(dep.name)) continue;
-                    std::string dep_protection_reason;
-                    if (package_is_removal_protected(dep.name, &dep_protection_reason)) {
-                        skipped_protected_packages[dep.name] = dep_protection_reason;
-                        VLOG(verbose, "Keeping protected system package out of autoremove: " << dep.name);
-                        continue;
-                    }
-                    if (protected_kernel_packages.count(dep.name) != 0) {
-                        skipped_kernel_packages.insert(dep.name);
-                        VLOG(verbose, "Keeping protected kernel package out of autoremove: " << dep.name);
-                        continue;
-                    }
-                    if (is_required_by_others(dep.name, removal_set, verbose)) continue;
-
-                    to_remove.push_back(dep.name);
-                    removal_set.insert(dep.name);
-                    changed = true;
-                }
-            }
+        std::vector<std::string> autoremove_packages = collect_autoremove_packages(
+            removal_set,
+            verbose,
+            &skipped_kernel_packages,
+            &skipped_protected_packages
+        );
+        for (const auto& pkg : autoremove_packages) {
+            if (removal_set.insert(pkg).second) to_remove.push_back(pkg);
         }
 
         if (!skipped_kernel_packages.empty()) {
@@ -1689,73 +2227,44 @@ int handle_remove(int argc, char* argv[], bool verbose, bool purge, bool autorem
         }
     }
 
-    if (!to_remove.empty()) {
-        std::cout << "The following packages will be REMOVED:" << std::endl;
-        for (const auto& pkg : to_remove) {
-            std::cout << "  " << Color::RED << pkg << Color::RESET << std::endl;
+    return execute_removal_plan(to_remove, to_purge, verbose);
+}
+
+int handle_autoremove(bool verbose, bool purge) {
+    std::cout << "Calculating removable packages..." << std::endl;
+
+    std::set<std::string> skipped_kernel_packages;
+    std::map<std::string, std::string> skipped_protected_packages;
+    std::vector<std::string> to_remove = collect_autoremove_packages(
+        {},
+        verbose,
+        &skipped_kernel_packages,
+        &skipped_protected_packages
+    );
+
+    if (!skipped_kernel_packages.empty()) {
+        std::cout << "Keeping protected kernel package(s):";
+        for (const auto& pkg : skipped_kernel_packages) {
+            std::cout << " " << pkg;
+        }
+        std::cout << std::endl;
+    }
+    if (!skipped_protected_packages.empty()) {
+        std::cout << "Keeping protected system package(s):" << std::endl;
+        for (const auto& entry : skipped_protected_packages) {
+            std::cout << "  " << entry.first << " (" << entry.second << ")" << std::endl;
         }
     }
-    if (!to_purge.empty()) {
-        std::cout << "The following packages will be PURGED:" << std::endl;
-        for (const auto& pkg : to_purge) {
-            std::cout << "  " << Color::MAGENTA << pkg << Color::RESET << std::endl;
-        }
+
+    std::vector<std::string> to_purge;
+    std::set<std::string> selected(to_remove.begin(), to_remove.end());
+    if (purge) {
+        to_purge = to_remove;
+        std::vector<std::string> purge_only = collect_autoremove_purge_only_packages(selected, verbose);
+        to_purge.insert(to_purge.end(), purge_only.begin(), purge_only.end());
+        std::sort(to_purge.begin(), to_purge.end());
+        to_purge.erase(std::unique(to_purge.begin(), to_purge.end()), to_purge.end());
     }
 
-    if (!ask_confirmation("Do you want to continue?")) {
-        std::cout << "Abort." << std::endl;
-        return 0;
-    }
-
-    if (!to_remove.empty()) {
-        std::cout << Color::CYAN << "[*] Removing " << to_remove.size()
-                  << " package(s)..." << Color::RESET << std::endl;
-        size_t remove_progress_width = 0;
-
-        for (size_t i = 0; i < to_remove.size(); ++i) {
-            const auto& pkg = to_remove[i];
-            if (!verbose) render_package_progress("current", i, to_remove.size(), pkg, &remove_progress_width);
-            std::vector<std::string> removed_files = read_installed_file_list(pkg);
-            InstallCommandResult result = remove_package_by_name(pkg, verbose);
-            if (!result.success) {
-                if (!verbose) finish_progress_line(&remove_progress_width);
-                std::cerr << Color::RED << "E: Failed to remove " << pkg << Color::RESET << std::endl;
-                if (!verbose && !result.log_path.empty()) {
-                    std::cerr << " See " << result.log_path << " for details.";
-                }
-                std::cerr << std::endl;
-                return 1;
-            }
-            check_triggers(removed_files);
-            if (!verbose) render_package_progress("current", i + 1, to_remove.size(), pkg, &remove_progress_width);
-        }
-
-        if (!verbose) finish_progress_line(&remove_progress_width);
-    }
-
-    if (!to_purge.empty()) {
-        std::cout << Color::CYAN << "[*] Purging " << to_purge.size()
-                  << " package(s)..." << Color::RESET << std::endl;
-        size_t purge_progress_width = 0;
-
-        for (size_t i = 0; i < to_purge.size(); ++i) {
-            const auto& pkg = to_purge[i];
-            if (!verbose) render_package_progress("current", i, to_purge.size(), pkg, &purge_progress_width);
-            InstallCommandResult result = purge_package_by_name(pkg, verbose);
-            if (!result.success) {
-                if (!verbose) finish_progress_line(&purge_progress_width);
-                std::cerr << Color::RED << "E: Failed to purge " << pkg << Color::RESET << std::endl;
-                if (!verbose && !result.log_path.empty()) {
-                    std::cerr << " See " << result.log_path << " for details.";
-                }
-                std::cerr << std::endl;
-                return 1;
-            }
-            if (!verbose) render_package_progress("current", i + 1, to_purge.size(), pkg, &purge_progress_width);
-        }
-
-        if (!verbose) finish_progress_line(&purge_progress_width);
-    }
-
-    return 0;
+    return execute_removal_plan(to_remove, to_purge, verbose);
 }

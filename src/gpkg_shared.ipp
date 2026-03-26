@@ -18,6 +18,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <openssl/sha.h>
@@ -60,6 +61,7 @@ const std::string DEBIAN_CONFIG_PATH = ROOT_PREFIX + "/etc/gpkg/debian.conf";
 const std::string IMPORT_POLICY_PATH = ROOT_PREFIX + "/etc/gpkg/import-policy.json";
 const std::string BASE_SYSTEM_PROVIDER = "<base system policy>";
 const std::string STATUS_FILE = ROOT_PREFIX + "/var/lib/gpkg/status";
+const std::string EXTENDED_STATES_FILE = ROOT_PREFIX + "/var/lib/gpkg/extended_states";
 const std::string INFO_DIR = ROOT_PREFIX + "/var/lib/gpkg/info/";
 const std::string EXTENSION = ".gpkg";
 const std::string LOCK_FILE = ROOT_PREFIX + "/var/lib/gpkg/lock";
@@ -89,6 +91,11 @@ struct PackageStatusRecord {
     std::string version;
 };
 
+struct PackageAutoStateRecord {
+    std::string package;
+    bool auto_installed = false;
+};
+
 CommandCaptureResult run_command_captured(const std::string& cmd, bool verbose, const std::string& log_prefix);
 CommandCaptureResult run_command_captured_argv(
     const std::vector<std::string>& argv,
@@ -98,6 +105,10 @@ CommandCaptureResult run_command_captured_argv(
 std::vector<PackageStatusRecord> load_package_status_records();
 bool get_package_status_record(const std::string& pkg_name, PackageStatusRecord* out = nullptr);
 bool package_status_is_installed_like(const std::string& state);
+std::vector<PackageAutoStateRecord> load_package_auto_state_records();
+bool get_package_auto_installed_state(const std::string& pkg_name, bool* out_auto = nullptr);
+bool set_package_auto_installed_state(const std::string& pkg_name, bool auto_installed);
+bool erase_package_auto_installed_state(const std::string& pkg_name);
 
 enum class OptionalDependencyMode {
     Auto,
@@ -527,6 +538,7 @@ struct PackageMetadata {
     std::string package_scope;
     std::string installed_from;
     std::string size;
+    std::string installed_size_bytes;
     std::vector<std::string> depends;
     std::vector<std::string> recommends;
     std::vector<std::string> suggests;

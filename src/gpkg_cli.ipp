@@ -26,10 +26,12 @@ void print_help() {
               << "  --suggested-yes    Force installation of Debian Suggests for this transaction\n"
               << "  --suggested-no     Do not install Debian Suggests for this transaction\n"
               << "  --autoremove    Remove newly unneeded dependency packages during remove\n"
+              << "  --purge         Also purge package conffiles during remove/autoremove\n"
               << "  -V, --version   Show version\n\n"
               << "Commands:\n"
               << "  install <pkg>   Download and install packages (up to 5 archives in parallel)\n"
               << "  remove <pkg>    Remove an installed package (--purge to purge conffiles too)\n"
+              << "  autoremove      Remove automatically installed packages that are no longer needed\n"
               << "  repair          Repair broken dependencies and reinstall damaged packages\n"
               << "  upgrade         Upgrade all installed packages\n"
               << "  update          Update local package indices\n"
@@ -134,9 +136,11 @@ int main(int argc, char* argv[]) {
                   << Color::RESET << std::endl;
         return 1;
     }
-    if (purge && action != "remove") {
+    if (purge &&
+        action != "remove" &&
+        action != "autoremove") {
         std::cerr << Color::RED
-                  << "E: --purge is only valid with remove."
+                  << "E: --purge is only valid with remove or autoremove."
                   << Color::RESET << std::endl;
         return 1;
     }
@@ -145,6 +149,15 @@ int main(int argc, char* argv[]) {
                   << "E: --autoremove is only valid with remove."
                   << Color::RESET << std::endl;
         return 1;
+    }
+    if (action == "autoremove") {
+        std::vector<std::string> operands = collect_cli_operands(argc, argv, 2);
+        if (!operands.empty()) {
+            std::cerr << Color::RED
+                      << "E: gpkg autoremove does not take package names."
+                      << Color::RESET << std::endl;
+            return 1;
+        }
     }
 
     g_assume_yes = assume_yes;
@@ -156,7 +169,7 @@ int main(int argc, char* argv[]) {
 
 #ifndef DEV_MODE
     if (geteuid() != 0 &&
-        (action == "install" || action == "remove" || action == "update" ||
+        (action == "install" || action == "remove" || action == "autoremove" || action == "update" ||
          action == "add-repo" || action == "clean" || action == "upgrade" ||
          action == "repair")) {
         std::cerr << Color::RED << "E: This command requires root privileges." << Color::RESET << std::endl;
@@ -167,6 +180,7 @@ int main(int argc, char* argv[]) {
     bool needs_trans = (
         action == "install" ||
         action == "remove" ||
+        action == "autoremove" ||
         action == "repair" ||
         action == "upgrade" ||
         action == "update" ||
@@ -193,6 +207,7 @@ int main(int argc, char* argv[]) {
     if (action == "repair") return handle_repair(verbose);
     if (action == "install" && argc > 2) return handle_install(argc, argv, installed_cache, verbose);
     if (action == "remove" && argc > 2) return handle_remove(argc, argv, verbose, purge, autoremove);
+    if (action == "autoremove") return handle_autoremove(verbose, purge);
     if (action == "search") {
         std::string operand = first_cli_operand(argc, argv, 2);
         if (!operand.empty()) return handle_search(operand, verbose);

@@ -204,6 +204,7 @@ void populate_package_metadata_from_json(const std::string& obj, PackageMetadata
     get_json_value(obj, "package_scope", meta.package_scope);
     get_json_value(obj, "installed_from", meta.installed_from);
     get_json_value(obj, "size", meta.size);
+    get_json_value(obj, "installed_size_bytes", meta.installed_size_bytes);
     get_json_array(obj, "depends", meta.depends);
     get_json_array(obj, "recommends", meta.recommends);
     get_json_array(obj, "suggests", meta.suggests);
