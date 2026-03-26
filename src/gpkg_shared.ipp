@@ -611,6 +611,15 @@ std::vector<std::string> collect_transaction_dependency_edges(const PackageMetad
     return unique;
 }
 
+std::vector<std::string> collect_integrity_dependency_edges(const PackageMetadata& meta) {
+    std::vector<std::string> unique;
+    std::set<std::string> seen;
+    for (const auto& edge : meta.depends) {
+        if (seen.insert(edge).second) unique.push_back(edge);
+    }
+    return unique;
+}
+
 std::string describe_optional_dependency_policy() {
     std::ostringstream out;
     out << "recommends=" << describe_optional_dependency_mode(g_optional_dependency_policy.recommends)

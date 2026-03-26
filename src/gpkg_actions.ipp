@@ -1590,7 +1590,7 @@ RepairInspection inspect_repair_state(bool verbose) {
             }
             needs_reinstall = true;
         } else {
-            for (const auto& dep_str : collect_transaction_dependency_edges(installed_meta)) {
+            for (const auto& dep_str : collect_integrity_dependency_edges(installed_meta)) {
                 Dependency dep = parse_dependency(dep_str);
                 std::string provider_name;
                 if (is_dependency_satisfied_locally(dep, installed_cache, verbose, &provider_name)) continue;
