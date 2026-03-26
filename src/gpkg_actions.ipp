@@ -243,6 +243,49 @@ bool parse_decimal_u64(const std::string& text, uint64_t* out) {
     return true;
 }
 
+struct MultiarchLogicalPrefixMapForEstimate {
+    const char* path_prefix;
+    const char* canonical_prefix;
+};
+
+const MultiarchLogicalPrefixMapForEstimate k_multiarch_logical_prefix_maps_for_estimate[] = {
+    {"/lib64/x86_64-linux-gnu", "/lib/x86_64-linux-gnu"},
+    {"/lib64", "/lib/x86_64-linux-gnu"},
+    {"/lib/x86_64-linux-gnu", "/lib/x86_64-linux-gnu"},
+    {"/usr/lib64/x86_64-linux-gnu", "/usr/lib/x86_64-linux-gnu"},
+    {"/usr/lib64", "/usr/lib/x86_64-linux-gnu"},
+    {"/usr/lib/x86_64-linux-gnu", "/usr/lib/x86_64-linux-gnu"},
+};
+
+std::string canonical_multiarch_logical_path_for_estimate(const std::string& path) {
+    for (const auto& map : k_multiarch_logical_prefix_maps_for_estimate) {
+        std::string prefix = map.path_prefix;
+        if (path == prefix) return map.canonical_prefix;
+        if (path.rfind(prefix + "/", 0) != 0) continue;
+        return std::string(map.canonical_prefix) + path.substr(prefix.size());
+    }
+    return path;
+}
+
+std::string normalize_tar_member_path_for_estimate(const std::string& raw_path, bool strip_data) {
+    std::string line = trim(raw_path);
+    if (line.empty() || line == "." || line == "./") return "";
+
+    if (line.rfind("./", 0) == 0) line.erase(0, 2);
+
+    if (strip_data) {
+        if (line.rfind("data/", 0) == 0) {
+            line.erase(0, 5);
+        } else {
+            return "";
+        }
+    }
+
+    if (!line.empty() && line.back() == '/') line.pop_back();
+    if (line.empty()) return "";
+    return canonical_multiarch_logical_path_for_estimate("/" + line);
+}
+
 std::string installed_conffile_manifest_path(const std::string& pkg_name) {
     return INFO_DIR + pkg_name + ".conffiles";
 }
@@ -287,6 +330,7 @@ bool estimate_declared_installed_bytes(const PackageMetadata& meta, uint64_t* by
     uint64_t parsed = 0;
     if (parse_decimal_u64(meta.installed_size_bytes, &parsed)) {
         if (bytes_out) *bytes_out = parsed;
+        if (approximate_out) *approximate_out = true;
         return true;
     }
     if (parse_decimal_u64(meta.size, &parsed)) {
@@ -299,11 +343,23 @@ bool estimate_declared_installed_bytes(const PackageMetadata& meta, uint64_t* by
     return false;
 }
 
-uint64_t measure_live_path_bytes_no_follow(const std::string& full_path) {
+uint64_t measure_live_path_disk_bytes_no_follow(
+    const std::string& full_path,
+    std::set<std::pair<dev_t, ino_t>>* seen_inodes = nullptr
+) {
     struct stat st {};
     if (lstat(full_path.c_str(), &st) != 0) return 0;
 
     if (S_ISDIR(st.st_mode) && !S_ISLNK(st.st_mode)) return 0;
+
+    if (!S_ISLNK(st.st_mode) && seen_inodes) {
+        std::pair<dev_t, ino_t> inode_key{st.st_dev, st.st_ino};
+        if (!seen_inodes->insert(inode_key).second) return 0;
+    }
+
+    if (st.st_blocks > 0) {
+        return static_cast<uint64_t>(st.st_blocks) * 512ULL;
+    }
 
     if (st.st_size <= 0) return 0;
     return static_cast<uint64_t>(st.st_size);
@@ -314,12 +370,17 @@ uint64_t measure_manifest_payload_bytes(
     const std::set<std::string>* exclude_paths = nullptr
 ) {
     std::set<std::string> seen;
+    std::set<std::pair<dev_t, ino_t>> seen_inodes;
     uint64_t total = 0;
     for (const auto& path : paths) {
         if (path.empty()) continue;
-        if (exclude_paths && exclude_paths->count(path) != 0) continue;
-        if (!seen.insert(path).second) continue;
-        total = saturating_add_u64(total, measure_live_path_bytes_no_follow(ROOT_PREFIX + path));
+        std::string canonical_path = canonical_multiarch_logical_path_for_estimate(path);
+        if (exclude_paths && exclude_paths->count(canonical_path) != 0) continue;
+        if (!seen.insert(canonical_path).second) continue;
+        total = saturating_add_u64(
+            total,
+            measure_live_path_disk_bytes_no_follow(ROOT_PREFIX + canonical_path, &seen_inodes)
+        );
     }
     return total;
 }
@@ -335,7 +396,9 @@ uint64_t estimate_current_installed_payload_bytes(
     std::set<std::string> excluded_paths;
     if (!include_conffiles) {
         std::vector<std::string> conffiles = load_dependency_entries(installed_conffile_manifest_path(pkg_name));
-        excluded_paths.insert(conffiles.begin(), conffiles.end());
+        for (const auto& conffile : conffiles) {
+            excluded_paths.insert(canonical_multiarch_logical_path_for_estimate(conffile));
+        }
     }
 
     uint64_t measured = measure_manifest_payload_bytes(
@@ -356,6 +419,189 @@ uint64_t estimate_current_installed_payload_bytes(
 
     if (approximate_out) *approximate_out = true;
     return 0;
+}
+
+struct CachedArchivePayloadInfo {
+    bool available = false;
+    bool approximate = true;
+    uint64_t target_bytes = 0;
+    std::vector<std::string> installed_paths;
+};
+
+CachedArchivePayloadInfo inspect_payload_tar_for_disk_estimate(const std::string& tar_path) {
+    CachedArchivePayloadInfo info;
+    std::vector<GpkgArchive::TarEntry> entries;
+    std::string error;
+    if (!GpkgArchive::tar_list_entries(tar_path, entries, &error)) {
+        return info;
+    }
+
+    bool strip_data = false;
+    for (const auto& entry : entries) {
+        std::string normalized = trim(entry.path);
+        if (normalized.rfind("./", 0) == 0) normalized.erase(0, 2);
+        if (normalized.rfind("data/", 0) == 0 || normalized == "data") {
+            strip_data = true;
+            break;
+        }
+    }
+
+    std::set<std::string> seen_paths;
+    bool has_non_regular_entries = false;
+    for (const auto& entry : entries) {
+        std::string normalized_path = normalize_tar_member_path_for_estimate(entry.path, strip_data);
+        if (normalized_path.empty()) continue;
+
+        if (entry.type == GpkgArchive::TarEntryType::Regular) {
+            if (seen_paths.insert(normalized_path).second) {
+                info.installed_paths.push_back(normalized_path);
+                info.target_bytes = saturating_add_u64(info.target_bytes, entry.size);
+            }
+            continue;
+        }
+
+        if (entry.type == GpkgArchive::TarEntryType::Symlink ||
+            entry.type == GpkgArchive::TarEntryType::Hardlink) {
+            if (seen_paths.insert(normalized_path).second) {
+                info.installed_paths.push_back(normalized_path);
+            }
+            has_non_regular_entries = true;
+        }
+    }
+
+    info.available = true;
+    info.approximate = has_non_regular_entries;
+    return info;
+}
+
+bool inspect_gpkg_archive_payload_for_disk_estimate(
+    const std::string& archive_path,
+    CachedArchivePayloadInfo* out_info
+) {
+    if (out_info) *out_info = CachedArchivePayloadInfo{};
+
+    char temp_template[] = "/tmp/gpkg-disk-estimate-XXXXXX";
+    char* temp_dir = mkdtemp(temp_template);
+    if (!temp_dir) return false;
+
+    std::string temp_root = temp_dir;
+    bool ok = false;
+    std::string archive_error;
+    std::string outer_tar = temp_root + "/archive.tar";
+    if (!GpkgArchive::decompress_zstd_file(archive_path, outer_tar, &archive_error)) {
+        run_command("rm -rf " + shell_quote(temp_root), false);
+        return false;
+    }
+
+    std::string unpack_root = temp_root + "/unpack";
+    if (!mkdir_p(unpack_root) ||
+        !GpkgArchive::tar_extract_to_directory(outer_tar, unpack_root, {}, &archive_error)) {
+        run_command("rm -rf " + shell_quote(temp_root), false);
+        return false;
+    }
+
+    std::string data_archive;
+    if (!locate_deb_data_archive(unpack_root, data_archive)) {
+        run_command("rm -rf " + shell_quote(temp_root), false);
+        return false;
+    }
+
+    std::string payload_tar;
+    if (!materialize_deb_payload_tar(data_archive, temp_root, payload_tar, &archive_error)) {
+        run_command("rm -rf " + shell_quote(temp_root), false);
+        return false;
+    }
+
+    CachedArchivePayloadInfo info = inspect_payload_tar_for_disk_estimate(payload_tar);
+    ok = info.available;
+    if (out_info) *out_info = info;
+    run_command("rm -rf " + shell_quote(temp_root), false);
+    return ok;
+}
+
+bool inspect_debian_archive_payload_for_disk_estimate(
+    const std::string& archive_path,
+    CachedArchivePayloadInfo* out_info
+) {
+    if (out_info) *out_info = CachedArchivePayloadInfo{};
+
+    char temp_template[] = "/tmp/gpkg-deb-disk-estimate-XXXXXX";
+    char* temp_dir = mkdtemp(temp_template);
+    if (!temp_dir) return false;
+
+    std::string temp_root = temp_dir;
+    bool ok = false;
+    std::string archive_error;
+    if (!GpkgArchive::extract_ar_archive_to_directory(archive_path, temp_root, &archive_error)) {
+        run_command("rm -rf " + shell_quote(temp_root), false);
+        return false;
+    }
+
+    std::string data_archive;
+    if (!locate_deb_data_archive(temp_root, data_archive)) {
+        run_command("rm -rf " + shell_quote(temp_root), false);
+        return false;
+    }
+
+    std::string payload_tar;
+    if (!materialize_deb_payload_tar(data_archive, temp_root, payload_tar, &archive_error)) {
+        run_command("rm -rf " + shell_quote(temp_root), false);
+        return false;
+    }
+
+    CachedArchivePayloadInfo info = inspect_payload_tar_for_disk_estimate(payload_tar);
+    ok = info.available;
+    if (out_info) *out_info = info;
+    run_command("rm -rf " + shell_quote(temp_root), false);
+    return ok;
+}
+
+bool get_cached_archive_payload_info(const PackageMetadata& meta, CachedArchivePayloadInfo* out_info) {
+    if (out_info) *out_info = CachedArchivePayloadInfo{};
+
+    std::string cache_key;
+    enum class ArchiveSourceKind { None, Gpkg, Debian } source_kind = ArchiveSourceKind::None;
+
+    if (package_is_debian_source(meta)) {
+        std::string imported_path = get_imported_gpkg_path(meta);
+        if (access(imported_path.c_str(), F_OK) == 0) {
+            cache_key = "gpkg:" + imported_path;
+            source_kind = ArchiveSourceKind::Gpkg;
+        } else {
+            std::string deb_path = get_cached_debian_archive_path(meta);
+            if (access(deb_path.c_str(), F_OK) == 0) {
+                cache_key = "deb:" + deb_path;
+                source_kind = ArchiveSourceKind::Debian;
+            }
+        }
+    } else {
+        std::string gpkg_path = get_cached_package_path(meta);
+        if (access(gpkg_path.c_str(), F_OK) == 0) {
+            cache_key = "gpkg:" + gpkg_path;
+            source_kind = ArchiveSourceKind::Gpkg;
+        }
+    }
+
+    if (source_kind == ArchiveSourceKind::None) return false;
+
+    static std::map<std::string, CachedArchivePayloadInfo> cache;
+    auto cache_it = cache.find(cache_key);
+    if (cache_it != cache.end()) {
+        if (out_info) *out_info = cache_it->second;
+        return cache_it->second.available;
+    }
+
+    CachedArchivePayloadInfo info;
+    bool ok = false;
+    if (source_kind == ArchiveSourceKind::Gpkg) {
+        ok = inspect_gpkg_archive_payload_for_disk_estimate(cache_key.substr(5), &info);
+    } else {
+        ok = inspect_debian_archive_payload_for_disk_estimate(cache_key.substr(4), &info);
+    }
+    if (!ok) info = CachedArchivePayloadInfo{};
+    cache[cache_key] = info;
+    if (out_info) *out_info = info;
+    return info.available;
 }
 
 uint64_t estimate_current_purge_only_bytes(const std::string& pkg_name, bool* approximate_out = nullptr) {
@@ -384,14 +630,22 @@ TransactionDiskEstimate estimate_install_transaction_disk_change(
     for (const auto& pkg : packages) {
         uint64_t target_bytes = 0;
         bool target_approximate = false;
-        if (!estimate_declared_installed_bytes(pkg, &target_bytes, &target_approximate)) {
+        uint64_t current_bytes = 0;
+        bool current_approximate = false;
+        CachedArchivePayloadInfo archive_info;
+        bool have_archive_info = get_cached_archive_payload_info(pkg, &archive_info);
+        if (have_archive_info) {
+            target_bytes = archive_info.target_bytes;
+            target_approximate = archive_info.approximate;
+        } else if (!estimate_declared_installed_bytes(pkg, &target_bytes, &target_approximate)) {
             target_approximate = true;
         }
 
-        uint64_t current_bytes = 0;
-        bool current_approximate = false;
         if (is_installed(pkg.name)) {
             current_bytes = estimate_current_installed_payload_bytes(pkg.name, true, &current_approximate);
+        } else if (have_archive_info) {
+            current_bytes = measure_manifest_payload_bytes(archive_info.installed_paths);
+            current_approximate = archive_info.approximate;
         } else if (package_is_base_system_provided(pkg.name)) {
             current_approximate = true;
         }
