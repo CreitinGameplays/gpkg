@@ -542,6 +542,51 @@ std::string debian_installed_size_kib_to_bytes_string(const std::string& kib_tex
     return std::to_string(kib * kBytesPerKib);
 }
 
+std::string derive_debian_t64_legacy_alias(const std::string& package_name) {
+    if (package_name.size() <= 3) return "";
+    if (package_name.rfind("lib", 0) != 0) return "";
+    if (package_name.size() < 4 || package_name.substr(package_name.size() - 3) != "t64") return "";
+
+    std::string legacy = package_name.substr(0, package_name.size() - 3);
+    return legacy == package_name ? std::string() : legacy;
+}
+
+void append_debian_t64_legacy_provides(
+    std::vector<std::string>& provides,
+    const std::string& package_name,
+    const std::string& version
+) {
+    std::string legacy = derive_debian_t64_legacy_alias(package_name);
+    if (legacy.empty()) return;
+
+    if (std::find(provides.begin(), provides.end(), legacy) == provides.end()) {
+        provides.push_back(legacy);
+    }
+
+    if (!version.empty()) {
+        std::string versioned = legacy + " (= " + version + ")";
+        if (std::find(provides.begin(), provides.end(), versioned) == provides.end()) {
+            provides.push_back(versioned);
+        }
+    }
+}
+
+void append_debian_t64_legacy_conflicts_and_replaces(
+    std::vector<std::string>& conflicts,
+    std::vector<std::string>& replaces,
+    const std::string& package_name
+) {
+    std::string legacy = derive_debian_t64_legacy_alias(package_name);
+    if (legacy.empty()) return;
+
+    if (std::find(conflicts.begin(), conflicts.end(), legacy) == conflicts.end()) {
+        conflicts.push_back(legacy);
+    }
+    if (std::find(replaces.begin(), replaces.end(), legacy) == replaces.end()) {
+        replaces.push_back(legacy);
+    }
+}
+
 std::map<std::string, std::vector<std::string>> build_debian_provider_map(
     const std::vector<DebianPackageRecord>& records,
     const std::string& apt_arch
@@ -549,6 +594,7 @@ std::map<std::string, std::vector<std::string>> build_debian_provider_map(
     std::map<std::string, std::vector<std::string>> providers;
     for (const auto& record : records) {
         std::vector<std::string> provided = normalize_relation_field_value(record.provides_raw, apt_arch);
+        append_debian_t64_legacy_provides(provided, record.package, record.version);
         for (const auto& capability : provided) {
             RelationAtom atom = normalize_relation_atom(capability, apt_arch);
             if (!atom.valid) continue;
@@ -609,7 +655,7 @@ PackageMetadata build_debian_package_metadata(
         required_dependency_text,
         record.package,
         config.apt_arch,
-        false,
+        true,
         policy,
         available_packages,
         provider_map,
@@ -670,6 +716,9 @@ PackageMetadata build_debian_package_metadata(
     
     meta.replaces = normalize_relation_field_value(record.replaces_raw, config.apt_arch);
     for (const auto& dep : package_override.replaces_add) meta.replaces.push_back(dep);
+
+    append_debian_t64_legacy_provides(meta.provides, record.package, record.version);
+    append_debian_t64_legacy_conflicts_and_replaces(meta.conflicts, meta.replaces, record.package);
     
     meta.package_scope = include_recommends ? "depends+recommends" : "depends";
     meta.installed_from = config.packages_url;

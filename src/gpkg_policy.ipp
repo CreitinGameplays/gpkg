@@ -428,7 +428,7 @@ std::vector<std::string> normalize_dependency_relation_value(
     const std::string& value,
     const std::string& package_name,
     const std::string& apt_arch,
-    bool include_recommends,
+    bool allow_unavailable_fallback,
     const ImportPolicy& policy,
     const std::set<std::string>& available_packages,
     const std::map<std::string, std::vector<std::string>>& provider_map,
@@ -526,7 +526,7 @@ std::vector<std::string> normalize_dependency_relation_value(
         }
 
         if (selected.empty() && dropped_as_system) continue;
-        if (selected.empty()) {
+        if (selected.empty() && allow_unavailable_fallback) {
             for (const auto& alternative : alternatives) {
                 selected = consider_relation(alternative, false);
                 if (!selected.empty()) break;
@@ -536,6 +536,6 @@ std::vector<std::string> normalize_dependency_relation_value(
         if (!selected.empty()) normalized.push_back(selected);
     }
 
-    (void)include_recommends;
+    (void)allow_unavailable_fallback;
     return unique_string_list(normalized);
 }
