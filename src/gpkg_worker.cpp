@@ -108,6 +108,12 @@ std::vector<std::string> read_list_file(const std::string& pkg_name);
 std::vector<std::string> get_installed_packages(const std::string& extension = ".list");
 std::string path_basename(const std::string& path);
 std::string read_symlink_target(const std::string& path);
+bool file_list_touches_selinux_policy_store(const std::vector<std::string>& files);
+bool restorecon_transaction_paths(const std::vector<std::string>& logical_paths, std::string* error_out = nullptr);
+bool schedule_selinux_autorelabel(
+    std::vector<InstallRollbackEntry>& rollback_entries,
+    std::string* error_out = nullptr
+);
 bool backup_live_path_if_present(
     const std::string& live_full_path,
     const std::string& logical_path,
@@ -2887,6 +2893,11 @@ bool action_remove_safe(const std::string& pkg_name) {
     std::vector<std::string> conffiles = normalize_owned_manifest_paths(load_package_conffiles(pkg_name));
     std::set<std::string> conffile_set(conffiles.begin(), conffiles.end());
     bool runtime_sensitive = files_touch_runtime_linker_state(owned_files);
+    bool selinux_policy_touched = file_list_touches_selinux_policy_store(owned_files);
+    std::vector<std::string> selinux_relabel_paths = owned_files;
+    for (const auto& entry : load_replaced_system_files(pkg_name)) {
+        selinux_relabel_paths.push_back(entry.path);
+    }
     sort_paths_for_removal(owned_files);
 
     std::vector<InstallRollbackEntry> removal_rollback_entries;
@@ -2970,6 +2981,19 @@ bool action_remove_safe(const std::string& pkg_name) {
         return false;
     }
 
+    std::string selinux_error;
+    if (!restorecon_transaction_paths(selinux_relabel_paths, &selinux_error)) {
+        rollback_remove_transaction(pkg_name, removal_rollback_entries, runtime_sensitive, false);
+        std::cerr << "E: " << selinux_error << std::endl;
+        return false;
+    }
+    if (selinux_policy_touched &&
+        !schedule_selinux_autorelabel(removal_rollback_entries, &selinux_error)) {
+        rollback_remove_transaction(pkg_name, removal_rollback_entries, runtime_sensitive, false);
+        std::cerr << "E: " << selinux_error << std::endl;
+        return false;
+    }
+
     if (!set_package_status_record(pkg_name, "deinstall", "ok", "config-files", current_version)) {
         rollback_remove_transaction(pkg_name, removal_rollback_entries, runtime_sensitive, false);
         std::cerr << "E: Failed to finalize package status after removal." << std::endl;
@@ -2997,6 +3021,7 @@ bool action_purge_safe(const std::string& pkg_name) {
     }
 
     std::vector<std::string> conffiles = normalize_owned_manifest_paths(load_package_conffiles(pkg_name));
+    bool selinux_policy_touched = file_list_touches_selinux_policy_store(conffiles);
     sort_paths_for_removal(conffiles);
 
     std::vector<InstallRollbackEntry> purge_rollback_entries;
@@ -3020,6 +3045,14 @@ bool action_purge_safe(const std::string& pkg_name) {
     if (!stage_package_metadata_removal(pkg_name, purge_rollback_entries, false)) {
         rollback_install_changes(purge_rollback_entries);
         std::cerr << "E: Failed to purge package metadata safely." << std::endl;
+        return false;
+    }
+
+    std::string selinux_error;
+    if (selinux_policy_touched &&
+        !schedule_selinux_autorelabel(purge_rollback_entries, &selinux_error)) {
+        rollback_install_changes(purge_rollback_entries);
+        std::cerr << "E: " << selinux_error << std::endl;
         return false;
     }
 
@@ -3052,6 +3085,7 @@ bool action_retire_safe(const std::string& pkg_name) {
 
     std::vector<std::string> owned_files = normalize_owned_manifest_paths(read_list_file(pkg_name));
     bool runtime_sensitive = files_touch_runtime_linker_state(owned_files);
+    bool selinux_policy_touched = file_list_touches_selinux_policy_store(owned_files);
     sort_paths_for_removal(owned_files);
 
     std::vector<InstallRollbackEntry> rollback_entries;
@@ -3077,6 +3111,27 @@ bool action_retire_safe(const std::string& pkg_name) {
         refresh_linker_cache_if_available();
         std::cerr << "E: ldconfig failed after retiring runtime files for "
                   << pkg_name << "." << std::endl;
+        return false;
+    }
+
+    std::string selinux_error;
+    if (!restorecon_transaction_paths(owned_files, &selinux_error)) {
+        rollback_install_changes(rollback_entries);
+        if (runtime_sensitive) {
+            sync_multiarch_runtime_aliases();
+            refresh_linker_cache_if_available();
+        }
+        std::cerr << "E: " << selinux_error << std::endl;
+        return false;
+    }
+    if (selinux_policy_touched &&
+        !schedule_selinux_autorelabel(rollback_entries, &selinux_error)) {
+        rollback_install_changes(rollback_entries);
+        if (runtime_sensitive) {
+            sync_multiarch_runtime_aliases();
+            refresh_linker_cache_if_available();
+        }
+        std::cerr << "E: " << selinux_error << std::endl;
         return false;
     }
 
@@ -3581,6 +3636,140 @@ std::string get_package_version(const std::string& pkg_name) {
     return content.substr(val_start + 1, val_end - val_start - 1);
 }
 
+std::string to_lower_ascii(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return value;
+}
+
+bool path_matches_prefix_or_exact(const std::string& path, const std::string& prefix) {
+    if (path == prefix) return true;
+    return path.rfind(prefix + "/", 0) == 0;
+}
+
+bool selinux_config_requests_enabled() {
+    std::ifstream f(g_root_prefix + "/etc/selinux/config");
+    if (!f) return false;
+
+    std::string line;
+    while (std::getline(f, line)) {
+        line = trim(line);
+        if (line.empty() || line[0] == '#') continue;
+        if (line.rfind("SELINUX=", 0) != 0) continue;
+        return to_lower_ascii(trim(line.substr(std::string("SELINUX=").size()))) != "disabled";
+    }
+
+    return false;
+}
+
+bool selinux_runtime_active() {
+    if (!g_root_prefix.empty()) return false;
+    return access("/sys/fs/selinux/enforce", F_OK) == 0;
+}
+
+std::string find_live_executable_path(const std::vector<std::string>& candidates) {
+    if (!g_root_prefix.empty()) return "";
+    for (const auto& candidate : candidates) {
+        if (!candidate.empty() && access(candidate.c_str(), X_OK) == 0) return candidate;
+    }
+    return "";
+}
+
+bool file_list_touches_selinux_policy_store(const std::vector<std::string>& files) {
+    for (const auto& path : files) {
+        if (path_matches_prefix_or_exact(path, "/etc/selinux") ||
+            path_matches_prefix_or_exact(path, "/usr/share/selinux") ||
+            path_matches_prefix_or_exact(path, "/var/lib/selinux")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::vector<std::string> existing_selinux_relabel_targets(const std::vector<std::string>& logical_paths) {
+    std::vector<std::string> targets;
+    std::set<std::string> seen;
+
+    for (const auto& path : logical_paths) {
+        std::string normalized = canonical_multiarch_logical_path(path);
+        if (normalized.empty() || !seen.insert(normalized).second) continue;
+        if (!path_exists_no_follow(g_root_prefix + normalized)) continue;
+        targets.push_back(normalized);
+    }
+
+    std::sort(targets.begin(), targets.end(), [](const std::string& left, const std::string& right) {
+        if (left.size() != right.size()) return left.size() < right.size();
+        return left < right;
+    });
+    return targets;
+}
+
+bool relabel_path_with_restorecon(const std::string& restorecon, const std::string& full_path, std::string* error_out) {
+    struct stat st;
+    if (lstat(full_path.c_str(), &st) != 0) {
+        if (errno == ENOENT) return true;
+        if (error_out) *error_out = "lstat failed for " + full_path + ": " + strerror(errno);
+        return false;
+    }
+
+    std::vector<std::string> args = {"-F"};
+    if (S_ISLNK(st.st_mode)) {
+        args.push_back("-h");
+    } else if (S_ISDIR(st.st_mode)) {
+        args.push_back("-R");
+    }
+    args.push_back(full_path);
+
+    int rc = run_path_with_args(restorecon, args);
+    if (rc == 0) return true;
+    if (error_out) {
+        *error_out = "restorecon failed for " + full_path + " (exit " + std::to_string(rc) + ")";
+    }
+    return false;
+}
+
+bool restorecon_transaction_paths(const std::vector<std::string>& logical_paths, std::string* error_out) {
+    if (error_out) error_out->clear();
+    if (!selinux_config_requests_enabled() || !selinux_runtime_active()) return true;
+
+    std::string restorecon = find_live_executable_path({
+        "/usr/sbin/restorecon",
+        "/sbin/restorecon",
+        "/usr/bin/restorecon",
+        "/bin/restorecon",
+    });
+    if (restorecon.empty()) {
+        if (error_out) *error_out = "SELinux is enabled but restorecon is not available.";
+        return false;
+    }
+
+    for (const auto& logical_path : existing_selinux_relabel_targets(logical_paths)) {
+        if (!relabel_path_with_restorecon(restorecon, g_root_prefix + logical_path, error_out)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool schedule_selinux_autorelabel(
+    std::vector<InstallRollbackEntry>& rollback_entries,
+    std::string* error_out
+) {
+    if (error_out) error_out->clear();
+    if (!selinux_config_requests_enabled()) return true;
+
+    std::string autorelabel_path = g_root_prefix + "/.autorelabel";
+    if (!prepare_path_for_transaction_write(autorelabel_path, "/.autorelabel", rollback_entries) ||
+        !write_text_file_atomic(autorelabel_path, "", 0644)) {
+        if (error_out) *error_out = "Failed to schedule SELinux autorelabel.";
+        return false;
+    }
+
+    return true;
+}
+
 bool action_install(const std::string& pkg_file) {
     // 1. Unpack to temp
     ScopedExtractWorkspace workspace;
@@ -3624,6 +3813,7 @@ bool action_install(const std::string& pkg_file) {
     std::vector<std::string> new_files = collapse_multiarch_install_alias_paths(
         payload_inspection.paths);
     bool runtime_sensitive = files_touch_runtime_linker_state(new_files);
+    bool selinux_policy_touched = file_list_touches_selinux_policy_store(new_files);
     
     std::string pkg_name;
     std::string new_version;
@@ -3774,6 +3964,17 @@ bool action_install(const std::string& pkg_file) {
         refresh_linker_cache_if_available();
         std::cerr << "E: ldconfig failed after installing runtime files for "
                   << pkg_name << "." << std::endl;
+        return false;
+    }
+
+    std::string selinux_error;
+    if (!restorecon_transaction_paths(new_files, &selinux_error)) {
+        rollback_install_changes(install_rollback_entries);
+        if (runtime_sensitive) {
+            sync_multiarch_runtime_aliases();
+            refresh_linker_cache_if_available();
+        }
+        std::cerr << "E: " << selinux_error << std::endl;
         return false;
     }
 
@@ -3983,6 +4184,30 @@ bool action_install(const std::string& pkg_file) {
             for (const auto& orphan : orphans) {
                 remove_path(orphan);
             }
+        }
+    }
+
+    if (!restorecon_transaction_paths(installed_files, &selinux_error)) {
+        rollback_install_changes(install_rollback_entries);
+        if (runtime_sensitive) {
+            sync_multiarch_runtime_aliases();
+            refresh_linker_cache_if_available();
+        }
+        std::cerr << "E: " << selinux_error << std::endl;
+        return false;
+    }
+
+    if (selinux_policy_touched && selinux_config_requests_enabled()) {
+        std::string autorelabel_path = g_root_prefix + "/.autorelabel";
+        if (!prepare_path_for_transaction_write(autorelabel_path, "/.autorelabel", install_rollback_entries) ||
+            !write_text_file_atomic(autorelabel_path, "", 0644)) {
+            rollback_install_changes(install_rollback_entries);
+            if (runtime_sensitive) {
+                sync_multiarch_runtime_aliases();
+                refresh_linker_cache_if_available();
+            }
+            std::cerr << "E: Failed to schedule SELinux autorelabel after updating policy files." << std::endl;
+            return false;
         }
     }
 
