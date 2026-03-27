@@ -1579,6 +1579,35 @@ bool resolve_upgrade_target_metadata(
     return get_repo_package_info(provider, out_meta);
 }
 
+bool redirect_upgrade_target_to_live_provider(
+    const Dependency& requested_dep,
+    const std::set<std::string>& installed_cache,
+    bool verbose,
+    Dependency& redirected_dep
+) {
+    redirected_dep = requested_dep;
+
+    std::string canonical_requested = canonicalize_package_name(requested_dep.name, verbose);
+    if (canonical_requested.empty()) return false;
+    if (package_has_exact_live_install_state(canonical_requested)) return false;
+
+    std::string provider_name;
+    if (!find_installed_dependency_provider(requested_dep, installed_cache, &provider_name)) return false;
+    if (provider_name.empty() || provider_name == BASE_SYSTEM_PROVIDER) return false;
+
+    provider_name = canonicalize_package_name(provider_name, verbose);
+    if (provider_name.empty() || provider_name == canonical_requested) return false;
+
+    PackageMetadata provider_repo_meta;
+    if (!get_repo_package_info(provider_name, provider_repo_meta)) return false;
+    if (!package_metadata_satisfies_dependency(provider_name, provider_repo_meta, requested_dep)) return false;
+
+    VLOG(verbose, "Redirecting upgrade target " << canonical_requested
+         << " to installed provider " << provider_name);
+    redirected_dep = {provider_name, "", ""};
+    return true;
+}
+
 bool queue_upgrade_target(
     const Dependency& requested_dep,
     const std::map<std::string, std::vector<std::string>>& companion_map,
@@ -1592,8 +1621,16 @@ bool queue_upgrade_target(
     bool verbose,
     bool force_reinstall = false
 ) {
+    Dependency effective_dep = requested_dep;
+    redirect_upgrade_target_to_live_provider(
+        requested_dep,
+        installed_cache,
+        verbose,
+        effective_dep
+    );
+
     PackageMetadata meta;
-    if (!resolve_upgrade_target_metadata(requested_dep, meta, verbose)) {
+    if (!resolve_upgrade_target_metadata(effective_dep, meta, verbose)) {
         VLOG(verbose, "No repository candidate available for upgrade target " << requested_dep.name);
         return true;
     }
