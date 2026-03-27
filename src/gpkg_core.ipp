@@ -597,6 +597,31 @@ bool get_json_array(const std::string& obj, const std::string& key, std::vector<
     return true;
 }
 
+std::vector<PackageStatusRecord> load_base_system_package_status_records() {
+    std::vector<PackageStatusRecord> records;
+    foreach_json_object(BASE_SYSTEM_REGISTRY_PATH, [&](const std::string& obj) {
+        PackageStatusRecord record;
+        if (!get_json_value(obj, "package", record.package)) return true;
+        get_json_value(obj, "version", record.version);
+        record.want = "install";
+        record.flag = "ok";
+        record.status = "installed";
+        records.push_back(record);
+        return true;
+    });
+    return records;
+}
+
+bool get_base_system_package_status_record(const std::string& pkg_name, PackageStatusRecord* out) {
+    std::vector<PackageStatusRecord> records = load_base_system_package_status_records();
+    for (const auto& record : records) {
+        if (record.package != pkg_name) continue;
+        if (out) *out = record;
+        return true;
+    }
+    return false;
+}
+
 bool ask_confirmation(const std::string& query) {
     if (g_assume_yes) {
         std::cout << Color::YELLOW << query << " [Y/n] y" << Color::RESET << std::endl;

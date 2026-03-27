@@ -22,10 +22,17 @@ bool get_local_installed_package_version(
     if (is_installed(pkg_name, version_out)) return true;
 
     PackageStatusRecord dpkg_record;
-    if (!get_dpkg_package_status_record(pkg_name, &dpkg_record)) return false;
-    if (!package_status_is_installed_like(dpkg_record.status)) return false;
+    if (get_dpkg_package_status_record(pkg_name, &dpkg_record) &&
+        package_status_is_installed_like(dpkg_record.status)) {
+        if (version_out) *version_out = dpkg_record.version;
+        return true;
+    }
 
-    if (version_out) *version_out = dpkg_record.version;
+    PackageStatusRecord base_record;
+    if (!get_base_system_package_status_record(pkg_name, &base_record)) return false;
+    if (!package_status_is_installed_like(base_record.status) || base_record.version.empty()) return false;
+
+    if (version_out) *version_out = base_record.version;
     return true;
 }
 
@@ -48,6 +55,27 @@ std::vector<std::string> collect_upgrade_scan_packages(
 
         if (is_blocked_import_package(record.package, verbose)) {
             VLOG(verbose, "Skipping policy-blocked package during upgrade scan: " << record.package);
+            continue;
+        }
+
+        PackageMetadata repo_meta;
+        if (!get_repo_package_info(record.package, repo_meta)) continue;
+        upgrade_scan.insert(record.package);
+    }
+
+    for (const auto& record : load_base_system_package_status_records()) {
+        if (record.package.empty()) continue;
+        if (!package_status_is_installed_like(record.status)) continue;
+        if (upgrade_scan.count(record.package) != 0) continue;
+
+        if (package_is_base_system_provided(record.package) &&
+            !is_upgradeable_system_package(record.package)) {
+            VLOG(verbose, "Skipping non-upgradeable base package from base-system registry: " << record.package);
+            continue;
+        }
+
+        if (is_blocked_import_package(record.package, verbose)) {
+            VLOG(verbose, "Skipping policy-blocked base-system registry package during upgrade scan: " << record.package);
             continue;
         }
 

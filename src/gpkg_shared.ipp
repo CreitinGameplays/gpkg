@@ -60,6 +60,7 @@ const std::string UPGRADE_COMPANIONS_PATH = ROOT_PREFIX + "/etc/gpkg/upgrade-com
 const std::string DEBIAN_CONFIG_PATH = ROOT_PREFIX + "/etc/gpkg/debian.conf";
 const std::string IMPORT_POLICY_PATH = ROOT_PREFIX + "/etc/gpkg/import-policy.json";
 const std::string DPKG_STATUS_FILE = ROOT_PREFIX + "/var/lib/dpkg/status";
+const std::string BASE_SYSTEM_REGISTRY_PATH = ROOT_PREFIX + "/usr/share/gpkg/base-system.json";
 const std::string BASE_SYSTEM_PROVIDER = "<base system policy>";
 const std::string STATUS_FILE = ROOT_PREFIX + "/var/lib/gpkg/status";
 const std::string EXTENDED_STATES_FILE = ROOT_PREFIX + "/var/lib/gpkg/extended_states";
@@ -105,8 +106,10 @@ CommandCaptureResult run_command_captured_argv(
 );
 std::vector<PackageStatusRecord> load_package_status_records();
 std::vector<PackageStatusRecord> load_dpkg_package_status_records();
+std::vector<PackageStatusRecord> load_base_system_package_status_records();
 bool get_package_status_record(const std::string& pkg_name, PackageStatusRecord* out = nullptr);
 bool get_dpkg_package_status_record(const std::string& pkg_name, PackageStatusRecord* out = nullptr);
+bool get_base_system_package_status_record(const std::string& pkg_name, PackageStatusRecord* out = nullptr);
 bool package_status_is_installed_like(const std::string& state);
 std::vector<PackageAutoStateRecord> load_package_auto_state_records();
 bool get_package_auto_installed_state(const std::string& pkg_name, bool* out_auto = nullptr);
