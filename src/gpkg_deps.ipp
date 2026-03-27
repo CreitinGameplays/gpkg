@@ -42,6 +42,31 @@ bool get_installed_package_metadata(const std::string& pkg_name, PackageMetadata
     return !out_meta.version.empty() || !content.empty();
 }
 
+bool get_live_installed_package_metadata(const std::string& pkg_name, PackageMetadata& out_meta) {
+    if (get_installed_package_metadata(pkg_name, out_meta)) return true;
+
+    PackageStatusRecord status_record;
+    bool have_live_status =
+        get_dpkg_package_status_record(pkg_name, &status_record) &&
+        package_status_is_installed_like(status_record.status);
+    if (!have_live_status) {
+        have_live_status =
+            get_base_system_package_status_record(pkg_name, &status_record) &&
+            package_status_is_installed_like(status_record.status);
+    }
+    if (!have_live_status) return false;
+
+    if (get_repo_package_info(pkg_name, out_meta)) {
+        if (!status_record.version.empty()) out_meta.version = status_record.version;
+        return true;
+    }
+
+    out_meta = {};
+    out_meta.name = pkg_name;
+    out_meta.version = status_record.version;
+    return !out_meta.version.empty();
+}
+
 Dependency parse_dependency(const std::string& dep_str) {
     Dependency dep;
     size_t open_paren = dep_str.find('(');
@@ -212,7 +237,7 @@ bool find_installed_dependency_provider(
 
     for (const auto& installed_name : installed_cache) {
         PackageMetadata meta;
-        if (!get_installed_package_metadata(installed_name, meta)) continue;
+        if (!get_live_installed_package_metadata(installed_name, meta)) continue;
         if (!package_metadata_satisfies_dependency(installed_name, meta, dep)) continue;
         if (provider_out) *provider_out = installed_name;
         return true;
@@ -576,7 +601,7 @@ bool build_transaction_plan(
         if (missing_installed_meta.count(pkg_name)) return nullptr;
 
         PackageMetadata meta;
-        if (!get_installed_package_metadata(pkg_name, meta)) {
+        if (!get_live_installed_package_metadata(pkg_name, meta)) {
             missing_installed_meta.insert(pkg_name);
             return nullptr;
         }

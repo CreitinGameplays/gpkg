@@ -1026,6 +1026,27 @@ std::vector<std::string> get_registered_package_names() {
     return std::vector<std::string>(package_names.begin(), package_names.end());
 }
 
+std::vector<std::string> get_exact_live_package_names() {
+    std::set<std::string> package_names;
+
+    for (const auto& pkg : get_registered_package_names()) {
+        if (!pkg.empty()) package_names.insert(pkg);
+    }
+
+    for (const auto& record : load_dpkg_package_status_records()) {
+        if (record.package.empty()) continue;
+        if (!package_status_is_installed_like(record.status)) continue;
+        package_names.insert(record.package);
+    }
+
+    return std::vector<std::string>(package_names.begin(), package_names.end());
+}
+
+std::set<std::string> get_exact_live_installed_package_set() {
+    auto names = get_exact_live_package_names();
+    return std::set<std::string>(names.begin(), names.end());
+}
+
 std::set<std::string> get_registered_installed_package_set(const std::set<std::string>& excluding = {}) {
     std::set<std::string> installed;
     for (const auto& pkg : get_registered_package_names()) {
@@ -2155,7 +2176,13 @@ int handle_doctor(bool verbose) {
     }
 
     std::vector<std::string> registered_packages = get_registered_package_names();
-    install_section.ok.push_back("gpkg knows about " + std::to_string(registered_packages.size()) + " installed package(s)");
+    std::set<std::string> exact_live_packages = get_exact_live_installed_package_set();
+    install_section.ok.push_back("gpkg knows about " + std::to_string(registered_packages.size()) + " registered package(s)");
+    if (exact_live_packages.size() != registered_packages.size()) {
+        install_section.ok.push_back(
+            "detected " + std::to_string(exact_live_packages.size()) + " exact live package(s) from gpkg and dpkg state"
+        );
+    }
 
     RepairInspection inspection = inspect_repair_state(verbose);
     if (inspection.detected_issues.empty()) {
@@ -2177,13 +2204,6 @@ int handle_doctor(bool verbose) {
         base_section.errors.push_back("base-system registry is missing or empty: " + BASE_SYSTEM_REGISTRY_PATH);
     } else {
         base_section.ok.push_back("loaded " + std::to_string(base_entries.size()) + " base-system registry entrie(s)");
-    }
-
-    std::set<std::string> exact_live_packages(registered_packages.begin(), registered_packages.end());
-    for (const auto& record : load_dpkg_package_status_records()) {
-        if (record.package.empty()) continue;
-        if (!package_status_is_installed_like(record.status)) continue;
-        exact_live_packages.insert(record.package);
     }
 
     size_t stale_base_entries = 0;
@@ -2218,8 +2238,7 @@ int handle_doctor(bool verbose) {
         upgrade_section.errors.push_back("cannot build a dry-run upgrade plan until the local package index is available");
     } else {
         PreparedUpgradeState prepared;
-        std::set<std::string> installed_cache(registered_packages.begin(), registered_packages.end());
-        if (!prepare_upgrade_transaction(installed_cache, verbose, prepared)) {
+        if (!prepare_upgrade_transaction(exact_live_packages, verbose, prepared)) {
             upgrade_section.errors.push_back(
                 "gpkg could not build a safe upgrade plan; the next 'gpkg upgrade' would likely fail"
             );

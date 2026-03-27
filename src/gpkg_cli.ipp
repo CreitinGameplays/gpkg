@@ -190,10 +190,7 @@ int main(int argc, char* argv[]) {
     );
     TransactionGuard guard(needs_trans, verbose);
 
-    std::set<std::string> installed_cache;
-    for (const auto& pkg : get_registered_package_names()) {
-        installed_cache.insert(pkg);
-    }
+    std::set<std::string> installed_cache = get_exact_live_installed_package_set();
 
     if (action == "help") {
         print_help();
