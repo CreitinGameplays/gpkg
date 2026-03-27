@@ -36,15 +36,80 @@ bool get_local_installed_package_version(
     return true;
 }
 
+bool package_has_exact_live_install_state(
+    const std::string& pkg_name,
+    std::string* version_out = nullptr
+) {
+    if (version_out) version_out->clear();
+    if (pkg_name.empty()) return false;
+
+    if (is_installed(pkg_name, version_out)) return true;
+
+    PackageStatusRecord dpkg_record;
+    if (get_dpkg_package_status_record(pkg_name, &dpkg_record) &&
+        package_status_is_installed_like(dpkg_record.status)) {
+        if (version_out) *version_out = dpkg_record.version;
+        return true;
+    }
+
+    return false;
+}
+
+bool resolve_local_or_repo_package_metadata(
+    const std::string& pkg_name,
+    PackageMetadata& out_meta
+) {
+    if (get_installed_package_metadata(pkg_name, out_meta)) return true;
+    return get_repo_package_info(pkg_name, out_meta);
+}
+
+bool base_registry_entry_is_shadowed_by_live_package(
+    const BaseSystemRegistryEntry& entry,
+    const PackageMetadata& entry_repo_meta,
+    const std::set<std::string>& exact_live_packages,
+    bool verbose
+) {
+    for (const auto& live_name : exact_live_packages) {
+        if (live_name.empty() || live_name == entry.package) continue;
+
+        PackageMetadata live_meta;
+        if (!resolve_local_or_repo_package_metadata(live_name, live_meta)) continue;
+
+        Dependency entry_dep{entry.package, "", ""};
+        bool live_provides_entry =
+            package_metadata_satisfies_dependency(live_name, live_meta, entry_dep);
+        bool entry_conflicts_live =
+            package_conflicts_with_package(entry_repo_meta, live_name, &live_meta);
+        bool live_conflicts_entry =
+            package_conflicts_with_package(live_meta, entry.package, &entry_repo_meta);
+        bool live_replaces_entry =
+            package_replaces_package(live_meta, entry.package, &entry_repo_meta);
+
+        if (!live_provides_entry && !entry_conflicts_live &&
+            !live_conflicts_entry && !live_replaces_entry) {
+            continue;
+        }
+
+        VLOG(verbose, "Skipping stale base-system entry " << entry.package
+                     << " because live package " << live_name
+                     << " supersedes or conflicts with it.");
+        return true;
+    }
+
+    return false;
+}
+
 std::vector<std::string> collect_upgrade_scan_packages(
     const std::set<std::string>& registered_installed,
     bool verbose
 ) {
     std::set<std::string> upgrade_scan = registered_installed;
+    std::set<std::string> exact_live_packages = registered_installed;
 
     for (const auto& record : load_dpkg_package_status_records()) {
         if (record.package.empty()) continue;
         if (!package_status_is_installed_like(record.status)) continue;
+        exact_live_packages.insert(record.package);
         if (upgrade_scan.count(record.package) != 0) continue;
 
         if (package_is_base_system_provided(record.package) &&
@@ -63,25 +128,37 @@ std::vector<std::string> collect_upgrade_scan_packages(
         upgrade_scan.insert(record.package);
     }
 
-    for (const auto& record : load_base_system_package_status_records()) {
-        if (record.package.empty()) continue;
-        if (!package_status_is_installed_like(record.status)) continue;
-        if (upgrade_scan.count(record.package) != 0) continue;
-
-        if (package_is_base_system_provided(record.package) &&
-            !is_upgradeable_system_package(record.package)) {
-            VLOG(verbose, "Skipping non-upgradeable base package from base-system registry: " << record.package);
+    for (const auto& entry : load_base_system_registry_entries()) {
+        if (entry.package.empty()) continue;
+        if (upgrade_scan.count(entry.package) != 0) continue;
+        if (!base_system_registry_entry_looks_present(entry)) {
+            VLOG(verbose, "Skipping stale base-system registry package during upgrade scan: "
+                         << entry.package);
             continue;
         }
 
-        if (is_blocked_import_package(record.package, verbose)) {
-            VLOG(verbose, "Skipping policy-blocked base-system registry package during upgrade scan: " << record.package);
+        if (package_is_base_system_provided(entry.package) &&
+            !is_upgradeable_system_package(entry.package)) {
+            VLOG(verbose, "Skipping non-upgradeable base package from base-system registry: " << entry.package);
+            continue;
+        }
+
+        if (is_blocked_import_package(entry.package, verbose)) {
+            VLOG(verbose, "Skipping policy-blocked base-system registry package during upgrade scan: " << entry.package);
             continue;
         }
 
         PackageMetadata repo_meta;
-        if (!get_repo_package_info(record.package, repo_meta)) continue;
-        upgrade_scan.insert(record.package);
+        if (!get_repo_package_info(entry.package, repo_meta)) continue;
+        if (!package_has_exact_live_install_state(entry.package) &&
+            base_registry_entry_is_shadowed_by_live_package(
+                entry,
+                repo_meta,
+                exact_live_packages,
+                verbose)) {
+            continue;
+        }
+        upgrade_scan.insert(entry.package);
     }
 
     return std::vector<std::string>(upgrade_scan.begin(), upgrade_scan.end());
@@ -1345,6 +1422,12 @@ struct UpgradePlanEntry {
     bool reinstall_only = false;
 };
 
+struct PreparedUpgradeState {
+    std::vector<PackageMetadata> upgrade_queue;
+    std::vector<UpgradePlanEntry> explicit_targets;
+    TransactionPlan plan;
+};
+
 std::vector<std::string> parse_companion_tokens(const std::string& raw_value) {
     std::string normalized = raw_value;
     for (char& ch : normalized) {
@@ -1631,6 +1714,83 @@ bool expand_runtime_upgrade_companions(
     return true;
 }
 
+bool prepare_upgrade_transaction(
+    const std::set<std::string>& installed_cache,
+    bool verbose,
+    PreparedUpgradeState& out_state
+) {
+    out_state = {};
+
+    std::vector<std::string> upgrade_scan_packages = collect_upgrade_scan_packages(installed_cache, verbose);
+    VLOG(verbose, "Checking " << upgrade_scan_packages.size()
+         << " installed or importable packages and upgradeable base runtimes.");
+
+    std::set<std::string> queued_packages;
+    std::set<std::string> explicit_target_names;
+    std::set<std::string> target_walk;
+    std::set<std::string> dependency_visited;
+    auto upgradeable_system = load_upgradeable_system_packages();
+    auto companion_map = load_upgrade_companions();
+
+    for (const auto& entry : upgradeable_system) {
+        Dependency dep = parse_dependency(entry);
+        if (!queue_upgrade_target(
+                dep,
+                companion_map,
+                out_state.upgrade_queue,
+                out_state.explicit_targets,
+                queued_packages,
+                explicit_target_names,
+                target_walk,
+                dependency_visited,
+                installed_cache,
+                verbose,
+                g_force_reinstall
+            )) {
+            return false;
+        }
+    }
+
+    for (const auto& pkg : upgrade_scan_packages) {
+        std::string current_ver;
+        if (!get_local_installed_package_version(pkg, &current_ver)) continue;
+
+        PackageMetadata repo_meta;
+        if (!get_repo_package_info(pkg, repo_meta)) continue;
+        if (!g_force_reinstall && compare_versions(repo_meta.version, current_ver) <= 0) continue;
+
+        if (compare_versions(repo_meta.version, current_ver) > 0) {
+            VLOG(verbose, "Update found for " << pkg << ": " << current_ver << " -> " << repo_meta.version);
+        } else if (g_force_reinstall) {
+            VLOG(verbose, "Reinstall requested for " << pkg << " at " << current_ver);
+        }
+        Dependency dep{pkg, "", ""};
+        if (!queue_upgrade_target(
+                dep,
+                companion_map,
+                out_state.upgrade_queue,
+                out_state.explicit_targets,
+                queued_packages,
+                explicit_target_names,
+                target_walk,
+                dependency_visited,
+                installed_cache,
+                verbose,
+                g_force_reinstall
+            )) {
+            return false;
+        }
+    }
+
+    if (out_state.upgrade_queue.empty()) return true;
+
+    if (!build_transaction_plan(out_state.upgrade_queue, installed_cache, verbose, out_state.plan)) {
+        return false;
+    }
+    out_state.upgrade_queue = out_state.plan.install_queue;
+    return true;
+}
+
 RepairInspection inspect_repair_state(bool verbose) {
     RepairInspection inspection;
     std::vector<std::string> registered_packages = get_registered_package_names();
@@ -1741,80 +1901,21 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
     std::cout << "Reading package lists..." << std::endl;
     if (!ensure_repo_package_cache_loaded(verbose)) return 1;
     std::cout << "Optional dependency policy: " << describe_optional_dependency_policy() << std::endl;
-    std::vector<std::string> upgrade_scan_packages = collect_upgrade_scan_packages(installed_cache, verbose);
-    VLOG(verbose, "Checking " << upgrade_scan_packages.size()
-         << " installed or importable packages and upgradeable base runtimes.");
-
-    std::vector<PackageMetadata> upgrade_queue;
-    std::vector<UpgradePlanEntry> explicit_targets;
-    std::set<std::string> queued_packages;
-    std::set<std::string> explicit_target_names;
-    std::set<std::string> target_walk;
-    std::set<std::string> dependency_visited;
-    auto upgradeable_system = load_upgradeable_system_packages();
-    auto companion_map = load_upgrade_companions();
-
-    for (const auto& entry : upgradeable_system) {
-        Dependency dep = parse_dependency(entry);
-        if (!queue_upgrade_target(
-                dep,
-                companion_map,
-                upgrade_queue,
-                explicit_targets,
-                queued_packages,
-                explicit_target_names,
-                target_walk,
-                dependency_visited,
-                installed_cache,
-                verbose,
-                g_force_reinstall
-            )) {
-            return 1;
-        }
-    }
-
-    for (const auto& pkg : upgrade_scan_packages) {
-        std::string current_ver;
-        if (!get_local_installed_package_version(pkg, &current_ver)) continue;
-
-        PackageMetadata repo_meta;
-        if (!get_repo_package_info(pkg, repo_meta)) continue;
-        if (!g_force_reinstall && compare_versions(repo_meta.version, current_ver) <= 0) continue;
-
-        if (compare_versions(repo_meta.version, current_ver) > 0) {
-            VLOG(verbose, "Update found for " << pkg << ": " << current_ver << " -> " << repo_meta.version);
-        } else if (g_force_reinstall) {
-            VLOG(verbose, "Reinstall requested for " << pkg << " at " << current_ver);
-        }
-        Dependency dep{pkg, "", ""};
-        if (!queue_upgrade_target(
-                dep,
-                companion_map,
-                upgrade_queue,
-                explicit_targets,
-                queued_packages,
-                explicit_target_names,
-                target_walk,
-                dependency_visited,
-                installed_cache,
-                verbose,
-                g_force_reinstall
-            )) {
-            return 1;
-        }
-    }
+    PreparedUpgradeState prepared;
+    if (!prepare_upgrade_transaction(installed_cache, verbose, prepared)) return 1;
+    std::vector<PackageMetadata>& upgrade_queue = prepared.upgrade_queue;
+    std::vector<UpgradePlanEntry>& explicit_targets = prepared.explicit_targets;
+    TransactionPlan& upgrade_plan = prepared.plan;
 
     if (upgrade_queue.empty()) {
         std::cout << "All packages are up to date." << std::endl;
         return 0;
     }
 
-    TransactionPlan upgrade_plan;
-    if (!build_transaction_plan(upgrade_queue, installed_cache, verbose, upgrade_plan)) return 1;
-    upgrade_queue = upgrade_plan.install_queue;
-
     std::set<std::string> planned_names;
     for (const auto& pkg : upgrade_queue) planned_names.insert(pkg.name);
+    std::set<std::string> explicit_target_names;
+    for (const auto& entry : explicit_targets) explicit_target_names.insert(entry.meta.name);
 
     std::vector<UpgradePlanEntry> installed_upgrades;
     std::vector<UpgradePlanEntry> installed_reinstalls;
@@ -1998,6 +2099,190 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
               << Color::RESET << std::endl;
 
     return 0;
+}
+
+struct DoctorSection {
+    std::string title;
+    std::vector<std::string> ok;
+    std::vector<std::string> warnings;
+    std::vector<std::string> errors;
+};
+
+void print_doctor_lines(const std::vector<std::string>& lines, const std::string& color, const std::string& prefix) {
+    for (const auto& line : lines) {
+        std::cout << "  " << color << prefix << " " << line << Color::RESET << std::endl;
+    }
+}
+
+void print_doctor_section(const DoctorSection& section) {
+    std::cout << section.title << ":" << std::endl;
+    print_doctor_lines(section.ok, Color::GREEN, "[OK]");
+    print_doctor_lines(section.warnings, Color::YELLOW, "[WARN]");
+    print_doctor_lines(section.errors, Color::RED, "[ERR]");
+    if (section.ok.empty() && section.warnings.empty() && section.errors.empty()) {
+        std::cout << "  " << Color::BLUE << "[INFO] no findings" << Color::RESET << std::endl;
+    }
+}
+
+int handle_doctor(bool verbose) {
+    DoctorSection repo_section;
+    repo_section.title = "Repository configuration";
+    DoctorSection install_section;
+    install_section.title = "Installed package state";
+    DoctorSection base_section;
+    base_section.title = "Base system registry";
+    DoctorSection upgrade_section;
+    upgrade_section.title = "Upgrade dry-run";
+
+    auto repo_urls = get_repo_urls();
+    repo_section.ok.push_back("Debian backend config: " + load_debian_backend_config(false).packages_url);
+    repo_section.ok.push_back("Additional repositories configured: " + std::to_string(repo_urls.size()));
+
+    const std::string merged_index = REPO_CACHE_PATH + "Packages.json";
+    struct stat index_st {};
+    bool repo_index_present = lstat(merged_index.c_str(), &index_st) == 0;
+    if (!repo_index_present) {
+        repo_section.errors.push_back("local merged package index is missing; run 'gpkg update'");
+    } else {
+        repo_section.ok.push_back("local merged package index is present");
+        if (!ensure_repo_package_cache_loaded(verbose)) {
+            repo_section.errors.push_back("local package index exists but could not be loaded");
+        } else {
+            repo_section.ok.push_back(
+                "loaded " + std::to_string(g_repo_package_cache.size()) + " package records from the local index"
+            );
+        }
+    }
+
+    std::vector<std::string> registered_packages = get_registered_package_names();
+    install_section.ok.push_back("gpkg knows about " + std::to_string(registered_packages.size()) + " installed package(s)");
+
+    RepairInspection inspection = inspect_repair_state(verbose);
+    if (inspection.detected_issues.empty()) {
+        install_section.ok.push_back("installed package metadata and file lists look consistent");
+    } else {
+        install_section.errors.push_back(
+            std::to_string(inspection.detected_issues.size()) + " installed-package issue(s) detected"
+        );
+        for (const auto& issue : inspection.detected_issues) {
+            install_section.errors.push_back(issue);
+        }
+    }
+    for (const auto& issue : inspection.unresolved_issues) {
+        install_section.errors.push_back(issue);
+    }
+
+    std::vector<BaseSystemRegistryEntry> base_entries = load_base_system_registry_entries();
+    if (base_entries.empty()) {
+        base_section.errors.push_back("base-system registry is missing or empty: " + BASE_SYSTEM_REGISTRY_PATH);
+    } else {
+        base_section.ok.push_back("loaded " + std::to_string(base_entries.size()) + " base-system registry entrie(s)");
+    }
+
+    std::set<std::string> exact_live_packages(registered_packages.begin(), registered_packages.end());
+    for (const auto& record : load_dpkg_package_status_records()) {
+        if (record.package.empty()) continue;
+        if (!package_status_is_installed_like(record.status)) continue;
+        exact_live_packages.insert(record.package);
+    }
+
+    size_t stale_base_entries = 0;
+    size_t shadowed_base_entries = 0;
+    for (const auto& entry : base_entries) {
+        if (!base_system_registry_entry_looks_present(entry)) {
+            ++stale_base_entries;
+            base_section.warnings.push_back(
+                entry.package + " is still recorded in the base-system registry, but none of its recorded files are present"
+            );
+            continue;
+        }
+
+        if (!repo_index_present || !g_repo_package_cache_loaded) continue;
+        PackageMetadata repo_meta;
+        if (!get_repo_package_info(entry.package, repo_meta)) continue;
+        if (package_has_exact_live_install_state(entry.package)) continue;
+        if (base_registry_entry_is_shadowed_by_live_package(entry, repo_meta, exact_live_packages, verbose)) {
+            ++shadowed_base_entries;
+            base_section.warnings.push_back(
+                entry.package + " is shadowed by a live package family transition and should not drive upgrades"
+            );
+        }
+    }
+    if (base_entries.empty()) {
+        // already reported as an error above
+    } else if (stale_base_entries == 0 && shadowed_base_entries == 0) {
+        base_section.ok.push_back("base-system registry entries look consistent with the live system");
+    }
+
+    if (!repo_index_present || !g_repo_package_cache_loaded) {
+        upgrade_section.errors.push_back("cannot build a dry-run upgrade plan until the local package index is available");
+    } else {
+        PreparedUpgradeState prepared;
+        std::set<std::string> installed_cache(registered_packages.begin(), registered_packages.end());
+        if (!prepare_upgrade_transaction(installed_cache, verbose, prepared)) {
+            upgrade_section.errors.push_back(
+                "gpkg could not build a safe upgrade plan; the next 'gpkg upgrade' would likely fail"
+            );
+        } else if (prepared.upgrade_queue.empty()) {
+            upgrade_section.ok.push_back("all packages are currently up to date");
+        } else {
+            size_t installed_upgrades = 0;
+            size_t installed_reinstalls = 0;
+            size_t base_bootstraps = 0;
+            for (const auto& entry : prepared.explicit_targets) {
+                if (entry.was_installed && entry.reinstall_only) ++installed_reinstalls;
+                else if (entry.was_installed) ++installed_upgrades;
+                else ++base_bootstraps;
+            }
+            upgrade_section.ok.push_back(
+                "dry-run upgrade plan is valid for " + std::to_string(prepared.upgrade_queue.size()) + " package(s)"
+            );
+            if (installed_upgrades > 0) {
+                upgrade_section.ok.push_back(std::to_string(installed_upgrades) + " installed package(s) would be upgraded");
+            }
+            if (installed_reinstalls > 0) {
+                upgrade_section.warnings.push_back(std::to_string(installed_reinstalls) + " package(s) would be reinstalled");
+            }
+            if (base_bootstraps > 0) {
+                upgrade_section.warnings.push_back(
+                    std::to_string(base_bootstraps) + " base-system package(s) would be imported into gpkg during upgrade"
+                );
+            }
+            if (!prepared.plan.retirements.empty()) {
+                upgrade_section.warnings.push_back(
+                    std::to_string(prepared.plan.retirements.size()) + " replaced package(s) would be retired during upgrade"
+                );
+            }
+        }
+    }
+
+    std::vector<DoctorSection> sections = {
+        repo_section,
+        install_section,
+        base_section,
+        upgrade_section,
+    };
+
+    size_t warning_count = 0;
+    size_t error_count = 0;
+    std::cout << "gpkg doctor report:" << std::endl;
+    for (const auto& section : sections) {
+        print_doctor_section(section);
+        warning_count += section.warnings.size();
+        error_count += section.errors.size();
+    }
+
+    std::cout << "Summary: ";
+    if (error_count == 0 && warning_count == 0) {
+        std::cout << Color::GREEN << "healthy" << Color::RESET;
+    } else if (error_count == 0) {
+        std::cout << Color::YELLOW << "warnings detected" << Color::RESET;
+    } else {
+        std::cout << Color::RED << "problems detected" << Color::RESET;
+    }
+    std::cout << " (" << error_count << " error(s), " << warning_count << " warning(s))" << std::endl;
+
+    return error_count == 0 ? 0 : 1;
 }
 
 int handle_repair(bool verbose) {

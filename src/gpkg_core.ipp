@@ -599,16 +599,16 @@ bool get_json_array(const std::string& obj, const std::string& key, std::vector<
 
 std::vector<PackageStatusRecord> load_base_system_package_status_records() {
     std::vector<PackageStatusRecord> records;
-    foreach_json_object(BASE_SYSTEM_REGISTRY_PATH, [&](const std::string& obj) {
+    for (const auto& entry : load_base_system_registry_entries()) {
+        if (!base_system_registry_entry_looks_present(entry)) continue;
         PackageStatusRecord record;
-        if (!get_json_value(obj, "package", record.package)) return true;
-        get_json_value(obj, "version", record.version);
+        record.package = entry.package;
+        record.version = entry.version;
         record.want = "install";
         record.flag = "ok";
         record.status = "installed";
         records.push_back(record);
-        return true;
-    });
+    }
     return records;
 }
 
@@ -619,6 +619,33 @@ bool get_base_system_package_status_record(const std::string& pkg_name, PackageS
         if (out) *out = record;
         return true;
     }
+    return false;
+}
+
+std::vector<BaseSystemRegistryEntry> load_base_system_registry_entries() {
+    std::vector<BaseSystemRegistryEntry> entries;
+    foreach_json_object(BASE_SYSTEM_REGISTRY_PATH, [&](const std::string& obj) {
+        BaseSystemRegistryEntry entry;
+        if (!get_json_value(obj, "package", entry.package)) return true;
+        get_json_value(obj, "version", entry.version);
+        get_json_array(obj, "files", entry.files);
+        entries.push_back(std::move(entry));
+        return true;
+    });
+    return entries;
+}
+
+bool base_system_registry_entry_looks_present(const BaseSystemRegistryEntry& entry) {
+    if (entry.package.empty()) return false;
+    if (entry.files.empty()) return false;
+
+    for (const auto& rel_path : entry.files) {
+        if (rel_path.empty() || rel_path[0] != '/') continue;
+        std::string full_path = ROOT_PREFIX + rel_path;
+        struct stat st {};
+        if (lstat(full_path.c_str(), &st) == 0) return true;
+    }
+
     return false;
 }
 

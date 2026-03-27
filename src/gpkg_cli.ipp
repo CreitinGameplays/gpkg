@@ -33,6 +33,7 @@ void print_help() {
               << "  remove <pkg>    Remove an installed package (--purge to purge conffiles too)\n"
               << "  autoremove      Remove automatically installed packages that are no longer needed\n"
               << "  repair          Repair broken dependencies and reinstall damaged packages\n"
+              << "  doctor          Inspect gpkg, repository, and upgrade health\n"
               << "  upgrade         Upgrade all installed packages\n"
               << "  update          Update local package indices\n"
               << "  search <query>  Search for packages\n"
@@ -205,6 +206,7 @@ int main(int argc, char* argv[]) {
     if (action == "update") return handle_update(verbose);
     if (action == "upgrade") return handle_upgrade(installed_cache, verbose);
     if (action == "repair") return handle_repair(verbose);
+    if (action == "doctor") return handle_doctor(verbose);
     if (action == "install" && argc > 2) return handle_install(argc, argv, installed_cache, verbose);
     if (action == "remove" && argc > 2) return handle_remove(argc, argv, verbose, purge, autoremove);
     if (action == "autoremove") return handle_autoremove(verbose, purge);

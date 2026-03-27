@@ -93,6 +93,12 @@ struct PackageStatusRecord {
     std::string version;
 };
 
+struct BaseSystemRegistryEntry {
+    std::string package;
+    std::string version;
+    std::vector<std::string> files;
+};
+
 struct PackageAutoStateRecord {
     std::string package;
     bool auto_installed = false;
@@ -107,6 +113,8 @@ CommandCaptureResult run_command_captured_argv(
 std::vector<PackageStatusRecord> load_package_status_records();
 std::vector<PackageStatusRecord> load_dpkg_package_status_records();
 std::vector<PackageStatusRecord> load_base_system_package_status_records();
+std::vector<BaseSystemRegistryEntry> load_base_system_registry_entries();
+bool base_system_registry_entry_looks_present(const BaseSystemRegistryEntry& entry);
 bool get_package_status_record(const std::string& pkg_name, PackageStatusRecord* out = nullptr);
 bool get_dpkg_package_status_record(const std::string& pkg_name, PackageStatusRecord* out = nullptr);
 bool get_base_system_package_status_record(const std::string& pkg_name, PackageStatusRecord* out = nullptr);
