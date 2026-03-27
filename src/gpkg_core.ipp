@@ -302,9 +302,9 @@ std::vector<std::string> get_installed_packages(const std::string& extension = "
     return pkgs;
 }
 
-std::vector<PackageStatusRecord> load_package_status_records() {
+std::vector<PackageStatusRecord> load_status_records_from_file(const std::string& path) {
     std::vector<PackageStatusRecord> records;
-    std::ifstream f(STATUS_FILE);
+    std::ifstream f(path);
     if (!f) return records;
 
     PackageStatusRecord current;
@@ -358,8 +358,26 @@ std::vector<PackageStatusRecord> load_package_status_records() {
     return records;
 }
 
+std::vector<PackageStatusRecord> load_package_status_records() {
+    return load_status_records_from_file(STATUS_FILE);
+}
+
+std::vector<PackageStatusRecord> load_dpkg_package_status_records() {
+    return load_status_records_from_file(DPKG_STATUS_FILE);
+}
+
 bool get_package_status_record(const std::string& pkg_name, PackageStatusRecord* out) {
     std::vector<PackageStatusRecord> records = load_package_status_records();
+    for (const auto& record : records) {
+        if (record.package != pkg_name) continue;
+        if (out) *out = record;
+        return true;
+    }
+    return false;
+}
+
+bool get_dpkg_package_status_record(const std::string& pkg_name, PackageStatusRecord* out) {
+    std::vector<PackageStatusRecord> records = load_dpkg_package_status_records();
     for (const auto& record : records) {
         if (record.package != pkg_name) continue;
         if (out) *out = record;
@@ -608,16 +626,23 @@ int compare_debian_part(const std::string& left, const std::string& right) {
     size_t j = 0;
 
     while (i < left.size() || j < right.size()) {
+        // Debian compares maximal non-digit segments first. If one side is
+        // already at a digit, it contributes end-of-segment here rather than
+        // the digit byte itself.
         while ((i < left.size() && !std::isdigit(static_cast<unsigned char>(left[i]))) ||
                (j < right.size() && !std::isdigit(static_cast<unsigned char>(right[j])))) {
-            char lc = i < left.size() ? left[i] : '\0';
-            char rc = j < right.size() ? right[j] : '\0';
+            char lc = (i < left.size() && !std::isdigit(static_cast<unsigned char>(left[i])))
+                ? left[i]
+                : '\0';
+            char rc = (j < right.size() && !std::isdigit(static_cast<unsigned char>(right[j])))
+                ? right[j]
+                : '\0';
             int lo = debian_char_order(lc);
             int ro = debian_char_order(rc);
             if (lo < ro) return -1;
             if (lo > ro) return 1;
-            if (i < left.size()) ++i;
-            if (j < right.size()) ++j;
+            if (lc != '\0') ++i;
+            if (rc != '\0') ++j;
         }
 
         while (i < left.size() && left[i] == '0') ++i;

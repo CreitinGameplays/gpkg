@@ -12,9 +12,56 @@ enum class PlannedPackageKind {
     BaseSystemUpgrade,
 };
 
+bool get_local_installed_package_version(
+    const std::string& pkg_name,
+    std::string* version_out = nullptr
+) {
+    if (version_out) version_out->clear();
+    if (pkg_name.empty()) return false;
+
+    if (is_installed(pkg_name, version_out)) return true;
+
+    PackageStatusRecord dpkg_record;
+    if (!get_dpkg_package_status_record(pkg_name, &dpkg_record)) return false;
+    if (!package_status_is_installed_like(dpkg_record.status)) return false;
+
+    if (version_out) *version_out = dpkg_record.version;
+    return true;
+}
+
+std::vector<std::string> collect_upgrade_scan_packages(
+    const std::set<std::string>& registered_installed,
+    bool verbose
+) {
+    std::set<std::string> upgrade_scan = registered_installed;
+
+    for (const auto& record : load_dpkg_package_status_records()) {
+        if (record.package.empty()) continue;
+        if (!package_status_is_installed_like(record.status)) continue;
+        if (upgrade_scan.count(record.package) != 0) continue;
+
+        if (package_is_base_system_provided(record.package) &&
+            !is_upgradeable_system_package(record.package)) {
+            VLOG(verbose, "Skipping non-upgradeable base package during upgrade scan: " << record.package);
+            continue;
+        }
+
+        if (is_blocked_import_package(record.package, verbose)) {
+            VLOG(verbose, "Skipping policy-blocked package during upgrade scan: " << record.package);
+            continue;
+        }
+
+        PackageMetadata repo_meta;
+        if (!get_repo_package_info(record.package, repo_meta)) continue;
+        upgrade_scan.insert(record.package);
+    }
+
+    return std::vector<std::string>(upgrade_scan.begin(), upgrade_scan.end());
+}
+
 PlannedPackageKind classify_planned_package(const PackageMetadata& meta, std::string* current_version = nullptr) {
     std::string installed_version;
-    if (!is_installed(meta.name, &installed_version)) {
+    if (!get_local_installed_package_version(meta.name, &installed_version)) {
         if (package_is_base_system_provided(meta.name)) {
             if (current_version) *current_version = "base system";
             return PlannedPackageKind::BaseSystemUpgrade;
@@ -1420,11 +1467,11 @@ bool queue_upgrade_target(
     }
 
     std::string current_version;
-    bool was_installed = is_installed(meta.name, &current_version);
+    bool was_installed = get_local_installed_package_version(meta.name, &current_version);
     if (!was_installed) {
         std::string canonical_requested = canonicalize_package_name(requested_dep.name, verbose);
         if (canonical_requested != requested_dep.name) {
-            was_installed = is_installed(requested_dep.name, &current_version);
+            was_installed = get_local_installed_package_version(requested_dep.name, &current_version);
         }
     }
     bool reinstall_only = was_installed && compare_versions(meta.version, current_version) == 0;
@@ -1666,7 +1713,9 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
     std::cout << "Reading package lists..." << std::endl;
     if (!ensure_repo_package_cache_loaded(verbose)) return 1;
     std::cout << "Optional dependency policy: " << describe_optional_dependency_policy() << std::endl;
-    VLOG(verbose, "Checking " << installed_cache.size() << " installed packages and upgradeable base runtimes.");
+    std::vector<std::string> upgrade_scan_packages = collect_upgrade_scan_packages(installed_cache, verbose);
+    VLOG(verbose, "Checking " << upgrade_scan_packages.size()
+         << " installed or importable packages and upgradeable base runtimes.");
 
     std::vector<PackageMetadata> upgrade_queue;
     std::vector<UpgradePlanEntry> explicit_targets;
@@ -1696,9 +1745,9 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
         }
     }
 
-    for (const auto& pkg : installed_cache) {
+    for (const auto& pkg : upgrade_scan_packages) {
         std::string current_ver;
-        if (!is_installed(pkg, &current_ver)) continue;
+        if (!get_local_installed_package_version(pkg, &current_ver)) continue;
 
         PackageMetadata repo_meta;
         if (!get_repo_package_info(pkg, repo_meta)) continue;
