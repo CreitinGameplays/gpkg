@@ -561,6 +561,51 @@ struct PackageMetadata {
     std::vector<std::string> replaces;
 };
 
+struct Dependency;
+
+struct UpgradeContext {
+    std::vector<PackageStatusRecord> registered_status_records;
+    std::vector<PackageStatusRecord> dpkg_status_records;
+    std::vector<BaseSystemRegistryEntry> base_entries;
+    std::map<std::string, PackageStatusRecord> registered_status_by_package;
+    std::map<std::string, PackageStatusRecord> dpkg_status_by_package;
+    std::map<std::string, PackageStatusRecord> base_status_by_package;
+    std::map<std::string, bool> base_presence_by_package;
+    std::vector<std::string> registered_package_names;
+    std::set<std::string> registered_package_set;
+    std::set<std::string> exact_live_packages;
+    std::set<std::string> present_base_packages;
+    std::map<std::string, std::string> normalized_root_by_raw;
+    std::map<std::string, std::vector<std::string>> shadowed_aliases_by_target;
+    std::map<std::string, std::string> shadowed_base_alias_target;
+    mutable std::map<std::string, PackageMetadata> live_metadata_cache;
+    mutable std::set<std::string> missing_live_metadata;
+    mutable std::map<std::string, std::string> registered_version_cache;
+    mutable std::set<std::string> missing_registered_versions;
+};
+
+UpgradeContext build_upgrade_context(bool verbose = false);
+bool get_local_installed_package_version(
+    const std::string& pkg_name,
+    std::string* version_out = nullptr,
+    UpgradeContext* context = nullptr
+);
+bool package_has_exact_live_install_state(
+    const std::string& pkg_name,
+    std::string* version_out = nullptr,
+    UpgradeContext* context = nullptr
+);
+bool get_context_live_installed_package_metadata(
+    UpgradeContext& context,
+    const std::string& pkg_name,
+    PackageMetadata& out_meta
+);
+std::string normalize_upgrade_root_name(
+    const std::string& raw_name,
+    UpgradeContext& context,
+    bool verbose
+);
+
 bool package_scope_contains(const std::string& scope, const std::string& token) {
     if (scope.empty() || token.empty()) return false;
 

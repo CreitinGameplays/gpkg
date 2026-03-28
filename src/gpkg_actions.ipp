@@ -14,10 +14,70 @@ enum class PlannedPackageKind {
 
 bool get_local_installed_package_version(
     const std::string& pkg_name,
-    std::string* version_out = nullptr
+    std::string* version_out,
+    UpgradeContext* context
 ) {
     if (version_out) version_out->clear();
     if (pkg_name.empty()) return false;
+
+    if (context) {
+        if (context->registered_package_set.count(pkg_name) != 0) {
+            auto status_it = context->registered_status_by_package.find(pkg_name);
+            if (status_it != context->registered_status_by_package.end() &&
+                !package_status_is_installed_like(status_it->second.status)) {
+                return false;
+            }
+            if (!version_out) return true;
+
+            if (status_it != context->registered_status_by_package.end() &&
+                !status_it->second.version.empty()) {
+                *version_out = status_it->second.version;
+                return true;
+            }
+
+            auto cached_it = context->registered_version_cache.find(pkg_name);
+            if (cached_it != context->registered_version_cache.end()) {
+                *version_out = cached_it->second;
+                return true;
+            }
+            if (context->missing_registered_versions.count(pkg_name) != 0) return false;
+
+            std::string info_path = INFO_DIR + pkg_name + ".json";
+            std::ifstream f(info_path);
+            if (!f) {
+                context->missing_registered_versions.insert(pkg_name);
+                return false;
+            }
+
+            std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+            std::string parsed_version;
+            if (!get_json_value(content, "version", parsed_version) || parsed_version.empty()) {
+                context->missing_registered_versions.insert(pkg_name);
+                return false;
+            }
+
+            context->registered_version_cache[pkg_name] = parsed_version;
+            *version_out = parsed_version;
+            return true;
+        }
+
+        auto dpkg_it = context->dpkg_status_by_package.find(pkg_name);
+        if (dpkg_it != context->dpkg_status_by_package.end() &&
+            package_status_is_installed_like(dpkg_it->second.status)) {
+            if (version_out) *version_out = dpkg_it->second.version;
+            return true;
+        }
+
+        auto base_it = context->base_status_by_package.find(pkg_name);
+        if (base_it != context->base_status_by_package.end() &&
+            package_status_is_installed_like(base_it->second.status) &&
+            !base_it->second.version.empty()) {
+            if (version_out) *version_out = base_it->second.version;
+            return true;
+        }
+
+        return false;
+    }
 
     if (is_installed(pkg_name, version_out)) return true;
 
@@ -38,10 +98,26 @@ bool get_local_installed_package_version(
 
 bool package_has_exact_live_install_state(
     const std::string& pkg_name,
-    std::string* version_out = nullptr
+    std::string* version_out,
+    UpgradeContext* context
 ) {
     if (version_out) version_out->clear();
     if (pkg_name.empty()) return false;
+
+    if (context) {
+        if (context->registered_package_set.count(pkg_name) != 0) {
+            return get_local_installed_package_version(pkg_name, version_out, context);
+        }
+
+        auto dpkg_it = context->dpkg_status_by_package.find(pkg_name);
+        if (dpkg_it != context->dpkg_status_by_package.end() &&
+            package_status_is_installed_like(dpkg_it->second.status)) {
+            if (version_out) *version_out = dpkg_it->second.version;
+            return true;
+        }
+
+        return false;
+    }
 
     if (is_installed(pkg_name, version_out)) return true;
 
@@ -55,10 +131,144 @@ bool package_has_exact_live_install_state(
     return false;
 }
 
-bool resolve_local_or_repo_package_metadata(
+std::vector<std::string> collect_registered_package_names_from_status_records(
+    const std::vector<PackageStatusRecord>& status_records
+) {
+    std::set<std::string> package_names;
+    std::map<std::string, std::string> status_by_package;
+    for (const auto& record : status_records) {
+        if (record.package.empty()) continue;
+        status_by_package[record.package] = record.status;
+        if (!package_status_is_installed_like(record.status)) continue;
+        package_names.insert(record.package);
+    }
+    for (const auto& pkg : get_installed_packages(".json")) {
+        auto status_it = status_by_package.find(pkg);
+        if (status_it != status_by_package.end() &&
+            !package_status_is_installed_like(status_it->second)) {
+            continue;
+        }
+        package_names.insert(pkg);
+    }
+    for (const auto& pkg : get_installed_packages(".list")) {
+        auto status_it = status_by_package.find(pkg);
+        if (status_it != status_by_package.end() &&
+            !package_status_is_installed_like(status_it->second)) {
+            continue;
+        }
+        package_names.insert(pkg);
+    }
+
+    return std::vector<std::string>(package_names.begin(), package_names.end());
+}
+
+UpgradeContext build_upgrade_context(bool verbose) {
+    (void)verbose;
+
+    UpgradeContext context;
+    context.registered_status_records = load_package_status_records();
+    for (const auto& record : context.registered_status_records) {
+        if (record.package.empty()) continue;
+        context.registered_status_by_package[record.package] = record;
+    }
+
+    context.registered_package_names =
+        collect_registered_package_names_from_status_records(context.registered_status_records);
+    context.registered_package_set.insert(
+        context.registered_package_names.begin(),
+        context.registered_package_names.end()
+    );
+    context.exact_live_packages.insert(
+        context.registered_package_names.begin(),
+        context.registered_package_names.end()
+    );
+
+    context.dpkg_status_records = load_dpkg_package_status_records();
+    for (const auto& record : context.dpkg_status_records) {
+        if (record.package.empty()) continue;
+        context.dpkg_status_by_package[record.package] = record;
+        if (!package_status_is_installed_like(record.status)) continue;
+        context.exact_live_packages.insert(record.package);
+    }
+
+    context.base_entries = load_base_system_registry_entries();
+    for (const auto& entry : context.base_entries) {
+        if (entry.package.empty()) continue;
+        bool present = base_system_registry_entry_looks_present(entry);
+        auto existing = context.base_presence_by_package.find(entry.package);
+        if (existing == context.base_presence_by_package.end()) {
+            context.base_presence_by_package[entry.package] = present;
+        } else {
+            existing->second = existing->second || present;
+        }
+        if (!present) continue;
+
+        context.present_base_packages.insert(entry.package);
+        PackageStatusRecord record;
+        record.package = entry.package;
+        record.version = entry.version;
+        record.want = "install";
+        record.flag = "ok";
+        record.status = "installed";
+        context.base_status_by_package[entry.package] = record;
+    }
+
+    return context;
+}
+
+bool get_context_live_installed_package_metadata(
+    UpgradeContext& context,
     const std::string& pkg_name,
     PackageMetadata& out_meta
 ) {
+    auto cache_it = context.live_metadata_cache.find(pkg_name);
+    if (cache_it != context.live_metadata_cache.end()) {
+        out_meta = cache_it->second;
+        return true;
+    }
+    if (context.missing_live_metadata.count(pkg_name) != 0) return false;
+
+    PackageMetadata meta;
+    if (get_installed_package_metadata(pkg_name, meta)) {
+        context.live_metadata_cache[pkg_name] = meta;
+        out_meta = meta;
+        return true;
+    }
+
+    std::string installed_version;
+    if (!get_local_installed_package_version(pkg_name, &installed_version, &context)) {
+        context.missing_live_metadata.insert(pkg_name);
+        return false;
+    }
+
+    if (get_repo_package_info(pkg_name, meta)) {
+        if (!installed_version.empty()) meta.version = installed_version;
+        context.live_metadata_cache[pkg_name] = meta;
+        out_meta = meta;
+        return true;
+    }
+
+    meta = {};
+    meta.name = pkg_name;
+    meta.version = installed_version;
+    if (meta.version.empty()) {
+        context.missing_live_metadata.insert(pkg_name);
+        return false;
+    }
+
+    context.live_metadata_cache[pkg_name] = meta;
+    out_meta = meta;
+    return true;
+}
+
+bool resolve_local_or_repo_package_metadata(
+    const std::string& pkg_name,
+    PackageMetadata& out_meta,
+    UpgradeContext* context = nullptr
+) {
+    if (context && get_context_live_installed_package_metadata(*context, pkg_name, out_meta)) {
+        return true;
+    }
     if (get_installed_package_metadata(pkg_name, out_meta)) return true;
     return get_repo_package_info(pkg_name, out_meta);
 }
@@ -220,6 +430,245 @@ bool queued_upgrade_candidate_shadows_base_alias(
                  << " in favor of " << candidate.name
                  << " because the former only survives as non-exact base-system state.");
     return true;
+}
+
+bool context_package_has_present_base_registry_state(
+    const UpgradeContext& context,
+    const std::string& pkg_name
+) {
+    auto it = context.base_presence_by_package.find(pkg_name);
+    return it != context.base_presence_by_package.end() && it->second;
+}
+
+bool candidate_shadows_requested_alias(
+    const std::string& candidate_name,
+    const PackageMetadata& candidate_meta,
+    const std::string& requested_name,
+    const PackageMetadata* requested_meta = nullptr
+) {
+    if (candidate_name.empty() || requested_name.empty()) return false;
+    if (candidate_name == requested_name) return false;
+
+    Dependency requested_dep{requested_name, "", ""};
+    bool candidate_satisfies_requested =
+        package_metadata_satisfies_dependency(candidate_name, candidate_meta, requested_dep);
+    bool candidate_replaces_requested =
+        package_replaces_package(candidate_meta, requested_name, requested_meta);
+    if (!candidate_satisfies_requested && !candidate_replaces_requested) return false;
+
+    bool candidate_conflicts_requested =
+        package_conflicts_with_package(candidate_meta, requested_name, requested_meta);
+    bool requested_conflicts_candidate =
+        requested_meta &&
+        package_conflicts_with_package(*requested_meta, candidate_name, &candidate_meta);
+    if (!candidate_conflicts_requested &&
+        !requested_conflicts_candidate &&
+        !candidate_replaces_requested) {
+        return false;
+    }
+
+    if (requested_meta) {
+        Dependency candidate_dep{candidate_name, "", ""};
+        bool requested_satisfies_candidate =
+            package_metadata_satisfies_dependency(requested_name, *requested_meta, candidate_dep);
+        bool requested_replaces_candidate =
+            package_replaces_package(*requested_meta, candidate_name, &candidate_meta);
+        if ((requested_satisfies_candidate || requested_replaces_candidate) &&
+            !candidate_replaces_requested) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool should_prefer_family_candidate(
+    const std::string& requested_name,
+    const PackageMetadata* requested_meta,
+    const std::string& candidate_name,
+    const PackageMetadata& candidate_meta,
+    const std::string& current_name,
+    const PackageMetadata* current_meta
+) {
+    if (current_name.empty() || !current_meta) return true;
+
+    bool candidate_shadows =
+        candidate_shadows_requested_alias(candidate_name, candidate_meta, requested_name, requested_meta);
+    bool current_shadows =
+        candidate_shadows_requested_alias(current_name, *current_meta, requested_name, requested_meta);
+    if (candidate_shadows != current_shadows) return candidate_shadows;
+
+    bool candidate_is_requested = candidate_name == requested_name;
+    bool current_is_requested = current_name == requested_name;
+    if (candidate_is_requested != current_is_requested) {
+        return !current_is_requested;
+    }
+
+    return should_prefer_repo_candidate(candidate_meta, *current_meta);
+}
+
+std::string find_best_exact_live_family(
+    const Dependency& requested_dep,
+    UpgradeContext& context,
+    bool verbose
+) {
+    if (package_has_exact_live_install_state(requested_dep.name, nullptr, &context)) {
+        return requested_dep.name;
+    }
+
+    std::string best_name;
+    PackageMetadata best_meta;
+    for (const auto& live_name : context.exact_live_packages) {
+        if (live_name.empty() || live_name == requested_dep.name) continue;
+
+        PackageMetadata live_meta;
+        if (!get_context_live_installed_package_metadata(context, live_name, live_meta)) continue;
+        if (!package_metadata_satisfies_dependency(live_name, live_meta, requested_dep) &&
+            !package_replaces_package(live_meta, requested_dep.name, nullptr)) {
+            continue;
+        }
+
+        if (best_name.empty() || should_prefer_repo_candidate(live_meta, best_meta)) {
+            best_name = live_name;
+            best_meta = live_meta;
+        }
+    }
+
+    if (!best_name.empty()) {
+        VLOG(verbose, "Normalized " << requested_dep.name
+                     << " to exact live package family " << best_name);
+    }
+    return best_name;
+}
+
+std::string find_best_present_base_family(
+    const Dependency& requested_dep,
+    UpgradeContext& context,
+    bool verbose
+) {
+    PackageMetadata requested_meta;
+    PackageMetadata* requested_meta_ptr = nullptr;
+    if (resolve_local_or_repo_package_metadata(requested_dep.name, requested_meta, &context)) {
+        requested_meta_ptr = &requested_meta;
+    }
+
+    std::string best_name;
+    PackageMetadata best_meta;
+    for (const auto& base_name : context.present_base_packages) {
+        PackageMetadata base_meta;
+        if (!resolve_local_or_repo_package_metadata(base_name, base_meta, &context)) continue;
+
+        if (!package_metadata_satisfies_dependency(base_name, base_meta, requested_dep) &&
+            !package_replaces_package(base_meta, requested_dep.name, requested_meta_ptr)) {
+            continue;
+        }
+
+        if (best_name.empty() ||
+            should_prefer_family_candidate(
+                requested_dep.name,
+                requested_meta_ptr,
+                base_name,
+                base_meta,
+                best_name,
+                &best_meta
+            )) {
+            best_name = base_name;
+            best_meta = base_meta;
+        }
+    }
+
+    if (!best_name.empty() && best_name != requested_dep.name) {
+        VLOG(verbose, "Normalized " << requested_dep.name
+                     << " to present base-backed family " << best_name);
+    }
+    return best_name;
+}
+
+std::string normalize_upgrade_root_name(
+    const std::string& raw_name,
+    UpgradeContext& context,
+    bool verbose
+) {
+    std::string canonical_name = canonicalize_package_name(raw_name, verbose);
+    if (canonical_name.empty()) return "";
+
+    Dependency requested_dep{canonical_name, "", ""};
+    if (package_has_exact_live_install_state(canonical_name, nullptr, &context)) {
+        return canonical_name;
+    }
+
+    std::string exact_live_family = find_best_exact_live_family(requested_dep, context, verbose);
+    if (!exact_live_family.empty()) return exact_live_family;
+
+    std::string base_family = find_best_present_base_family(requested_dep, context, verbose);
+    if (!base_family.empty()) return base_family;
+
+    PackageMetadata repo_meta;
+    if (get_repo_package_info(canonical_name, repo_meta)) return repo_meta.name;
+
+    return find_provider(canonical_name, requested_dep.op, requested_dep.version, verbose);
+}
+
+std::vector<std::string> collect_normalized_upgrade_roots(
+    UpgradeContext& context,
+    bool verbose
+) {
+    context.normalized_root_by_raw.clear();
+    context.shadowed_aliases_by_target.clear();
+    context.shadowed_base_alias_target.clear();
+
+    std::set<std::string> raw_roots;
+    for (const auto& pkg : context.exact_live_packages) {
+        if (!pkg.empty()) raw_roots.insert(canonicalize_package_name(pkg, verbose));
+    }
+    for (const auto& pkg : context.present_base_packages) {
+        if (!pkg.empty()) raw_roots.insert(canonicalize_package_name(pkg, verbose));
+    }
+    for (const auto& entry : load_upgradeable_system_packages()) {
+        Dependency dep = parse_dependency(entry);
+        if (dep.name.empty()) continue;
+        raw_roots.insert(canonicalize_package_name(dep.name, verbose));
+    }
+
+    std::vector<std::string> normalized_roots;
+    std::set<std::string> emitted_targets;
+    for (const auto& raw_name : raw_roots) {
+        if (raw_name.empty()) continue;
+
+        if (package_is_base_system_provided(raw_name) &&
+            !is_upgradeable_system_package(raw_name)) {
+            VLOG(verbose, "Skipping non-upgradeable base package during normalized upgrade scan: "
+                         << raw_name);
+            continue;
+        }
+
+        if (is_blocked_import_package(raw_name, verbose)) {
+            VLOG(verbose, "Skipping policy-blocked package during normalized upgrade scan: "
+                         << raw_name);
+            continue;
+        }
+
+        std::string target = normalize_upgrade_root_name(raw_name, context, verbose);
+        if (target.empty()) {
+            VLOG(verbose, "No repository candidate available for normalized upgrade root "
+                         << raw_name);
+            continue;
+        }
+
+        context.normalized_root_by_raw[raw_name] = target;
+        if (raw_name != target) {
+            context.shadowed_aliases_by_target[target].push_back(raw_name);
+            if (context_package_has_present_base_registry_state(context, raw_name)) {
+                context.shadowed_base_alias_target[raw_name] = target;
+            }
+        }
+
+        if (emitted_targets.insert(target).second) {
+            normalized_roots.push_back(target);
+        }
+    }
+
+    return normalized_roots;
 }
 
 PlannedPackageKind classify_planned_package(const PackageMetadata& meta, std::string* current_version = nullptr) {
@@ -1056,32 +1505,7 @@ void sort_removal_queue_for_operation(std::vector<std::string>& to_remove, bool 
 }
 
 std::vector<std::string> get_registered_package_names() {
-    std::set<std::string> package_names;
-    std::map<std::string, std::string> status_by_package;
-    for (const auto& record : load_package_status_records()) {
-        if (record.package.empty()) continue;
-        status_by_package[record.package] = record.status;
-        if (!package_status_is_installed_like(record.status)) continue;
-        package_names.insert(record.package);
-    }
-    for (const auto& pkg : get_installed_packages(".json")) {
-        auto status_it = status_by_package.find(pkg);
-        if (status_it != status_by_package.end() &&
-            !package_status_is_installed_like(status_it->second)) {
-            continue;
-        }
-        package_names.insert(pkg);
-    }
-    for (const auto& pkg : get_installed_packages(".list")) {
-        auto status_it = status_by_package.find(pkg);
-        if (status_it != status_by_package.end() &&
-            !package_status_is_installed_like(status_it->second)) {
-            continue;
-        }
-        package_names.insert(pkg);
-    }
-
-    return std::vector<std::string>(package_names.begin(), package_names.end());
+    return collect_registered_package_names_from_status_records(load_package_status_records());
 }
 
 std::vector<std::string> get_exact_live_package_names() {
@@ -1691,16 +2115,25 @@ bool redirect_upgrade_target_to_live_provider(
     const Dependency& requested_dep,
     const std::set<std::string>& installed_cache,
     bool verbose,
-    Dependency& redirected_dep
+    Dependency& redirected_dep,
+    UpgradeContext* context = nullptr
 ) {
     redirected_dep = requested_dep;
 
     std::string canonical_requested = canonicalize_package_name(requested_dep.name, verbose);
     if (canonical_requested.empty()) return false;
-    if (package_has_exact_live_install_state(canonical_requested)) return false;
+    if (package_has_exact_live_install_state(canonical_requested, nullptr, context)) return false;
 
     std::string provider_name;
-    if (!find_installed_dependency_provider(requested_dep, installed_cache, &provider_name)) return false;
+    if (!find_installed_dependency_provider(
+            requested_dep,
+            installed_cache,
+            &provider_name,
+            context,
+            verbose
+        )) {
+        return false;
+    }
     if (provider_name.empty() || provider_name == BASE_SYSTEM_PROVIDER) return false;
 
     provider_name = canonicalize_package_name(provider_name, verbose);
@@ -1727,14 +2160,16 @@ bool queue_upgrade_target(
     std::set<std::string>& dependency_visited,
     const std::set<std::string>& installed_cache,
     bool verbose,
-    bool force_reinstall = false
+    bool force_reinstall = false,
+    UpgradeContext* context = nullptr
 ) {
     Dependency effective_dep = requested_dep;
     redirect_upgrade_target_to_live_provider(
         requested_dep,
         installed_cache,
         verbose,
-        effective_dep
+        effective_dep,
+        context
     );
 
     PackageMetadata meta;
@@ -1744,11 +2179,15 @@ bool queue_upgrade_target(
     }
 
     std::string current_version;
-    bool was_installed = get_local_installed_package_version(meta.name, &current_version);
+    bool was_installed = get_local_installed_package_version(meta.name, &current_version, context);
     if (!was_installed) {
         std::string canonical_requested = canonicalize_package_name(requested_dep.name, verbose);
         if (canonical_requested != requested_dep.name) {
-            was_installed = get_local_installed_package_version(requested_dep.name, &current_version);
+            was_installed = get_local_installed_package_version(
+                requested_dep.name,
+                &current_version,
+                context
+            );
         }
     }
     bool reinstall_only = was_installed && compare_versions(meta.version, current_version) == 0;
@@ -1780,7 +2219,8 @@ bool queue_upgrade_target(
                 dependency_visited,
                 installed_cache,
                 verbose,
-                force_reinstall
+                force_reinstall,
+                context
             )) {
             target_walk.erase(meta.name);
             return false;
@@ -1796,7 +2236,9 @@ bool queue_upgrade_target(
                 install_queue,
                 dependency_visited,
                 installed_cache,
-                verbose
+                verbose,
+                false,
+                context
             )) {
             target_walk.erase(meta.name);
             return false;
@@ -1881,54 +2323,41 @@ bool expand_runtime_upgrade_companions(
 }
 
 bool prepare_upgrade_transaction(
-    const std::set<std::string>& installed_cache,
+    UpgradeContext& context,
     bool verbose,
     PreparedUpgradeState& out_state
 ) {
     out_state = {};
 
-    std::vector<std::string> upgrade_scan_packages = collect_upgrade_scan_packages(installed_cache, verbose);
-    VLOG(verbose, "Checking " << upgrade_scan_packages.size()
-         << " installed or importable packages and upgradeable base runtimes.");
+    std::vector<std::string> normalized_roots = collect_normalized_upgrade_roots(context, verbose);
+    VLOG(verbose, "Checking " << normalized_roots.size()
+         << " normalized installed or importable package families and upgradeable base runtimes.");
 
     std::set<std::string> queued_packages;
     std::set<std::string> explicit_target_names;
     std::set<std::string> target_walk;
     std::set<std::string> dependency_visited;
-    auto upgradeable_system = load_upgradeable_system_packages();
     auto companion_map = load_upgrade_companions();
 
-    for (const auto& entry : upgradeable_system) {
-        Dependency dep = parse_dependency(entry);
-        if (!queue_upgrade_target(
-                dep,
-                companion_map,
-                out_state.upgrade_queue,
-                out_state.explicit_targets,
-                queued_packages,
-                explicit_target_names,
-                target_walk,
-                dependency_visited,
-                installed_cache,
-                verbose,
-                g_force_reinstall
-            )) {
-            return false;
-        }
-    }
-
-    for (const auto& pkg : upgrade_scan_packages) {
+    for (const auto& pkg : normalized_roots) {
         std::string current_ver;
-        if (!get_local_installed_package_version(pkg, &current_ver)) continue;
+        bool was_installed = get_local_installed_package_version(pkg, &current_ver, &context);
 
         PackageMetadata repo_meta;
         if (!get_repo_package_info(pkg, repo_meta)) continue;
-        if (!g_force_reinstall && compare_versions(repo_meta.version, current_ver) <= 0) continue;
+        if (was_installed &&
+            !g_force_reinstall &&
+            compare_versions(repo_meta.version, current_ver) <= 0) {
+            continue;
+        }
 
-        if (compare_versions(repo_meta.version, current_ver) > 0) {
+        if (was_installed && compare_versions(repo_meta.version, current_ver) > 0) {
             VLOG(verbose, "Update found for " << pkg << ": " << current_ver << " -> " << repo_meta.version);
-        } else if (g_force_reinstall) {
+        } else if (was_installed && g_force_reinstall) {
             VLOG(verbose, "Reinstall requested for " << pkg << " at " << current_ver);
+        } else if (!was_installed) {
+            VLOG(verbose, "Import candidate found for normalized live family " << pkg
+                         << " at repository version " << repo_meta.version);
         }
         Dependency dep{pkg, "", ""};
         if (!queue_upgrade_target(
@@ -1940,9 +2369,10 @@ bool prepare_upgrade_transaction(
                 explicit_target_names,
                 target_walk,
                 dependency_visited,
-                installed_cache,
+                context.exact_live_packages,
                 verbose,
-                g_force_reinstall
+                g_force_reinstall,
+                &context
             )) {
             return false;
         }
@@ -1950,22 +2380,24 @@ bool prepare_upgrade_transaction(
 
     if (out_state.upgrade_queue.empty()) return true;
 
-    prune_shadowed_upgrade_targets(
-        out_state.upgrade_queue,
-        out_state.explicit_targets,
-        verbose
-    );
-
-    if (!build_transaction_plan(out_state.upgrade_queue, installed_cache, verbose, out_state.plan)) {
+    if (!build_transaction_plan(
+            out_state.upgrade_queue,
+            context.exact_live_packages,
+            verbose,
+            out_state.plan,
+            &context
+        )) {
         return false;
     }
     out_state.upgrade_queue = out_state.plan.install_queue;
     return true;
 }
 
-RepairInspection inspect_repair_state(bool verbose) {
+RepairInspection inspect_repair_state(
+    const std::vector<std::string>& registered_packages,
+    bool verbose
+) {
     RepairInspection inspection;
-    std::vector<std::string> registered_packages = get_registered_package_names();
     std::set<std::string> installed_cache(registered_packages.begin(), registered_packages.end());
     std::set<std::string> reinstall_targets;
     std::set<std::string> visited;
@@ -2067,14 +2499,20 @@ RepairInspection inspect_repair_state(bool verbose) {
     return inspection;
 }
 
+RepairInspection inspect_repair_state(bool verbose) {
+    return inspect_repair_state(get_registered_package_names(), verbose);
+}
+
 int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
+    (void)installed_cache;
     if (!ensure_repo_index_available()) return 1;
 
     std::cout << "Reading package lists..." << std::endl;
     if (!ensure_repo_package_cache_loaded(verbose)) return 1;
     std::cout << "Optional dependency policy: " << describe_optional_dependency_policy() << std::endl;
+    UpgradeContext context = build_upgrade_context(verbose);
     PreparedUpgradeState prepared;
-    if (!prepare_upgrade_transaction(installed_cache, verbose, prepared)) return 1;
+    if (!prepare_upgrade_transaction(context, verbose, prepared)) return 1;
     std::vector<PackageMetadata>& upgrade_queue = prepared.upgrade_queue;
     std::vector<UpgradePlanEntry>& explicit_targets = prepared.explicit_targets;
     TransactionPlan& upgrade_plan = prepared.plan;
@@ -2201,8 +2639,8 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
         if (!update_package_auto_install_state_after_install(
                 upgrade_queue[i].name,
                 explicit_target_names.count(upgrade_queue[i].name) != 0 &&
-                    installed_cache.count(upgrade_queue[i].name) == 0,
-                installed_cache)) {
+                    context.exact_live_packages.count(upgrade_queue[i].name) == 0,
+                context.exact_live_packages)) {
             if (!verbose) finish_progress_line(&install_progress_width);
             std::cerr << Color::RED << "E: Failed to update gpkg auto-install state for "
                       << upgrade_queue[i].name << Color::RESET << std::endl;
@@ -2326,8 +2764,9 @@ int handle_doctor(bool verbose) {
         }
     }
 
-    std::vector<std::string> registered_packages = get_registered_package_names();
-    std::set<std::string> exact_live_packages = get_exact_live_installed_package_set();
+    UpgradeContext context = build_upgrade_context(verbose);
+    std::vector<std::string>& registered_packages = context.registered_package_names;
+    std::set<std::string>& exact_live_packages = context.exact_live_packages;
     install_section.ok.push_back("gpkg knows about " + std::to_string(registered_packages.size()) + " registered package(s)");
     if (exact_live_packages.size() != registered_packages.size()) {
         install_section.ok.push_back(
@@ -2335,7 +2774,7 @@ int handle_doctor(bool verbose) {
         );
     }
 
-    RepairInspection inspection = inspect_repair_state(verbose);
+    RepairInspection inspection = inspect_repair_state(registered_packages, verbose);
     if (inspection.detected_issues.empty()) {
         install_section.ok.push_back("installed package metadata and file lists look consistent");
     } else {
@@ -2350,7 +2789,19 @@ int handle_doctor(bool verbose) {
         install_section.errors.push_back(issue);
     }
 
-    std::vector<BaseSystemRegistryEntry> base_entries = load_base_system_registry_entries();
+    PreparedUpgradeState prepared;
+    bool have_valid_upgrade_plan = false;
+    if (!repo_index_present || !g_repo_package_cache_loaded) {
+        upgrade_section.errors.push_back("cannot build a dry-run upgrade plan until the local package index is available");
+    } else if (!prepare_upgrade_transaction(context, verbose, prepared)) {
+        upgrade_section.errors.push_back(
+            "gpkg could not build a safe upgrade plan; the next 'gpkg upgrade' would likely fail"
+        );
+    } else {
+        have_valid_upgrade_plan = true;
+    }
+
+    std::vector<BaseSystemRegistryEntry>& base_entries = context.base_entries;
     if (base_entries.empty()) {
         base_section.errors.push_back("base-system registry is missing or empty: " + BASE_SYSTEM_REGISTRY_PATH);
     } else {
@@ -2368,14 +2819,12 @@ int handle_doctor(bool verbose) {
             continue;
         }
 
-        if (!repo_index_present || !g_repo_package_cache_loaded) continue;
-        PackageMetadata repo_meta;
-        if (!get_repo_package_info(entry.package, repo_meta)) continue;
-        if (package_has_exact_live_install_state(entry.package)) continue;
-        if (base_registry_entry_is_shadowed_by_live_package(entry, repo_meta, exact_live_packages, verbose)) {
+        auto shadow_it = context.shadowed_base_alias_target.find(entry.package);
+        if (shadow_it != context.shadowed_base_alias_target.end()) {
             ++shadowed_base_entries;
             base_section.warnings.push_back(
-                entry.package + " is shadowed by a live package family transition and should not drive upgrades"
+                entry.package + " is shadowed by live package family " + shadow_it->second
+                + " and will not drive upgrades"
             );
         }
     }
@@ -2385,44 +2834,35 @@ int handle_doctor(bool verbose) {
         base_section.ok.push_back("base-system registry entries look consistent with the live system");
     }
 
-    if (!repo_index_present || !g_repo_package_cache_loaded) {
-        upgrade_section.errors.push_back("cannot build a dry-run upgrade plan until the local package index is available");
-    } else {
-        PreparedUpgradeState prepared;
-        if (!prepare_upgrade_transaction(exact_live_packages, verbose, prepared)) {
-            upgrade_section.errors.push_back(
-                "gpkg could not build a safe upgrade plan; the next 'gpkg upgrade' would likely fail"
+    if (have_valid_upgrade_plan && prepared.upgrade_queue.empty()) {
+        upgrade_section.ok.push_back("all packages are currently up to date");
+    } else if (have_valid_upgrade_plan) {
+        size_t installed_upgrades = 0;
+        size_t installed_reinstalls = 0;
+        size_t base_bootstraps = 0;
+        for (const auto& entry : prepared.explicit_targets) {
+            if (entry.was_installed && entry.reinstall_only) ++installed_reinstalls;
+            else if (entry.was_installed) ++installed_upgrades;
+            else ++base_bootstraps;
+        }
+        upgrade_section.ok.push_back(
+            "dry-run upgrade plan is valid for " + std::to_string(prepared.upgrade_queue.size()) + " package(s)"
+        );
+        if (installed_upgrades > 0) {
+            upgrade_section.ok.push_back(std::to_string(installed_upgrades) + " installed package(s) would be upgraded");
+        }
+        if (installed_reinstalls > 0) {
+            upgrade_section.warnings.push_back(std::to_string(installed_reinstalls) + " package(s) would be reinstalled");
+        }
+        if (base_bootstraps > 0) {
+            upgrade_section.warnings.push_back(
+                std::to_string(base_bootstraps) + " base-system package(s) would be imported into gpkg during upgrade"
             );
-        } else if (prepared.upgrade_queue.empty()) {
-            upgrade_section.ok.push_back("all packages are currently up to date");
-        } else {
-            size_t installed_upgrades = 0;
-            size_t installed_reinstalls = 0;
-            size_t base_bootstraps = 0;
-            for (const auto& entry : prepared.explicit_targets) {
-                if (entry.was_installed && entry.reinstall_only) ++installed_reinstalls;
-                else if (entry.was_installed) ++installed_upgrades;
-                else ++base_bootstraps;
-            }
-            upgrade_section.ok.push_back(
-                "dry-run upgrade plan is valid for " + std::to_string(prepared.upgrade_queue.size()) + " package(s)"
+        }
+        if (!prepared.plan.retirements.empty()) {
+            upgrade_section.warnings.push_back(
+                std::to_string(prepared.plan.retirements.size()) + " replaced package(s) would be retired during upgrade"
             );
-            if (installed_upgrades > 0) {
-                upgrade_section.ok.push_back(std::to_string(installed_upgrades) + " installed package(s) would be upgraded");
-            }
-            if (installed_reinstalls > 0) {
-                upgrade_section.warnings.push_back(std::to_string(installed_reinstalls) + " package(s) would be reinstalled");
-            }
-            if (base_bootstraps > 0) {
-                upgrade_section.warnings.push_back(
-                    std::to_string(base_bootstraps) + " base-system package(s) would be imported into gpkg during upgrade"
-                );
-            }
-            if (!prepared.plan.retirements.empty()) {
-                upgrade_section.warnings.push_back(
-                    std::to_string(prepared.plan.retirements.size()) + " replaced package(s) would be retired during upgrade"
-                );
-            }
         }
     }
 

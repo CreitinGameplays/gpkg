@@ -231,9 +231,47 @@ std::map<std::string, std::vector<std::string>> load_upgrade_companions();
 bool find_installed_dependency_provider(
     const Dependency& dep,
     const std::set<std::string>& installed_cache,
-    std::string* provider_out = nullptr
+    std::string* provider_out = nullptr,
+    UpgradeContext* context = nullptr,
+    bool verbose = false
 ) {
     if (provider_out) provider_out->clear();
+
+    if (context) {
+        std::string normalized_name = normalize_upgrade_root_name(dep.name, *context, verbose);
+        if (!normalized_name.empty()) {
+            PackageMetadata normalized_meta;
+            if (get_context_live_installed_package_metadata(*context, normalized_name, normalized_meta) &&
+                package_metadata_satisfies_dependency(normalized_name, normalized_meta, dep)) {
+                if (provider_out) *provider_out = normalized_name;
+                return true;
+            }
+        }
+
+        std::set<std::string> live_candidates = context->exact_live_packages;
+        live_candidates.insert(
+            context->present_base_packages.begin(),
+            context->present_base_packages.end()
+        );
+        std::string best_name;
+        PackageMetadata best_meta;
+        for (const auto& candidate_name : live_candidates) {
+            if (candidate_name.empty()) continue;
+
+            PackageMetadata candidate_meta;
+            if (!get_context_live_installed_package_metadata(*context, candidate_name, candidate_meta)) continue;
+            if (!package_metadata_satisfies_dependency(candidate_name, candidate_meta, dep)) continue;
+
+            if (best_name.empty() || should_prefer_repo_candidate(candidate_meta, best_meta)) {
+                best_name = candidate_name;
+                best_meta = candidate_meta;
+            }
+        }
+        if (!best_name.empty()) {
+            if (provider_out) *provider_out = best_name;
+            return true;
+        }
+    }
 
     for (const auto& installed_name : installed_cache) {
         PackageMetadata meta;
@@ -250,18 +288,20 @@ bool is_dependency_satisfied_locally(
     const Dependency& dep,
     const std::set<std::string>& installed_cache,
     bool verbose,
-    std::string* provider_out = nullptr
+    std::string* provider_out = nullptr,
+    UpgradeContext* context = nullptr
 ) {
     if (provider_out) provider_out->clear();
 
     std::string installed_ver;
-    if (is_installed(dep.name, &installed_ver) && version_satisfies(installed_ver, dep.op, dep.version)) {
+    if (package_has_exact_live_install_state(dep.name, &installed_ver, context) &&
+        version_satisfies(installed_ver, dep.op, dep.version)) {
         if (provider_out) *provider_out = dep.name;
         return true;
     }
 
     std::string provider_name;
-    if (find_installed_dependency_provider(dep, installed_cache, &provider_name)) {
+    if (find_installed_dependency_provider(dep, installed_cache, &provider_name, context, verbose)) {
         if (provider_out) *provider_out = provider_name;
         return true;
     }
@@ -275,7 +315,8 @@ bool is_dependency_satisfied_locally(
         return true;
     }
 
-    if (verbose && !dep.op.empty() && is_installed(dep.name, &installed_ver)) {
+    if (verbose && !dep.op.empty() &&
+        package_has_exact_live_install_state(dep.name, &installed_ver, context)) {
         VLOG(verbose, dep.name << " is installed as " << installed_ver
              << " but does not satisfy " << dep.op << " " << dep.version);
     }
@@ -318,7 +359,8 @@ bool resolve_dependencies(
     std::set<std::string>& visited,
     const std::set<std::string>& installed_cache,
     bool verbose,
-    bool force_queue_requested = false
+    bool force_queue_requested = false,
+    UpgradeContext* context = nullptr
 ) {
     std::string canonical_pkg = canonicalize_package_name(pkg, verbose);
     Dependency requested_dep{canonical_pkg, op, req_version};
@@ -342,12 +384,18 @@ bool resolve_dependencies(
 
     std::string provider_name;
     if (!force_queue_requested &&
-        is_dependency_satisfied_locally(requested_dep, installed_cache, verbose, &provider_name)) {
+        is_dependency_satisfied_locally(
+            requested_dep,
+            installed_cache,
+            verbose,
+            &provider_name,
+            context
+        )) {
         if (provider_name == BASE_SYSTEM_PROVIDER) {
             VLOG(verbose, canonical_pkg << " is satisfied by the base-system policy.");
         } else if (provider_name == canonical_pkg) {
             std::string installed_ver;
-            is_installed(canonical_pkg, &installed_ver);
+            get_local_installed_package_version(canonical_pkg, &installed_ver, context);
             VLOG(verbose, canonical_pkg << " " << installed_ver << " is installed and satisfies constraints.");
         } else {
             VLOG(verbose, canonical_pkg << " is provided by installed package " << provider_name);
@@ -356,7 +404,8 @@ bool resolve_dependencies(
     }
 
     std::string installed_ver;
-    if (!force_queue_requested && is_installed(canonical_pkg, &installed_ver)) {
+    if (!force_queue_requested &&
+        package_has_exact_live_install_state(canonical_pkg, &installed_ver, context)) {
         if (version_satisfies(installed_ver, op, req_version)) {
             VLOG(verbose, canonical_pkg << " " << installed_ver << " is installed and satisfies constraints.");
             return true;
@@ -380,7 +429,17 @@ bool resolve_dependencies(
         std::string provider = find_provider(canonical_pkg, op, req_version, verbose);
         if (!provider.empty()) {
             VLOG(verbose, "Redirecting " << canonical_pkg << " -> " << provider);
-            return resolve_dependencies(provider, "", "", install_queue, visited, installed_cache, verbose, force_queue_requested);
+            return resolve_dependencies(
+                provider,
+                "",
+                "",
+                install_queue,
+                visited,
+                installed_cache,
+                verbose,
+                force_queue_requested,
+                context
+            );
         }
 
         std::cerr << Color::RED << "E: Unable to locate package " << canonical_pkg << Color::RESET << std::endl;
@@ -418,7 +477,17 @@ bool resolve_dependencies(
     visited.insert(canonical_pkg);
     for (const auto& dep_str : collect_transaction_dependency_edges(meta)) {
         Dependency dep = parse_dependency(dep_str);
-        if (!resolve_dependencies(dep.name, dep.op, dep.version, install_queue, visited, installed_cache, verbose, false)) {
+        if (!resolve_dependencies(
+                dep.name,
+                dep.op,
+                dep.version,
+                install_queue,
+                visited,
+                installed_cache,
+                verbose,
+                false,
+                context
+            )) {
             return false;
         }
     }
@@ -581,7 +650,8 @@ bool build_transaction_plan(
     const std::vector<PackageMetadata>& queue,
     const std::set<std::string>& installed,
     bool verbose,
-    TransactionPlan& out_plan
+    TransactionPlan& out_plan,
+    UpgradeContext* context = nullptr
 ) {
     out_plan = {};
 
@@ -601,7 +671,10 @@ bool build_transaction_plan(
         if (missing_installed_meta.count(pkg_name)) return nullptr;
 
         PackageMetadata meta;
-        if (!get_live_installed_package_metadata(pkg_name, meta)) {
+        bool found = context
+            ? get_context_live_installed_package_metadata(*context, pkg_name, meta)
+            : get_live_installed_package_metadata(pkg_name, meta);
+        if (!found) {
             missing_installed_meta.insert(pkg_name);
             return nullptr;
         }
