@@ -244,6 +244,7 @@ size_t recommended_parallel_worker_count(size_t task_count) {
 }
 
 std::set<std::string> g_pending_triggers;
+const std::string SELINUX_RELABEL_TRIGGER = "selinux-relabel";
 bool g_assume_yes = false;
 bool g_force_reinstall = false;
 OptionalDependencyPolicy g_optional_dependency_policy;
@@ -423,6 +424,17 @@ int run_ldconfig_trigger(bool verbose) {
     return decode_command_exit_status(run_command_argv(argv, verbose));
 }
 
+int run_selinux_relabel_trigger(bool verbose) {
+    std::vector<std::string> argv = {"gpkg-worker", "--refresh-selinux-label-state"};
+    if (verbose) argv.push_back("--verbose");
+    if (!ROOT_PREFIX.empty()) {
+        argv.push_back("--root");
+        argv.push_back(ROOT_PREFIX);
+    }
+
+    return decode_command_exit_status(run_command_argv(argv, verbose));
+}
+
 void run_triggers(bool verbose) {
     if (g_pending_triggers.empty()) return;
 
@@ -441,6 +453,21 @@ void run_triggers(bool verbose) {
             }
             if (verbose) std::cout << "[DEBUG] Running trigger via gpkg-worker: " << cmd << std::endl;
             if (run_ldconfig_trigger(verbose) != 0) {
+                failed_triggers.push_back(cmd);
+            }
+            continue;
+        }
+
+        if (cmd == SELINUX_RELABEL_TRIGGER) {
+            if (!is_executable_command_available("gpkg-worker")) {
+                if (verbose) {
+                    std::cout << "[DEBUG] Skipping SELinux relabel trigger because gpkg-worker is unavailable."
+                              << std::endl;
+                }
+                continue;
+            }
+            if (verbose) std::cout << "[DEBUG] Running trigger via gpkg-worker: " << cmd << std::endl;
+            if (run_selinux_relabel_trigger(verbose) != 0) {
                 failed_triggers.push_back(cmd);
             }
             continue;

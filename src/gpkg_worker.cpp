@@ -45,6 +45,12 @@ struct PackageStatusRecord {
 };
 
 struct InstallRollbackEntry;
+struct InstalledManifestSnapshot {
+    bool loaded = false;
+    std::vector<std::string> installed_packages;
+    std::map<std::string, std::vector<std::string>> file_lists_by_package;
+    std::map<std::string, std::string> owner_by_path;
+};
 
 std::string g_tmp_extract_path;
 
@@ -110,6 +116,8 @@ std::string path_basename(const std::string& path);
 std::string read_symlink_target(const std::string& path);
 bool file_list_touches_selinux_policy_store(const std::vector<std::string>& files);
 bool restorecon_transaction_paths(const std::vector<std::string>& logical_paths, std::string* error_out = nullptr);
+bool finalize_selinux_relabel_for_success(const std::vector<std::string>& logical_paths, std::string* error_out = nullptr);
+bool action_refresh_selinux_label_state();
 bool schedule_selinux_autorelabel(
     std::vector<InstallRollbackEntry>& rollback_entries,
     std::string* error_out = nullptr
@@ -120,11 +128,14 @@ bool backup_live_path_if_present(
     std::vector<InstallRollbackEntry>& rollback_entries,
     bool* had_existing
 );
+const InstalledManifestSnapshot& ensure_installed_manifest_snapshot();
+std::string find_cached_file_owner(const std::string& pkg_name, const std::string& file_path);
 
 // Logging
 bool g_verbose = false;
 size_t g_parallel_jobs = 0;
 bool g_defer_runtime_linker_refresh = false;
+bool g_defer_selinux_relabel = false;
 std::vector<PackageStatusRecord> g_status_records_cache;
 bool g_status_records_cache_loaded = false;
 #define VLOG(msg) do { if (g_verbose) std::cout << "[WORKER] " << msg << std::endl; } while(0)
@@ -878,12 +889,11 @@ int runtime_alias_path_rank(const std::string& path) {
 
 std::map<std::string, std::string> build_runtime_file_owner_index() {
     std::map<std::string, std::string> owner_index;
-    for (const auto& pkg_name : get_installed_packages()) {
-        for (const auto& owned_path : read_list_file(pkg_name)) {
-            if (!runtime_alias_managed_prefix(owned_path)) continue;
-            if (!is_multiarch_runtime_alias_candidate(path_basename(owned_path))) continue;
-            owner_index.emplace(canonical_multiarch_logical_path(owned_path), pkg_name);
-        }
+    const auto& snapshot = ensure_installed_manifest_snapshot();
+    for (const auto& entry : snapshot.owner_by_path) {
+        if (!runtime_alias_managed_prefix(entry.first)) continue;
+        if (!is_multiarch_runtime_alias_candidate(path_basename(entry.first))) continue;
+        owner_index.emplace(entry.first, entry.second);
     }
     return owner_index;
 }
@@ -1341,7 +1351,7 @@ struct ScopedExtractWorkspace {
 
 // --- Database (List File) Management ---
 
-std::vector<std::string> read_list_file(const std::string& pkg_name) {
+std::vector<std::string> read_list_file_from_disk(const std::string& pkg_name) {
     std::vector<std::string> files;
     std::string path = get_info_dir() + pkg_name + ".list";
     std::ifstream f(path);
@@ -1356,7 +1366,7 @@ std::vector<std::string> read_list_file(const std::string& pkg_name) {
 }
 
 // Get list of installed package names from INFO_DIR
-std::vector<std::string> get_installed_packages(const std::string& extension) {
+std::vector<std::string> get_installed_packages_from_disk(const std::string& extension) {
     std::vector<std::string> pkgs;
     DIR* d = opendir(get_info_dir().c_str());
     if (!d) return pkgs;
@@ -1376,6 +1386,49 @@ std::vector<std::string> get_installed_packages(const std::string& extension) {
     }
     closedir(d);
     return pkgs;
+}
+
+InstalledManifestSnapshot g_installed_manifest_snapshot;
+
+const InstalledManifestSnapshot& ensure_installed_manifest_snapshot() {
+    if (g_installed_manifest_snapshot.loaded) return g_installed_manifest_snapshot;
+
+    g_installed_manifest_snapshot.loaded = true;
+    g_installed_manifest_snapshot.installed_packages = get_installed_packages_from_disk(".list");
+    for (const auto& pkg_name : g_installed_manifest_snapshot.installed_packages) {
+        std::vector<std::string> files = read_list_file_from_disk(pkg_name);
+        g_installed_manifest_snapshot.file_lists_by_package.emplace(pkg_name, files);
+        for (const auto& owned_path : files) {
+            std::string canonical_path = canonical_multiarch_logical_path(owned_path);
+            if (canonical_path.empty()) continue;
+            g_installed_manifest_snapshot.owner_by_path.emplace(canonical_path, pkg_name);
+        }
+    }
+
+    return g_installed_manifest_snapshot;
+}
+
+std::vector<std::string> read_installed_list_file_cached(const std::string& pkg_name) {
+    const auto& snapshot = ensure_installed_manifest_snapshot();
+    auto it = snapshot.file_lists_by_package.find(pkg_name);
+    if (it != snapshot.file_lists_by_package.end()) return it->second;
+    return read_list_file_from_disk(pkg_name);
+}
+
+std::string find_cached_file_owner(const std::string& pkg_name, const std::string& file_path) {
+    const auto& snapshot = ensure_installed_manifest_snapshot();
+    std::string canonical_path = canonical_multiarch_logical_path(file_path);
+    auto it = snapshot.owner_by_path.find(canonical_path);
+    if (it == snapshot.owner_by_path.end() || it->second == pkg_name) return "";
+    return it->second;
+}
+
+std::vector<std::string> read_list_file(const std::string& pkg_name) {
+    return read_list_file_from_disk(pkg_name);
+}
+
+std::vector<std::string> get_installed_packages(const std::string& extension) {
+    return get_installed_packages_from_disk(extension);
 }
 
 bool read_file_prefix(const std::string& path, unsigned char* buffer, size_t count) {
@@ -1743,15 +1796,7 @@ bool write_package_conffiles(const std::string& pkg_name, const std::vector<std:
 }
 
 std::string find_file_owner(const std::string& pkg_name, const std::string& file_path) {
-    std::string canonical_file_path = canonical_multiarch_logical_path(file_path);
-    for (const auto& other : get_installed_packages()) {
-        if (other == pkg_name) continue;
-        auto other_files = read_list_file(other);
-        for (const auto& owned_path : other_files) {
-            if (canonical_multiarch_logical_path(owned_path) == canonical_file_path) return other;
-        }
-    }
-    return "";
+    return find_cached_file_owner(pkg_name, file_path);
 }
 
 struct PreservedConfigFile {
@@ -2284,6 +2329,55 @@ std::vector<std::string> collect_install_relabel_paths(
     std::vector<std::string> relabel_paths;
     std::set<std::string> seen;
     for (const auto& entry : staged_entries) {
+        std::string canonical_path = canonical_multiarch_logical_path(entry.path);
+        if (canonical_path.empty()) continue;
+
+        if (entry.is_directory && created_paths.count(canonical_path) == 0) continue;
+        if (!seen.insert(canonical_path).second) continue;
+        relabel_paths.push_back(canonical_path);
+    }
+
+    return relabel_paths;
+}
+
+bool install_path_is_early_selinux_relabel_candidate(const StagedInstallEntry& entry) {
+    std::string path = canonical_multiarch_logical_path(entry.path);
+    if (path.empty()) return false;
+
+    const char* critical_prefixes[] = {
+        "/bin",
+        "/sbin",
+        "/lib",
+        "/lib64",
+        "/usr/bin",
+        "/usr/sbin",
+        "/usr/lib",
+        "/usr/lib64",
+        "/usr/libexec",
+    };
+    for (const char* prefix : critical_prefixes) {
+        std::string prefix_str = prefix;
+        if (path == prefix_str || path.rfind(prefix_str + "/", 0) == 0) return true;
+    }
+
+    return !entry.is_directory && (entry.mode & 0111) != 0;
+}
+
+std::vector<std::string> collect_early_install_relabel_paths(
+    const std::vector<StagedInstallEntry>& staged_entries,
+    const std::vector<InstallRollbackEntry>& rollback_entries
+) {
+    std::set<std::string> created_paths;
+    for (const auto& entry : rollback_entries) {
+        if (!entry.created_only) continue;
+        created_paths.insert(canonical_multiarch_logical_path(entry.path));
+    }
+
+    std::vector<std::string> relabel_paths;
+    std::set<std::string> seen;
+    for (const auto& entry : staged_entries) {
+        if (!install_path_is_early_selinux_relabel_candidate(entry)) continue;
+
         std::string canonical_path = canonical_multiarch_logical_path(entry.path);
         if (canonical_path.empty()) continue;
 
@@ -3028,7 +3122,7 @@ bool action_remove_safe(const std::string& pkg_name) {
     }
 
     std::string selinux_error;
-    if (!restorecon_transaction_paths(selinux_relabel_paths, &selinux_error)) {
+    if (!finalize_selinux_relabel_for_success(selinux_relabel_paths, &selinux_error)) {
         rollback_remove_transaction(pkg_name, removal_rollback_entries, runtime_sensitive, false);
         std::cerr << "E: " << selinux_error << std::endl;
         return false;
@@ -3161,7 +3255,7 @@ bool action_retire_safe(const std::string& pkg_name) {
     }
 
     std::string selinux_error;
-    if (!restorecon_transaction_paths(owned_files, &selinux_error)) {
+    if (!finalize_selinux_relabel_for_success(owned_files, &selinux_error)) {
         rollback_install_changes(rollback_entries);
         if (runtime_sensitive) {
             sync_multiarch_runtime_aliases();
@@ -3608,6 +3702,7 @@ bool check_collisions(const std::string& pkg_name, const std::vector<std::string
     std::set<std::string> owned_by_me = build_normalized_owned_path_set(read_list_file(pkg_name));
 
     std::vector<std::string> collisions;
+    std::map<std::string, std::string> owner_by_collision;
 
     for (const auto& file : new_files) {
         std::string canonical_file = canonical_multiarch_logical_path(file);
@@ -3622,6 +3717,7 @@ bool check_collisions(const std::string& pkg_name, const std::vector<std::string
              if (canonical_file == "/usr/share/info/dir") continue;
 
              collisions.push_back(canonical_file);
+             owner_by_collision.emplace(canonical_file, find_cached_file_owner(pkg_name, canonical_file));
         }
     }
 
@@ -3631,29 +3727,22 @@ bool check_collisions(const std::string& pkg_name, const std::vector<std::string
     std::vector<std::string> replaced = get_staged_replaces();
     
     for (const auto& col : collisions) {
-        bool owned = false;
-        // Check who owns it
-        for (const auto& other : get_installed_packages()) {
-            if (other == pkg_name) continue;
-            auto other_files = read_list_file(other);
-            for (const auto& of : other_files) {
-                if (canonical_multiarch_logical_path(of) == col) {
-                    if (std::find(replaced.begin(), replaced.end(), other) != replaced.end()) {
-                        std::cout << "W: Permitted overwrite of " << col << " because " << pkg_name << " replaces " << other << std::endl;
-                        owned = true;
-                        break;
-                    }
-                    std::cerr << "E: Conflict: " << col << " is owned by " << other << std::endl;
-                    owned = true;
-                    fatal = true;
-                    break;
-                }
+        std::string owner;
+        auto owner_it = owner_by_collision.find(col);
+        if (owner_it != owner_by_collision.end()) owner = owner_it->second;
+
+        if (!owner.empty()) {
+            if (std::find(replaced.begin(), replaced.end(), owner) != replaced.end()) {
+                std::cout << "W: Permitted overwrite of " << col << " because "
+                          << pkg_name << " replaces " << owner << std::endl;
+                continue;
             }
-            if (owned) break;
+            std::cerr << "E: Conflict: " << col << " is owned by " << owner << std::endl;
+            fatal = true;
+            continue;
         }
-        if (!owned) {
-             std::cerr << "W: Overwriting unowned file " << col << std::endl;
-        }
+
+        std::cerr << "W: Overwriting unowned file " << col << std::endl;
     }
     
     return !fatal;
@@ -3856,6 +3945,70 @@ bool restorecon_transaction_paths(const std::vector<std::string>& logical_paths,
     return true;
 }
 
+std::string deferred_selinux_relabel_queue_path() {
+    return g_root_prefix + "/var/lib/gpkg/triggers/selinux-relabel.list";
+}
+
+bool append_deferred_selinux_relabel_paths(const std::vector<std::string>& logical_paths, std::string* error_out) {
+    if (error_out) error_out->clear();
+    if (!selinux_config_requests_enabled()) return true;
+
+    std::vector<std::string> normalized = normalize_owned_manifest_paths(logical_paths);
+    if (normalized.empty()) return true;
+
+    std::string queue_path = deferred_selinux_relabel_queue_path();
+    if (!mkdir_p(path_parent_dir(queue_path))) {
+        if (error_out) *error_out = "Failed to prepare deferred SELinux relabel queue directory.";
+        return false;
+    }
+
+    std::ofstream out(queue_path, std::ios::app);
+    if (!out) {
+        if (error_out) *error_out = "Failed to append deferred SELinux relabel queue.";
+        return false;
+    }
+
+    for (const auto& path : normalized) out << path << "\n";
+    return out.good();
+}
+
+bool finalize_selinux_relabel_for_success(const std::vector<std::string>& logical_paths, std::string* error_out) {
+    if (!g_defer_selinux_relabel) return restorecon_transaction_paths(logical_paths, error_out);
+    return append_deferred_selinux_relabel_paths(logical_paths, error_out);
+}
+
+bool action_refresh_selinux_label_state() {
+    std::string queue_path = deferred_selinux_relabel_queue_path();
+    std::ifstream in(queue_path);
+    if (!in) return true;
+
+    std::vector<std::string> logical_paths;
+    std::set<std::string> seen;
+    std::string line;
+    while (std::getline(in, line)) {
+        line = trim(line);
+        if (line.empty()) continue;
+        std::string normalized = canonical_multiarch_logical_path(line);
+        if (normalized.empty()) continue;
+        if (!seen.insert(normalized).second) continue;
+        logical_paths.push_back(normalized);
+    }
+    in.close();
+
+    std::string error;
+    if (!restorecon_transaction_paths(logical_paths, &error)) {
+        if (!error.empty()) std::cerr << "E: " << error << std::endl;
+        return false;
+    }
+
+    if (unlink(queue_path.c_str()) != 0 && errno != ENOENT) {
+        std::cerr << "E: Failed to clear deferred SELinux relabel queue: "
+                  << strerror(errno) << std::endl;
+        return false;
+    }
+    return true;
+}
+
 bool schedule_selinux_autorelabel(
     std::vector<InstallRollbackEntry>& rollback_entries,
     std::string* error_out
@@ -4037,6 +4190,8 @@ bool action_install(const std::string& pkg_file) {
 
     std::vector<std::string> initial_selinux_relabel_paths =
         collect_install_relabel_paths(staged_entries, install_rollback_entries);
+    std::vector<std::string> early_selinux_relabel_paths =
+        collect_early_install_relabel_paths(staged_entries, install_rollback_entries);
 
     if (runtime_sensitive) {
         sync_multiarch_runtime_aliases();
@@ -4074,7 +4229,9 @@ bool action_install(const std::string& pkg_file) {
     }
 
     std::string selinux_error;
-    if (!restorecon_transaction_paths(initial_selinux_relabel_paths, &selinux_error)) {
+    const std::vector<std::string>& pre_postinst_selinux_paths =
+        g_defer_selinux_relabel ? early_selinux_relabel_paths : initial_selinux_relabel_paths;
+    if (!restorecon_transaction_paths(pre_postinst_selinux_paths, &selinux_error)) {
         rollback_install_changes(install_rollback_entries);
         if (runtime_sensitive) {
             sync_multiarch_runtime_aliases();
@@ -4295,7 +4452,23 @@ bool action_install(const std::string& pkg_file) {
 
     std::vector<std::string> postinstall_selinux_delta =
         collect_postinstall_relabel_delta(pkg_name, initial_selinux_relabel_paths);
-    if (!postinstall_selinux_delta.empty()) {
+    if (g_defer_selinux_relabel) {
+        std::vector<std::string> deferred_selinux_paths = initial_selinux_relabel_paths;
+        deferred_selinux_paths.insert(
+            deferred_selinux_paths.end(),
+            postinstall_selinux_delta.begin(),
+            postinstall_selinux_delta.end()
+        );
+        if (!finalize_selinux_relabel_for_success(deferred_selinux_paths, &selinux_error)) {
+            rollback_install_changes(install_rollback_entries);
+            if (runtime_sensitive) {
+                sync_multiarch_runtime_aliases();
+                refresh_linker_cache_if_available();
+            }
+            std::cerr << "E: " << selinux_error << std::endl;
+            return false;
+        }
+    } else if (!postinstall_selinux_delta.empty()) {
         if (!restorecon_transaction_paths(postinstall_selinux_delta, &selinux_error)) {
             rollback_install_changes(install_rollback_entries);
             if (runtime_sensitive) {
@@ -4426,7 +4599,7 @@ int main(int argc, char* argv[]) {
 
     if (argc < 2) {
 
-        std::cout << "Usage: gpkg-worker [options]\nOptions:\n  --install <file>\n  --remove <pkg>\n  --purge <pkg>\n  --retire <pkg>\n  --verify <pkg>\n  --refresh-runtime-linker-state\n  --register-file <path> --pkg <name>\n  --register-undo <cmd> --pkg <name>\n  --jobs <n>\n  --defer-runtime-linker-refresh\n";
+        std::cout << "Usage: gpkg-worker [options]\nOptions:\n  --install <file>\n  --remove <pkg>\n  --purge <pkg>\n  --retire <pkg>\n  --verify <pkg>\n  --refresh-runtime-linker-state\n  --refresh-selinux-label-state\n  --register-file <path> --pkg <name>\n  --register-undo <cmd> --pkg <name>\n  --jobs <n>\n  --defer-runtime-linker-refresh\n  --defer-selinux-relabel\n";
 
         return 1;
 
@@ -4454,6 +4627,8 @@ int main(int argc, char* argv[]) {
 
         else if (arg == "--register-undo") mode = "register-undo", target = argv[++i];
 
+        else if (arg == "--refresh-selinux-label-state") mode = "refresh-selinux-label-state";
+
         else if (arg == "--pkg") pkg_name = argv[++i];
 
         else if (arg == "--root") g_root_prefix = argv[++i];
@@ -4468,6 +4643,8 @@ int main(int argc, char* argv[]) {
         }
 
         else if (arg == "--defer-runtime-linker-refresh") g_defer_runtime_linker_refresh = true;
+
+        else if (arg == "--defer-selinux-relabel") g_defer_selinux_relabel = true;
 
         else if (arg == "-v" || arg == "--verbose") g_verbose = true;
 
@@ -4484,6 +4661,8 @@ int main(int argc, char* argv[]) {
     if (mode == "verify" && !target.empty()) return action_verify(target) ? 0 : 1;
 
     if (mode == "refresh-runtime-linker-state") return action_refresh_runtime_linker_state() ? 0 : 1;
+
+    if (mode == "refresh-selinux-label-state") return action_refresh_selinux_label_state() ? 0 : 1;
 
     if (mode == "register-file" && !target.empty() && !pkg_name.empty()) return action_register_file(pkg_name, target) ? 0 : 1;
 

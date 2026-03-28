@@ -746,11 +746,13 @@ std::vector<std::string> build_worker_command_argv(
     const std::string& mode,
     const std::string& value,
     bool verbose,
-    bool defer_runtime_refresh = false
+    bool defer_runtime_refresh = false,
+    bool defer_selinux_relabel = false
 ) {
     std::vector<std::string> argv = {"gpkg-worker", mode, value};
     if (verbose) argv.push_back("--verbose");
     if (defer_runtime_refresh) argv.push_back("--defer-runtime-linker-refresh");
+    if (defer_selinux_relabel) argv.push_back("--defer-selinux-relabel");
     if (!ROOT_PREFIX.empty()) {
         argv.push_back("--root");
         argv.push_back(ROOT_PREFIX);
@@ -760,37 +762,41 @@ std::vector<std::string> build_worker_command_argv(
 
 InstallCommandResult install_package_from_file(const std::string& pkg_file, bool verbose) {
     CommandCaptureResult result = run_command_captured_argv(
-        build_worker_command_argv("--install", pkg_file, verbose, true),
+        build_worker_command_argv("--install", pkg_file, verbose, true, true),
         verbose,
         "gpkg-install"
     );
+    if (result.exit_code == 0) g_pending_triggers.insert(SELINUX_RELABEL_TRIGGER);
     return {result.exit_code == 0, result.log_path};
 }
 
 InstallCommandResult retire_package_by_name(const std::string& pkg_name, bool verbose) {
     CommandCaptureResult result = run_command_captured_argv(
-        build_worker_command_argv("--retire", pkg_name, verbose, true),
+        build_worker_command_argv("--retire", pkg_name, verbose, true, true),
         verbose,
         "gpkg-retire"
     );
+    if (result.exit_code == 0) g_pending_triggers.insert(SELINUX_RELABEL_TRIGGER);
     return {result.exit_code == 0, result.log_path};
 }
 
 InstallCommandResult remove_package_by_name(const std::string& pkg_name, bool verbose) {
     CommandCaptureResult result = run_command_captured_argv(
-        build_worker_command_argv("--remove", pkg_name, verbose, true),
+        build_worker_command_argv("--remove", pkg_name, verbose, true, true),
         verbose,
         "gpkg-remove"
     );
+    if (result.exit_code == 0) g_pending_triggers.insert(SELINUX_RELABEL_TRIGGER);
     return {result.exit_code == 0, result.log_path};
 }
 
 InstallCommandResult purge_package_by_name(const std::string& pkg_name, bool verbose) {
     CommandCaptureResult result = run_command_captured_argv(
-        build_worker_command_argv("--purge", pkg_name, verbose, true),
+        build_worker_command_argv("--purge", pkg_name, verbose, true, true),
         verbose,
         "gpkg-purge"
     );
+    if (result.exit_code == 0) g_pending_triggers.insert(SELINUX_RELABEL_TRIGGER);
     return {result.exit_code == 0, result.log_path};
 }
 
