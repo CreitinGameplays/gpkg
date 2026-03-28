@@ -627,15 +627,17 @@ std::vector<std::string> apply_dependency_removals(
     return result;
 }
 
-PackageMetadata build_debian_package_metadata(
+bool build_debian_package_metadata(
     const DebianPackageRecord& record,
     const DebianBackendConfig& config,
     const ImportPolicy& policy,
     const std::set<std::string>& available_packages,
     const std::map<std::string, std::vector<std::string>>& provider_map,
-    const std::vector<std::string>& system_drop_patterns
+    const std::vector<std::string>& system_drop_patterns,
+    PackageMetadata& meta,
+    std::string* skip_reason_out = nullptr
 ) {
-    PackageMetadata meta;
+    if (skip_reason_out) skip_reason_out->clear();
     auto override_it = policy.package_overrides.find(record.package);
     PackageOverridePolicy package_override;
     if (override_it != policy.package_overrides.end()) package_override = override_it->second;
@@ -651,6 +653,7 @@ PackageMetadata build_debian_package_metadata(
         required_dependency_text += record.depends_raw;
     }
 
+    std::vector<std::string> unresolved_required_groups;
     std::vector<std::string> depends = normalize_dependency_relation_value(
         required_dependency_text,
         record.package,
@@ -659,8 +662,21 @@ PackageMetadata build_debian_package_metadata(
         policy,
         available_packages,
         provider_map,
-        system_drop_patterns
+        system_drop_patterns,
+        &unresolved_required_groups
     );
+    if (!unresolved_required_groups.empty()) {
+        if (skip_reason_out) {
+            std::ostringstream reason;
+            reason << "unresolved required dependency group(s): ";
+            for (size_t i = 0; i < unresolved_required_groups.size(); ++i) {
+                if (i > 0) reason << ", ";
+                reason << unresolved_required_groups[i];
+            }
+            *skip_reason_out = reason.str();
+        }
+        return false;
+    }
     for (const auto& dep : package_override.depends_add) depends.push_back(dep);
     depends = apply_dependency_removals(depends, package_override);
     std::vector<std::string> recommends = apply_dependency_removals(
@@ -722,7 +738,7 @@ PackageMetadata build_debian_package_metadata(
     
     meta.package_scope = include_recommends ? "depends+recommends" : "depends";
     meta.installed_from = config.packages_url;
-    return meta;
+    return true;
 }
 
 std::vector<PackageMetadata> load_debian_index_entries(
@@ -769,14 +785,24 @@ std::vector<PackageMetadata> load_debian_index_entries(
                 continue;
             }
 
-            PackageMetadata meta = build_debian_package_metadata(
+            PackageMetadata meta;
+            std::string skip_reason;
+            if (!build_debian_package_metadata(
                 record,
                 config,
                 policy,
                 available_packages,
                 provider_map,
-                system_drop_patterns
-            );
+                system_drop_patterns,
+                meta,
+                &skip_reason
+            )) {
+                if (skipped_policy) {
+                    if (skip_reason.empty()) skip_reason = "unresolved required dependencies";
+                    skipped.push_back(record.package + ": " + skip_reason);
+                }
+                continue;
+            }
 
             auto it = selected.find(meta.name);
             if (it == selected.end() || compare_versions(meta.version, it->second.version) > 0) {

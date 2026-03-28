@@ -432,7 +432,8 @@ std::vector<std::string> normalize_dependency_relation_value(
     const ImportPolicy& policy,
     const std::set<std::string>& available_packages,
     const std::map<std::string, std::vector<std::string>>& provider_map,
-    const std::vector<std::string>& system_drop_patterns
+    const std::vector<std::string>& system_drop_patterns,
+    std::vector<std::string>* unresolved_groups_out = nullptr
 ) {
     std::vector<std::string> normalized;
     std::vector<std::string> dependency_skip_patterns = policy.skip_packages;
@@ -533,6 +534,9 @@ std::vector<std::string> normalize_dependency_relation_value(
             }
         }
         if (selected.empty() && dropped_as_system) continue;
+        if (selected.empty() && unresolved_groups_out) {
+            unresolved_groups_out->push_back(trim(group));
+        }
         if (!selected.empty()) normalized.push_back(selected);
     }
 
