@@ -2269,6 +2269,52 @@ struct InstallRollbackEntry {
 void rollback_install_changes(const std::vector<InstallRollbackEntry>& rollback_entries);
 void discard_install_backups(const std::vector<InstallRollbackEntry>& rollback_entries);
 
+std::vector<std::string> collect_install_relabel_paths(
+    const std::vector<StagedInstallEntry>& staged_entries,
+    const std::vector<InstallRollbackEntry>& rollback_entries
+) {
+    // Relabel files we actually wrote plus directories we created; pre-existing
+    // parent directories like /usr or /usr/share do not need recursive relabels.
+    std::set<std::string> created_paths;
+    for (const auto& entry : rollback_entries) {
+        if (!entry.created_only) continue;
+        created_paths.insert(canonical_multiarch_logical_path(entry.path));
+    }
+
+    std::vector<std::string> relabel_paths;
+    std::set<std::string> seen;
+    for (const auto& entry : staged_entries) {
+        std::string canonical_path = canonical_multiarch_logical_path(entry.path);
+        if (canonical_path.empty()) continue;
+
+        if (entry.is_directory && created_paths.count(canonical_path) == 0) continue;
+        if (!seen.insert(canonical_path).second) continue;
+        relabel_paths.push_back(canonical_path);
+    }
+
+    return relabel_paths;
+}
+
+std::vector<std::string> collect_postinstall_relabel_delta(
+    const std::string& pkg_name,
+    const std::vector<std::string>& already_relabelled_paths
+) {
+    std::set<std::string> seen;
+    for (const auto& path : already_relabelled_paths) {
+        seen.insert(canonical_multiarch_logical_path(path));
+    }
+
+    std::vector<std::string> delta;
+    for (const auto& path : normalize_owned_manifest_paths(read_list_file(pkg_name))) {
+        std::string canonical_path = canonical_multiarch_logical_path(path);
+        if (canonical_path.empty()) continue;
+        if (!seen.insert(canonical_path).second) continue;
+        delta.push_back(canonical_path);
+    }
+
+    return delta;
+}
+
 size_t path_depth(const std::string& path) {
     return static_cast<size_t>(std::count(path.begin(), path.end(), '/'));
 }
@@ -3687,8 +3733,19 @@ bool file_list_touches_selinux_policy_store(const std::vector<std::string>& file
     return false;
 }
 
-std::vector<std::string> existing_selinux_relabel_targets(const std::vector<std::string>& logical_paths) {
-    std::vector<std::string> targets;
+struct SelinuxRelabelTarget {
+    std::string full_path;
+    bool recursive = false;
+};
+
+bool path_is_same_or_descendant_of(const std::string& path, const std::string& ancestor) {
+    if (path == ancestor) return true;
+    if (ancestor.empty()) return false;
+    return path.rfind(ancestor + "/", 0) == 0;
+}
+
+std::vector<SelinuxRelabelTarget> existing_selinux_relabel_targets(const std::vector<std::string>& logical_paths) {
+    std::vector<SelinuxRelabelTarget> candidates;
     std::set<std::string> seen;
 
     for (const auto& path : logical_paths) {
@@ -3700,6 +3757,7 @@ std::vector<std::string> existing_selinux_relabel_targets(const std::vector<std:
         if (lstat(full_path.c_str(), &st) != 0) continue;
 
         std::string relabel_target = full_path;
+        struct stat relabel_st = st;
         if (S_ISLNK(st.st_mode)) {
             std::string resolved = canonical_existing_path(full_path);
             if (resolved.empty()) {
@@ -3707,17 +3765,49 @@ std::vector<std::string> existing_selinux_relabel_targets(const std::vector<std:
                 continue;
             }
             relabel_target = resolved;
+            if (lstat(relabel_target.c_str(), &relabel_st) != 0) continue;
         }
 
         if (!seen.insert(relabel_target).second) continue;
-        targets.push_back(relabel_target);
+        candidates.push_back({relabel_target, S_ISDIR(relabel_st.st_mode)});
     }
 
-    std::sort(targets.begin(), targets.end(), [](const std::string& left, const std::string& right) {
-        if (left.size() != right.size()) return left.size() < right.size();
-        return left < right;
+    std::sort(candidates.begin(), candidates.end(), [](const SelinuxRelabelTarget& left, const SelinuxRelabelTarget& right) {
+        if (left.recursive != right.recursive) return left.recursive > right.recursive;
+        size_t left_depth = static_cast<size_t>(std::count(left.full_path.begin(), left.full_path.end(), '/'));
+        size_t right_depth = static_cast<size_t>(std::count(right.full_path.begin(), right.full_path.end(), '/'));
+        if (left_depth != right_depth) return left_depth > right_depth;
+        if (left.full_path.size() != right.full_path.size()) return left.full_path.size() > right.full_path.size();
+        return left.full_path < right.full_path;
     });
-    return targets;
+
+    std::vector<SelinuxRelabelTarget> selected;
+    for (const auto& candidate : candidates) {
+        bool covered_by_recursive_target = false;
+        for (const auto& target : selected) {
+            if (!target.recursive) continue;
+            if (path_is_same_or_descendant_of(candidate.full_path, target.full_path)) {
+                covered_by_recursive_target = true;
+                break;
+            }
+        }
+        if (covered_by_recursive_target) continue;
+
+        if (candidate.recursive) {
+            bool broader_than_existing_target = false;
+            for (const auto& target : selected) {
+                if (path_is_same_or_descendant_of(target.full_path, candidate.full_path)) {
+                    broader_than_existing_target = true;
+                    break;
+                }
+            }
+            if (broader_than_existing_target) continue;
+        }
+
+        selected.push_back(candidate);
+    }
+
+    return selected;
 }
 
 bool relabel_path_with_restorecon(const std::string& restorecon, const std::string& full_path, std::string* error_out) {
@@ -3757,8 +3847,8 @@ bool restorecon_transaction_paths(const std::vector<std::string>& logical_paths,
         return false;
     }
 
-    for (const auto& full_path : existing_selinux_relabel_targets(logical_paths)) {
-        if (!relabel_path_with_restorecon(restorecon, full_path, error_out)) {
+    for (const auto& target : existing_selinux_relabel_targets(logical_paths)) {
+        if (!relabel_path_with_restorecon(restorecon, target.full_path, error_out)) {
             return false;
         }
     }
@@ -3945,6 +4035,9 @@ bool action_install(const std::string& pkg_file) {
         return false;
     }
 
+    std::vector<std::string> initial_selinux_relabel_paths =
+        collect_install_relabel_paths(staged_entries, install_rollback_entries);
+
     if (runtime_sensitive) {
         sync_multiarch_runtime_aliases();
 
@@ -3981,7 +4074,7 @@ bool action_install(const std::string& pkg_file) {
     }
 
     std::string selinux_error;
-    if (!restorecon_transaction_paths(new_files, &selinux_error)) {
+    if (!restorecon_transaction_paths(initial_selinux_relabel_paths, &selinux_error)) {
         rollback_install_changes(install_rollback_entries);
         if (runtime_sensitive) {
             sync_multiarch_runtime_aliases();
@@ -4200,14 +4293,18 @@ bool action_install(const std::string& pkg_file) {
         }
     }
 
-    if (!restorecon_transaction_paths(installed_files, &selinux_error)) {
-        rollback_install_changes(install_rollback_entries);
-        if (runtime_sensitive) {
-            sync_multiarch_runtime_aliases();
-            refresh_linker_cache_if_available();
+    std::vector<std::string> postinstall_selinux_delta =
+        collect_postinstall_relabel_delta(pkg_name, initial_selinux_relabel_paths);
+    if (!postinstall_selinux_delta.empty()) {
+        if (!restorecon_transaction_paths(postinstall_selinux_delta, &selinux_error)) {
+            rollback_install_changes(install_rollback_entries);
+            if (runtime_sensitive) {
+                sync_multiarch_runtime_aliases();
+                refresh_linker_cache_if_available();
+            }
+            std::cerr << "E: " << selinux_error << std::endl;
+            return false;
         }
-        std::cerr << "E: " << selinux_error << std::endl;
-        return false;
     }
 
     if (selinux_policy_touched && selinux_config_requests_enabled()) {
