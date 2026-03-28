@@ -164,6 +164,64 @@ std::vector<std::string> collect_upgrade_scan_packages(
     return std::vector<std::string>(upgrade_scan.begin(), upgrade_scan.end());
 }
 
+bool package_has_present_base_registry_state(const std::string& pkg_name) {
+    if (pkg_name.empty()) return false;
+
+    for (const auto& entry : load_base_system_registry_entries()) {
+        if (entry.package != pkg_name) continue;
+        return base_system_registry_entry_looks_present(entry);
+    }
+
+    return false;
+}
+
+bool queued_upgrade_candidate_shadows_base_alias(
+    const PackageMetadata& candidate,
+    const PackageMetadata& shadowed,
+    bool verbose
+) {
+    if (candidate.name.empty() || shadowed.name.empty()) return false;
+    if (candidate.name == shadowed.name) return false;
+    if (package_has_exact_live_install_state(shadowed.name)) return false;
+
+    bool shadowed_is_base_backed =
+        package_is_base_system_provided(shadowed.name) ||
+        package_has_present_base_registry_state(shadowed.name);
+    if (!shadowed_is_base_backed) return false;
+
+    Dependency shadowed_dep{shadowed.name, "", ""};
+    if (!package_metadata_satisfies_dependency(candidate.name, candidate, shadowed_dep)) {
+        return false;
+    }
+
+    bool candidate_conflicts_shadowed =
+        package_conflicts_with_package(candidate, shadowed.name, &shadowed);
+    bool shadowed_conflicts_candidate =
+        package_conflicts_with_package(shadowed, candidate.name, &candidate);
+    bool candidate_replaces_shadowed =
+        package_replaces_package(candidate, shadowed.name, &shadowed);
+    if (!candidate_conflicts_shadowed &&
+        !shadowed_conflicts_candidate &&
+        !candidate_replaces_shadowed) {
+        return false;
+    }
+
+    Dependency candidate_dep{candidate.name, "", ""};
+    bool shadowed_satisfies_candidate =
+        package_metadata_satisfies_dependency(shadowed.name, shadowed, candidate_dep);
+    bool shadowed_replaces_candidate =
+        package_replaces_package(shadowed, candidate.name, &candidate);
+    if ((shadowed_satisfies_candidate || shadowed_replaces_candidate) &&
+        !candidate_replaces_shadowed) {
+        return false;
+    }
+
+    VLOG(verbose, "Pruning shadowed upgrade target " << shadowed.name
+                 << " in favor of " << candidate.name
+                 << " because the former only survives as non-exact base-system state.");
+    return true;
+}
+
 PlannedPackageKind classify_planned_package(const PackageMetadata& meta, std::string* current_version = nullptr) {
     std::string installed_version;
     if (!get_local_installed_package_version(meta.name, &installed_version)) {
@@ -1449,6 +1507,56 @@ struct PreparedUpgradeState {
     TransactionPlan plan;
 };
 
+void prune_shadowed_upgrade_targets(
+    std::vector<PackageMetadata>& upgrade_queue,
+    std::vector<UpgradePlanEntry>& explicit_targets,
+    bool verbose
+) {
+    if (upgrade_queue.size() < 2) return;
+
+    std::vector<bool> keep(upgrade_queue.size(), true);
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (size_t i = 0; i < upgrade_queue.size(); ++i) {
+            if (!keep[i]) continue;
+
+            for (size_t j = 0; j < upgrade_queue.size(); ++j) {
+                if (i == j || !keep[j]) continue;
+                if (!queued_upgrade_candidate_shadows_base_alias(
+                        upgrade_queue[j],
+                        upgrade_queue[i],
+                        verbose
+                    )) {
+                    continue;
+                }
+
+                keep[i] = false;
+                changed = true;
+                break;
+            }
+        }
+    }
+
+    std::vector<PackageMetadata> filtered_queue;
+    std::set<std::string> kept_names;
+    filtered_queue.reserve(upgrade_queue.size());
+    for (size_t i = 0; i < upgrade_queue.size(); ++i) {
+        if (!keep[i]) continue;
+        filtered_queue.push_back(upgrade_queue[i]);
+        kept_names.insert(upgrade_queue[i].name);
+    }
+    upgrade_queue.swap(filtered_queue);
+
+    std::vector<UpgradePlanEntry> filtered_targets;
+    filtered_targets.reserve(explicit_targets.size());
+    for (const auto& entry : explicit_targets) {
+        if (kept_names.count(entry.meta.name) == 0) continue;
+        filtered_targets.push_back(entry);
+    }
+    explicit_targets.swap(filtered_targets);
+}
+
 std::vector<std::string> parse_companion_tokens(const std::string& raw_value) {
     std::string normalized = raw_value;
     for (char& ch : normalized) {
@@ -1841,6 +1949,12 @@ bool prepare_upgrade_transaction(
     }
 
     if (out_state.upgrade_queue.empty()) return true;
+
+    prune_shadowed_upgrade_targets(
+        out_state.upgrade_queue,
+        out_state.explicit_targets,
+        verbose
+    );
 
     if (!build_transaction_plan(out_state.upgrade_queue, installed_cache, verbose, out_state.plan)) {
         return false;
