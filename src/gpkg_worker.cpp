@@ -3693,9 +3693,24 @@ std::vector<std::string> existing_selinux_relabel_targets(const std::vector<std:
 
     for (const auto& path : logical_paths) {
         std::string normalized = canonical_multiarch_logical_path(path);
-        if (normalized.empty() || !seen.insert(normalized).second) continue;
-        if (!path_exists_no_follow(g_root_prefix + normalized)) continue;
-        targets.push_back(normalized);
+        if (normalized.empty()) continue;
+
+        std::string full_path = g_root_prefix + normalized;
+        struct stat st {};
+        if (lstat(full_path.c_str(), &st) != 0) continue;
+
+        std::string relabel_target = full_path;
+        if (S_ISLNK(st.st_mode)) {
+            std::string resolved = canonical_existing_path(full_path);
+            if (resolved.empty()) {
+                VLOG("Skipping SELinux relabel for dangling or unreadable symlink " << normalized);
+                continue;
+            }
+            relabel_target = resolved;
+        }
+
+        if (!seen.insert(relabel_target).second) continue;
+        targets.push_back(relabel_target);
     }
 
     std::sort(targets.begin(), targets.end(), [](const std::string& left, const std::string& right) {
@@ -3714,9 +3729,7 @@ bool relabel_path_with_restorecon(const std::string& restorecon, const std::stri
     }
 
     std::vector<std::string> args = {"-F"};
-    if (S_ISLNK(st.st_mode)) {
-        args.push_back("-h");
-    } else if (S_ISDIR(st.st_mode)) {
+    if (S_ISDIR(st.st_mode)) {
         args.push_back("-R");
     }
     args.push_back(full_path);
@@ -3744,8 +3757,8 @@ bool restorecon_transaction_paths(const std::vector<std::string>& logical_paths,
         return false;
     }
 
-    for (const auto& logical_path : existing_selinux_relabel_targets(logical_paths)) {
-        if (!relabel_path_with_restorecon(restorecon, g_root_prefix + logical_path, error_out)) {
+    for (const auto& full_path : existing_selinux_relabel_targets(logical_paths)) {
+        if (!relabel_path_with_restorecon(restorecon, full_path, error_out)) {
             return false;
         }
     }
