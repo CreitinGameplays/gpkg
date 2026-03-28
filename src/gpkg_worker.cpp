@@ -110,6 +110,7 @@ std::string allocate_sibling_temp_path(const std::string& live_full_path, const 
 std::string get_package_version(const std::string& pkg_name);
 bool validate_elf_file(const std::string& path, off_t size, std::string* error);
 bool sync_multiarch_runtime_aliases();
+std::vector<std::string> collect_shadowed_stale_runtime_provider_paths();
 std::vector<std::string> read_list_file(const std::string& pkg_name);
 std::vector<std::string> get_installed_packages(const std::string& extension = ".list");
 std::string path_basename(const std::string& path);
@@ -406,20 +407,53 @@ int run_path_with_args(const std::string& path, const std::vector<std::string>& 
 bool refresh_linker_cache_if_available() {
     if (!sync_multiarch_runtime_aliases()) return false;
 
-    const char* candidates[] = {
-        "/sbin/ldconfig",
-        "/usr/sbin/ldconfig",
-        "/bin/ldconfig",
-        "/usr/bin/ldconfig",
+    auto find_ldconfig_path = []() -> std::string {
+        const char* candidates[] = {
+            "/sbin/ldconfig",
+            "/usr/sbin/ldconfig",
+            "/bin/ldconfig",
+            "/usr/bin/ldconfig",
+        };
+
+        for (const char* candidate : candidates) {
+            if (access(candidate, X_OK) == 0) return candidate;
+        }
+        return "";
     };
 
-    for (const char* candidate : candidates) {
-        if (access(candidate, X_OK) != 0) continue;
+    auto run_ldconfig = [&](const std::string& candidate) {
+        if (candidate.empty()) return true;
         return run_path_with_args(candidate, g_root_prefix.empty()
             ? std::vector<std::string>{}
             : std::vector<std::string>{"-r", g_root_prefix}) == 0;
+    };
+
+    std::string ldconfig_path = find_ldconfig_path();
+    if (!run_ldconfig(ldconfig_path)) return false;
+
+    std::vector<std::string> stale_paths = collect_shadowed_stale_runtime_provider_paths();
+    if (stale_paths.empty()) return true;
+
+    size_t removed = 0;
+    size_t failed = 0;
+    for (const auto& full_path : stale_paths) {
+        if (!remove_live_path_exact(full_path)) {
+            ++failed;
+            VLOG("Failed to prune shadowed stale runtime library " << full_path);
+            continue;
+        }
+
+        ++removed;
+        VLOG("Pruned shadowed stale runtime library " << full_path);
     }
 
+    if (removed > 0 && !run_ldconfig(ldconfig_path)) return false;
+    if (failed > 0) {
+        std::cerr << "W: Failed to prune " << failed
+                  << " shadowed stale runtime librar"
+                  << (failed == 1 ? "y" : "ies")
+                  << " after linker refresh." << std::endl;
+    }
     return true;
 }
 
@@ -1160,6 +1194,51 @@ bool sync_multiarch_runtime_aliases() {
     }
 
     return ok;
+}
+
+std::vector<std::string> collect_shadowed_stale_runtime_provider_paths() {
+    std::vector<std::string> stale_paths;
+    std::set<std::string> seen;
+    std::map<std::string, std::string> owner_index = build_runtime_file_owner_index();
+
+    for (const auto& family : k_runtime_alias_families) {
+        std::string dir_path = g_root_prefix + family.canonical_prefix;
+        DIR* dir = opendir(dir_path.c_str());
+        if (!dir) continue;
+
+        struct dirent* entry = nullptr;
+        while ((entry = readdir(dir)) != nullptr) {
+            std::string name = entry->d_name;
+            if (name == "." || name == "..") continue;
+            if (!is_multiarch_runtime_alias_candidate(name)) continue;
+
+            std::string link_name = runtime_canonical_link_name(name);
+            if (link_name == name) continue;
+
+            std::string logical_path = canonical_multiarch_logical_path(
+                std::string(family.canonical_prefix) + "/" + name);
+            if (!seen.insert(logical_path).second) continue;
+            if (owner_index.count(logical_path) != 0) continue;
+
+            std::string full_path = g_root_prefix + logical_path;
+            std::string current_real;
+            if (!runtime_path_resolves_to_valid_library(full_path, &current_real)) continue;
+
+            std::string active_provider =
+                select_global_runtime_alias_canonical_path(link_name, owner_index);
+            if (active_provider.empty()) continue;
+
+            std::string active_real;
+            if (!runtime_path_resolves_to_valid_library(active_provider, &active_real)) continue;
+            if (current_real == active_real) continue;
+
+            stale_paths.push_back(full_path);
+        }
+
+        closedir(dir);
+    }
+
+    return stale_paths;
 }
 
 std::string canonical_existing_path(const std::string& path) {

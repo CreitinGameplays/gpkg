@@ -57,6 +57,7 @@ const std::string SOURCES_DIR = ROOT_PREFIX + "/etc/gpkg/sources.list.d/";
 const std::string SYSTEM_PROVIDES_PATH = ROOT_PREFIX + "/etc/gpkg/system-provides.list";
 const std::string UPGRADEABLE_SYSTEM_PATH = ROOT_PREFIX + "/etc/gpkg/upgradeable-system.list";
 const std::string UPGRADE_COMPANIONS_PATH = ROOT_PREFIX + "/etc/gpkg/upgrade-companions.conf";
+const std::string UPGRADE_CATALOG_PATH = ROOT_PREFIX + "/var/lib/gpkg/upgrade-catalog.json";
 const std::string DEBIAN_CONFIG_PATH = ROOT_PREFIX + "/etc/gpkg/debian.conf";
 const std::string IMPORT_POLICY_PATH = ROOT_PREFIX + "/etc/gpkg/import-policy.json";
 const std::string DPKG_STATUS_FILE = ROOT_PREFIX + "/var/lib/dpkg/status";
@@ -102,6 +103,17 @@ struct BaseSystemRegistryEntry {
 struct PackageAutoStateRecord {
     std::string package;
     bool auto_installed = false;
+};
+
+enum class TransactionDependencyKind {
+    Required,
+    Recommended,
+    Suggested
+};
+
+struct TransactionDependencyEdge {
+    std::string relation;
+    TransactionDependencyKind kind = TransactionDependencyKind::Required;
 };
 
 CommandCaptureResult run_command_captured(const std::string& cmd, bool verbose, const std::string& log_prefix);
@@ -590,6 +602,21 @@ struct PackageMetadata {
 
 struct Dependency;
 
+struct UpgradeCatalogSkipEntry {
+    std::string kind;
+    std::string trigger;
+    std::string configured_name;
+    std::string resolved_name;
+    std::string reason;
+};
+
+struct ResolvedUpgradeCatalog {
+    std::string fingerprint;
+    std::vector<std::string> resolved_roots;
+    std::map<std::string, std::vector<std::string>> resolved_companions;
+    std::vector<UpgradeCatalogSkipEntry> skipped_entries;
+};
+
 struct UpgradeContext {
     std::vector<PackageStatusRecord> registered_status_records;
     std::vector<PackageStatusRecord> dpkg_status_records;
@@ -605,6 +632,9 @@ struct UpgradeContext {
     std::map<std::string, std::string> normalized_root_by_raw;
     std::map<std::string, std::vector<std::string>> shadowed_aliases_by_target;
     std::map<std::string, std::string> shadowed_base_alias_target;
+    ResolvedUpgradeCatalog upgrade_catalog;
+    bool upgrade_catalog_available = false;
+    std::string upgrade_catalog_problem;
     mutable std::map<std::string, PackageMetadata> live_metadata_cache;
     mutable std::set<std::string> missing_live_metadata;
     mutable std::map<std::string, std::string> registered_version_cache;
@@ -626,6 +656,15 @@ bool get_context_live_installed_package_metadata(
     UpgradeContext& context,
     const std::string& pkg_name,
     PackageMetadata& out_meta
+);
+bool load_upgrade_catalog(
+    ResolvedUpgradeCatalog& out_catalog,
+    std::string* problem_out = nullptr,
+    bool verbose = false
+);
+std::map<std::string, std::vector<std::string>> get_planner_upgrade_companion_map(
+    UpgradeContext* context = nullptr,
+    bool verbose = false
 );
 std::string normalize_upgrade_root_name(
     const std::string& raw_name,
@@ -680,18 +719,56 @@ bool should_include_suggests_for_transaction(const PackageMetadata& meta) {
     return should_include_optional_group(g_optional_dependency_policy.suggests, meta, "suggests");
 }
 
-std::vector<std::string> collect_transaction_dependency_edges(const PackageMetadata& meta) {
-    std::vector<std::string> edges = meta.depends;
+const char* transaction_dependency_kind_label(TransactionDependencyKind kind) {
+    switch (kind) {
+        case TransactionDependencyKind::Recommended:
+            return "recommended";
+        case TransactionDependencyKind::Suggested:
+            return "suggested";
+        case TransactionDependencyKind::Required:
+        default:
+            return "required";
+    }
+}
+
+bool transaction_dependency_is_optional(TransactionDependencyKind kind) {
+    return kind != TransactionDependencyKind::Required;
+}
+
+std::vector<TransactionDependencyEdge> collect_transaction_dependency_edge_details(const PackageMetadata& meta) {
+    std::vector<TransactionDependencyEdge> edges;
+    std::set<std::string> seen;
+
+    auto append_edges = [&](const std::vector<std::string>& relations, TransactionDependencyKind kind) {
+        for (const auto& relation : relations) {
+            if (!seen.insert(relation).second) continue;
+            edges.push_back({relation, kind});
+        }
+    };
+
+    append_edges(meta.depends, TransactionDependencyKind::Required);
     if (should_include_recommends_for_transaction(meta)) {
-        edges.insert(edges.end(), meta.recommends.begin(), meta.recommends.end());
+        append_edges(meta.recommends, TransactionDependencyKind::Recommended);
     }
     if (should_include_suggests_for_transaction(meta)) {
-        edges.insert(edges.end(), meta.suggests.begin(), meta.suggests.end());
+        append_edges(meta.suggests, TransactionDependencyKind::Suggested);
     }
 
+    return edges;
+}
+
+std::vector<std::string> collect_transaction_dependency_edges(const PackageMetadata& meta) {
+    std::vector<std::string> edges;
+    for (const auto& edge : collect_transaction_dependency_edge_details(meta)) {
+        edges.push_back(edge.relation);
+    }
+    return edges;
+}
+
+std::vector<std::string> collect_required_transaction_dependency_edges(const PackageMetadata& meta) {
     std::vector<std::string> unique;
     std::set<std::string> seen;
-    for (const auto& edge : edges) {
+    for (const auto& edge : meta.depends) {
         if (seen.insert(edge).second) unique.push_back(edge);
     }
     return unique;

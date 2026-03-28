@@ -2,16 +2,597 @@
 
 std::map<std::string, PackageMetadata> g_repo_package_cache;
 std::map<std::string, std::vector<std::string>> g_repo_provider_cache;
+std::set<std::string> g_repo_available_package_cache;
 bool g_repo_package_cache_loaded = false;
+
+bool ensure_repo_package_cache_loaded(bool verbose);
+bool should_prefer_repo_candidate(const PackageMetadata& candidate, const PackageMetadata& current);
 
 std::string relation_name_from_text(const std::string& relation) {
     size_t open_paren = relation.find('(');
     return trim(open_paren == std::string::npos ? relation : relation.substr(0, open_paren));
 }
 
+bool catalog_version_satisfies(
+    const std::string& current_ver,
+    const std::string& op,
+    const std::string& req_version
+) {
+    if (op.empty()) return true;
+
+    int cmp = compare_versions(current_ver, req_version);
+    if (op == ">>" || op == ">") return cmp > 0;
+    if (op == "<<") return cmp < 0;
+    if (op == ">=") return cmp >= 0;
+    if (op == "<=") return cmp <= 0;
+    if (op == "=" || op == "==") return cmp == 0;
+    return false;
+}
+
+bool catalog_meta_satisfies_relation(
+    const std::string& package_name,
+    const PackageMetadata& meta,
+    const RelationAtom& relation
+) {
+    std::string canonical_package = canonicalize_package_name(package_name);
+    std::string canonical_relation = canonicalize_package_name(relation.name);
+    if (canonical_package == canonical_relation &&
+        catalog_version_satisfies(meta.version, relation.op, relation.version)) {
+        return true;
+    }
+
+    for (const auto& provided_relation : meta.provides) {
+        RelationAtom provided = normalize_relation_atom(provided_relation, "any");
+        if (!provided.valid) continue;
+        if (canonicalize_package_name(provided.name) != canonical_relation) continue;
+        if (relation.op.empty()) return true;
+        if (!provided.version.empty() &&
+            catalog_version_satisfies(provided.version, relation.op, relation.version)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool get_loaded_repo_package_info(const std::string& pkg_name, PackageMetadata& out_meta) {
+    auto it = g_repo_package_cache.find(pkg_name);
+    if (it == g_repo_package_cache.end()) return false;
+    out_meta = it->second;
+    return true;
+}
+
+std::string upgrade_catalog_file_fingerprint_component(const std::string& path) {
+    struct stat st {};
+    if (lstat(path.c_str(), &st) != 0) return path + ":missing";
+
+    std::ostringstream out;
+    out << path << ":" << static_cast<long long>(st.st_size)
+        << ":" << static_cast<long long>(st.st_mtime);
+    return out.str();
+}
+
+std::string build_upgrade_catalog_fingerprint() {
+    return "v1|" +
+        upgrade_catalog_file_fingerprint_component(REPO_CACHE_PATH + "Packages.json") + "|" +
+        upgrade_catalog_file_fingerprint_component(IMPORT_POLICY_PATH) + "|" +
+        upgrade_catalog_file_fingerprint_component(UPGRADE_COMPANIONS_PATH);
+}
+
+std::set<std::string> load_present_base_registry_package_names() {
+    std::set<std::string> names;
+    for (const auto& entry : load_base_system_registry_entries()) {
+        if (entry.package.empty()) continue;
+        if (!base_system_registry_entry_looks_present(entry)) continue;
+        names.insert(canonicalize_package_name(entry.package));
+    }
+    return names;
+}
+
+const std::set<std::string>& get_loaded_repo_package_names() {
+    return g_repo_available_package_cache;
+}
+
+RelationAtom apply_catalog_policy_resolution(const RelationAtom& relation) {
+    RelationAtom resolved = relation;
+    if (!resolved.valid || resolved.name.empty()) return resolved;
+
+    const ImportPolicy& policy = get_import_policy();
+    std::string rewritten_name = apply_dependency_rewrite_name(
+        resolved.name,
+        policy.dependency_rewrites,
+        &policy.package_aliases
+    );
+    if (!rewritten_name.empty()) resolved.name = rewritten_name;
+
+    std::string provider_name = resolve_provider_name(
+        resolved.name,
+        policy.provider_choices,
+        g_repo_provider_cache,
+        get_loaded_repo_package_names()
+    );
+    if (!provider_name.empty()) resolved.name = provider_name;
+
+    resolved.normalized = resolved.op.empty()
+        ? resolved.name
+        : resolved.name + " (" + resolved.op + " " + resolved.version + ")";
+    resolved.valid = !resolved.name.empty();
+    return resolved;
+}
+
+std::vector<std::string> parse_upgrade_companion_tokens_for_catalog(const std::string& raw_value) {
+    std::string normalized = raw_value;
+    for (char& ch : normalized) {
+        if (ch == ',' || ch == '\t') ch = ' ';
+    }
+
+    std::vector<std::string> tokens;
+    std::set<std::string> seen;
+    std::istringstream iss(normalized);
+    std::string token;
+    while (iss >> token) {
+        if (seen.insert(token).second) tokens.push_back(token);
+    }
+    return tokens;
+}
+
+std::map<std::string, std::vector<std::string>> load_raw_upgrade_companions_for_catalog() {
+    std::map<std::string, std::vector<std::string>> companions;
+    std::ifstream f(UPGRADE_COMPANIONS_PATH);
+    if (!f) return companions;
+
+    std::string line;
+    while (std::getline(f, line)) {
+        size_t comment = line.find('#');
+        if (comment != std::string::npos) line = line.substr(0, comment);
+        line = trim(line);
+        if (line.empty()) continue;
+
+        size_t sep = line.find(':');
+        if (sep == std::string::npos) sep = line.find('=');
+        if (sep == std::string::npos) continue;
+
+        std::string trigger = trim(line.substr(0, sep));
+        std::string raw_companions = trim(line.substr(sep + 1));
+        if (trigger.empty() || raw_companions.empty()) continue;
+
+        auto parsed = parse_upgrade_companion_tokens_for_catalog(raw_companions);
+        auto& entry = companions[trigger];
+        std::set<std::string> seen(entry.begin(), entry.end());
+        for (const auto& pkg : parsed) {
+            if (seen.insert(pkg).second) entry.push_back(pkg);
+        }
+    }
+
+    return companions;
+}
+
+void append_upgrade_catalog_skip_entry(
+    ResolvedUpgradeCatalog& catalog,
+    const std::string& kind,
+    const std::string& configured_name,
+    const std::string& reason,
+    const std::string& trigger = "",
+    const std::string& resolved_name = ""
+) {
+    UpgradeCatalogSkipEntry entry;
+    entry.kind = kind;
+    entry.trigger = trigger;
+    entry.configured_name = configured_name;
+    entry.resolved_name = resolved_name;
+    entry.reason = reason;
+    catalog.skipped_entries.push_back(entry);
+}
+
+bool resolve_catalog_relation(
+    const RelationAtom& relation,
+    PackageMetadata& out_meta,
+    std::string& out_name,
+    std::string* reason_out = nullptr
+) {
+    out_meta = {};
+    out_name.clear();
+    if (reason_out) reason_out->clear();
+
+    if (!relation.valid || relation.name.empty()) {
+        if (reason_out) *reason_out = "invalid package relation";
+        return false;
+    }
+
+    RelationAtom effective_relation = apply_catalog_policy_resolution(relation);
+    std::string requested_name = canonicalize_package_name(effective_relation.name);
+    PackageMetadata exact_meta;
+    if (get_loaded_repo_package_info(requested_name, exact_meta) &&
+        catalog_meta_satisfies_relation(requested_name, exact_meta, effective_relation)) {
+        out_meta = exact_meta;
+        out_name = exact_meta.name;
+        return true;
+    }
+
+    auto provider_it = g_repo_provider_cache.find(requested_name);
+    if (provider_it == g_repo_provider_cache.end()) {
+        if (reason_out) *reason_out = "no repository package or provider candidate";
+        return false;
+    }
+
+    bool found = false;
+    PackageMetadata best_meta;
+    std::string best_name;
+    for (const auto& provider_name : provider_it->second) {
+        PackageMetadata candidate;
+        if (!get_loaded_repo_package_info(provider_name, candidate)) continue;
+        if (!catalog_meta_satisfies_relation(provider_name, candidate, effective_relation)) continue;
+
+        if (!found || should_prefer_repo_candidate(candidate, best_meta)) {
+            best_meta = candidate;
+            best_name = candidate.name;
+            found = true;
+        }
+    }
+
+    if (!found) {
+        if (reason_out) *reason_out = "no repository candidate satisfies the required relation";
+        return false;
+    }
+
+    out_meta = best_meta;
+    out_name = best_name;
+    return true;
+}
+
+struct UpgradeCatalogValidationCache {
+    std::set<std::string> valid_packages;
+    std::map<std::string, std::string> invalid_reasons;
+};
+
+bool validate_catalog_package_closure_recursive(
+    const std::string& pkg_name,
+    UpgradeCatalogValidationCache& cache,
+    std::set<std::string>& walk
+) {
+    if (cache.valid_packages.count(pkg_name) != 0) return true;
+    auto invalid_it = cache.invalid_reasons.find(pkg_name);
+    if (invalid_it != cache.invalid_reasons.end()) return false;
+    if (!walk.insert(pkg_name).second) return true;
+
+    PackageMetadata meta;
+    if (!get_loaded_repo_package_info(pkg_name, meta)) {
+        cache.invalid_reasons[pkg_name] = "repository metadata is missing";
+        walk.erase(pkg_name);
+        return false;
+    }
+
+    for (const auto& dep_str : meta.depends) {
+        RelationAtom dep = normalize_relation_atom(dep_str, "any");
+        if (!dep.valid) continue;
+        if (is_system_provided(dep.name, dep.op, dep.version)) continue;
+
+        PackageMetadata dep_meta;
+        std::string dep_name;
+        std::string resolve_reason;
+        if (!resolve_catalog_relation(dep, dep_meta, dep_name, &resolve_reason)) {
+            cache.invalid_reasons[pkg_name] =
+                "missing required dependency " + dep_str + " for " + pkg_name;
+            walk.erase(pkg_name);
+            return false;
+        }
+
+        if (!validate_catalog_package_closure_recursive(dep_name, cache, walk)) {
+            auto child_invalid_it = cache.invalid_reasons.find(dep_name);
+            if (child_invalid_it != cache.invalid_reasons.end()) {
+                cache.invalid_reasons[pkg_name] = child_invalid_it->second;
+            } else {
+                cache.invalid_reasons[pkg_name] =
+                    "required dependency closure failed via " + dep_name;
+            }
+            walk.erase(pkg_name);
+            return false;
+        }
+    }
+
+    walk.erase(pkg_name);
+    cache.valid_packages.insert(pkg_name);
+    return true;
+}
+
+bool validate_catalog_package_closure(
+    const std::string& pkg_name,
+    UpgradeCatalogValidationCache& cache,
+    std::string* reason_out = nullptr
+) {
+    std::set<std::string> walk;
+    bool ok = validate_catalog_package_closure_recursive(pkg_name, cache, walk);
+    if (reason_out) {
+        if (ok) reason_out->clear();
+        else *reason_out = cache.invalid_reasons[pkg_name];
+    }
+    return ok;
+}
+
+bool build_resolved_upgrade_catalog(
+    ResolvedUpgradeCatalog& out_catalog,
+    bool verbose,
+    std::string* error_out = nullptr
+) {
+    out_catalog = {};
+    if (error_out) error_out->clear();
+
+    if (!ensure_repo_package_cache_loaded(verbose)) {
+        if (error_out) *error_out = "repository package index could not be loaded";
+        return false;
+    }
+
+    out_catalog.fingerprint = build_upgrade_catalog_fingerprint();
+
+    const ImportPolicy& policy = get_import_policy(verbose);
+    std::vector<std::string> raw_roots = policy.upgradeable_system.empty()
+        ? load_pattern_entries_file(UPGRADEABLE_SYSTEM_PATH)
+        : load_pattern_entries(policy.upgradeable_system);
+    std::map<std::string, std::vector<std::string>> raw_companions =
+        load_raw_upgrade_companions_for_catalog();
+    std::set<std::string> present_base_packages = load_present_base_registry_package_names();
+    UpgradeCatalogValidationCache validation_cache;
+    std::map<std::string, std::string> resolved_root_by_configured;
+    std::set<std::string> emitted_roots;
+
+    auto try_add_root = [&](const std::string& raw_root, bool report_skip) {
+        RelationAtom relation = normalize_relation_atom(raw_root, "any");
+        if (!relation.valid || relation.name.empty()) {
+            if (report_skip) {
+                append_upgrade_catalog_skip_entry(
+                    out_catalog,
+                    "root",
+                    raw_root,
+                    "invalid configured upgrade root"
+                );
+            }
+            return;
+        }
+
+        PackageMetadata resolved_meta;
+        std::string resolved_name;
+        std::string resolve_reason;
+        if (!resolve_catalog_relation(relation, resolved_meta, resolved_name, &resolve_reason)) {
+            RelationAtom effective_relation = apply_catalog_policy_resolution(relation);
+            std::string canonical_root = canonicalize_package_name(effective_relation.name);
+            if (report_skip && !canonical_root.empty() && present_base_packages.count(canonical_root) != 0) {
+                VLOG(verbose, "Skipping base-only runtime family " << raw_root
+                             << " because no repository upgrade candidate is configured.");
+                return;
+            }
+            if (report_skip) {
+                append_upgrade_catalog_skip_entry(
+                    out_catalog,
+                    "root",
+                    raw_root,
+                    resolve_reason
+                );
+            } else {
+                VLOG(verbose, "Skipping unresolved base-system upgrade root " << raw_root
+                             << ": " << resolve_reason);
+            }
+            return;
+        }
+
+        std::string validation_reason;
+        if (!validate_catalog_package_closure(resolved_name, validation_cache, &validation_reason)) {
+            if (report_skip) {
+                append_upgrade_catalog_skip_entry(
+                    out_catalog,
+                    "root",
+                    raw_root,
+                    validation_reason,
+                    "",
+                    resolved_name
+                );
+            } else {
+                VLOG(verbose, "Skipping invalid base-system upgrade root " << raw_root
+                             << ": " << validation_reason);
+            }
+            return;
+        }
+
+        if (report_skip) resolved_root_by_configured[raw_root] = resolved_name;
+        if (emitted_roots.insert(resolved_name).second) {
+            out_catalog.resolved_roots.push_back(resolved_name);
+        }
+    };
+
+    for (const auto& raw_root : raw_roots) {
+        try_add_root(raw_root, true);
+    }
+
+    for (const auto& base_root : present_base_packages) {
+        if (base_root.empty()) continue;
+        if (is_blocked_import_package(base_root, verbose)) continue;
+        try_add_root(base_root, false);
+    }
+
+    for (const auto& entry : raw_companions) {
+        auto resolved_trigger_it = resolved_root_by_configured.find(entry.first);
+        if (resolved_trigger_it == resolved_root_by_configured.end()) continue;
+
+        const std::string& resolved_trigger = resolved_trigger_it->second;
+        auto& resolved_list = out_catalog.resolved_companions[resolved_trigger];
+        std::set<std::string> seen(resolved_list.begin(), resolved_list.end());
+        for (const auto& raw_companion : entry.second) {
+            RelationAtom relation = normalize_relation_atom(raw_companion, "any");
+            if (!relation.valid || relation.name.empty()) {
+                append_upgrade_catalog_skip_entry(
+                    out_catalog,
+                    "companion",
+                    raw_companion,
+                    "invalid configured runtime companion",
+                    resolved_trigger
+                );
+                continue;
+            }
+
+            PackageMetadata resolved_meta;
+            std::string resolved_name;
+            std::string resolve_reason;
+            if (!resolve_catalog_relation(relation, resolved_meta, resolved_name, &resolve_reason)) {
+                append_upgrade_catalog_skip_entry(
+                    out_catalog,
+                    "companion",
+                    raw_companion,
+                    resolve_reason,
+                    resolved_trigger
+                );
+                continue;
+            }
+
+            std::string validation_reason;
+            if (!validate_catalog_package_closure(resolved_name, validation_cache, &validation_reason)) {
+                append_upgrade_catalog_skip_entry(
+                    out_catalog,
+                    "companion",
+                    raw_companion,
+                    validation_reason,
+                    resolved_trigger,
+                    resolved_name
+                );
+                continue;
+            }
+
+            if (resolved_name == resolved_trigger) continue;
+            if (seen.insert(resolved_name).second) resolved_list.push_back(resolved_name);
+        }
+    }
+
+    return true;
+}
+
+std::string upgrade_catalog_skip_entry_to_json(const UpgradeCatalogSkipEntry& entry) {
+    std::vector<std::string> fields;
+    fields.push_back(json_string_field("kind", entry.kind));
+    fields.push_back(json_string_field("trigger", entry.trigger));
+    fields.push_back(json_string_field("configured_name", entry.configured_name));
+    fields.push_back(json_string_field("resolved_name", entry.resolved_name));
+    fields.push_back(json_string_field("reason", entry.reason));
+    return "{" + join_strings(fields, ",") + "}";
+}
+
+std::string upgrade_catalog_companion_map_to_json(
+    const std::map<std::string, std::vector<std::string>>& companions
+) {
+    std::vector<std::string> fields;
+    for (const auto& entry : companions) {
+        fields.push_back(
+            "\"" + json_escape(entry.first) + "\":" + json_array_from_strings(entry.second)
+        );
+    }
+    return "{" + join_strings(fields, ",") + "}";
+}
+
+bool write_upgrade_catalog(
+    const ResolvedUpgradeCatalog& catalog,
+    std::string* error_out = nullptr
+) {
+    if (error_out) error_out->clear();
+    if (!mkdir_parent(UPGRADE_CATALOG_PATH)) {
+        if (error_out) *error_out = "failed to create parent directory for " + UPGRADE_CATALOG_PATH;
+        return false;
+    }
+
+    std::string tmp_path = UPGRADE_CATALOG_PATH + ".tmp";
+    std::ofstream out(tmp_path);
+    if (!out) {
+        if (error_out) *error_out = "failed to open " + tmp_path + " for writing";
+        return false;
+    }
+
+    out << "{\n";
+    out << "  " << json_string_field("fingerprint", catalog.fingerprint) << ",\n";
+    out << "  \"resolved_roots\":" << json_array_from_strings(catalog.resolved_roots) << ",\n";
+    out << "  \"resolved_companions\":"
+        << upgrade_catalog_companion_map_to_json(catalog.resolved_companions) << ",\n";
+    out << "  \"skipped_entries\":[";
+    for (size_t i = 0; i < catalog.skipped_entries.size(); ++i) {
+        if (i > 0) out << ",";
+        out << "\n    " << upgrade_catalog_skip_entry_to_json(catalog.skipped_entries[i]);
+    }
+    if (!catalog.skipped_entries.empty()) out << "\n  ";
+    out << "]\n";
+    out << "}\n";
+    out.close();
+
+    if (rename(tmp_path.c_str(), UPGRADE_CATALOG_PATH.c_str()) != 0) {
+        if (error_out) *error_out = "failed to replace " + UPGRADE_CATALOG_PATH;
+        remove(tmp_path.c_str());
+        return false;
+    }
+
+    return true;
+}
+
+bool load_upgrade_catalog(
+    ResolvedUpgradeCatalog& out_catalog,
+    std::string* problem_out,
+    bool verbose
+) {
+    (void)verbose;
+    out_catalog = {};
+    if (problem_out) problem_out->clear();
+
+    JsonValue root;
+    if (!load_json_document(UPGRADE_CATALOG_PATH, root)) {
+        if (problem_out) {
+            if (access(UPGRADE_CATALOG_PATH.c_str(), F_OK) == 0) {
+                *problem_out = "upgrade catalog is unreadable; run 'gpkg update'";
+            } else {
+                *problem_out = "upgrade catalog is missing; run 'gpkg update'";
+            }
+        }
+        return false;
+    }
+
+    out_catalog.fingerprint = json_string_or(json_object_get(root, "fingerprint"));
+    if (out_catalog.fingerprint.empty()) {
+        if (problem_out) *problem_out = "upgrade catalog is missing its fingerprint; run 'gpkg update'";
+        return false;
+    }
+
+    std::string expected_fingerprint = build_upgrade_catalog_fingerprint();
+    if (out_catalog.fingerprint != expected_fingerprint) {
+        if (problem_out) *problem_out = "upgrade catalog is stale; run 'gpkg update'";
+        return false;
+    }
+
+    out_catalog.resolved_roots = json_string_array(json_object_get(root, "resolved_roots"));
+
+    if (const JsonValue* companions = json_object_get(root, "resolved_companions")) {
+        if (companions->is_object()) {
+            for (const auto& entry : companions->object_items) {
+                out_catalog.resolved_companions[entry.first] = json_string_array(&entry.second);
+            }
+        }
+    }
+
+    if (const JsonValue* skipped_entries = json_object_get(root, "skipped_entries")) {
+        if (skipped_entries->is_array()) {
+            for (const auto& item : skipped_entries->array_items) {
+                if (!item.is_object()) continue;
+                UpgradeCatalogSkipEntry entry;
+                entry.kind = json_string_or(json_object_get(item, "kind"));
+                entry.trigger = json_string_or(json_object_get(item, "trigger"));
+                entry.configured_name = json_string_or(json_object_get(item, "configured_name"));
+                entry.resolved_name = json_string_or(json_object_get(item, "resolved_name"));
+                entry.reason = json_string_or(json_object_get(item, "reason"));
+                if (!entry.kind.empty() && !entry.configured_name.empty()) {
+                    out_catalog.skipped_entries.push_back(entry);
+                }
+            }
+        }
+    }
+
+    return true;
+}
+
 void invalidate_repo_package_cache() {
     g_repo_package_cache.clear();
     g_repo_provider_cache.clear();
+    g_repo_available_package_cache.clear();
     g_repo_package_cache_loaded = false;
 }
 
@@ -245,6 +826,11 @@ bool ensure_repo_package_cache_loaded(bool verbose) {
         }
     }
 
+    g_repo_available_package_cache.clear();
+    for (const auto& entry : packages) {
+        if (!entry.first.empty()) g_repo_available_package_cache.insert(entry.first);
+    }
+
     g_repo_package_cache = std::move(packages);
     g_repo_provider_cache = std::move(providers);
     g_repo_package_cache_loaded = true;
@@ -387,8 +973,46 @@ int handle_update(bool verbose) {
     }
 
     invalidate_repo_package_cache();
+    if (!ensure_repo_package_cache_loaded(verbose)) {
+        std::cerr << Color::RED << "E: Failed to reload the merged package index after update."
+                  << Color::RESET << std::endl;
+        return 1;
+    }
+
+    ResolvedUpgradeCatalog upgrade_catalog;
+    std::string catalog_error;
+    if (!build_resolved_upgrade_catalog(upgrade_catalog, verbose, &catalog_error)) {
+        std::cerr << Color::RED << "E: Failed to build the runtime upgrade catalog";
+        if (!catalog_error.empty()) std::cerr << ": " << catalog_error;
+        std::cerr << Color::RESET << std::endl;
+        return 1;
+    }
+    if (!write_upgrade_catalog(upgrade_catalog, &catalog_error)) {
+        std::cerr << Color::RED << "E: Failed to write the runtime upgrade catalog";
+        if (!catalog_error.empty()) std::cerr << ": " << catalog_error;
+        std::cerr << Color::RESET << std::endl;
+        return 1;
+    }
+
     std::cout << Color::GREEN << "✓ Merged " << total_packages << " packages from "
               << success_count << " sources." << Color::RESET << std::endl;
+    std::cout << Color::GREEN << "✓ Wrote validated upgrade catalog for "
+              << upgrade_catalog.resolved_roots.size() << " upgrade "
+              << (upgrade_catalog.resolved_roots.size() == 1 ? "root" : "roots")
+              << Color::RESET << std::endl;
+    if (!upgrade_catalog.skipped_entries.empty()) {
+        std::cout << Color::YELLOW << "W: Skipped "
+                  << upgrade_catalog.skipped_entries.size()
+                  << " configured runtime upgrade entr"
+                  << (upgrade_catalog.skipped_entries.size() == 1 ? "y" : "ies")
+                  << " during catalog validation:" << Color::RESET << std::endl;
+        for (const auto& entry : upgrade_catalog.skipped_entries) {
+            std::cout << "  " << Color::YELLOW << entry.kind << " "
+                      << entry.configured_name;
+            if (!entry.trigger.empty()) std::cout << " (trigger " << entry.trigger << ")";
+            std::cout << ": " << entry.reason << Color::RESET << std::endl;
+        }
+    }
     return 0;
 }
 

@@ -259,6 +259,17 @@ bool queued_candidate_satisfies_dependency(
 
 std::map<std::string, std::vector<std::string>> load_upgrade_companions();
 
+std::map<std::string, std::vector<std::string>> get_planner_upgrade_companion_map(
+    UpgradeContext* context,
+    bool verbose
+) {
+    if (context && context->upgrade_catalog_available) {
+        return context->upgrade_catalog.resolved_companions;
+    }
+    (void)verbose;
+    return load_upgrade_companions();
+}
+
 bool find_installed_dependency_provider(
     const Dependency& dep,
     const std::set<std::string>& installed_cache,
@@ -400,7 +411,8 @@ bool resolve_dependencies(
     const std::set<std::string>& installed_cache,
     bool verbose,
     bool force_queue_requested = false,
-    UpgradeContext* context = nullptr
+    UpgradeContext* context = nullptr,
+    bool suppress_errors = false
 ) {
     std::string canonical_pkg = canonicalize_package_name(pkg, verbose);
     Dependency requested_dep{canonical_pkg, op, req_version};
@@ -409,9 +421,11 @@ bool resolve_dependencies(
         for (const auto& queued : install_queue) {
             if (queued.name != canonical_pkg) continue;
             if (!queued_candidate_satisfies_dependency(queued, requested_dep)) {
-                std::cerr << Color::RED << "E: Dependency conflict! " << canonical_pkg << " " << queued.version
-                          << " is queued, but " << op << " " << req_version
-                          << " is required." << Color::RESET << std::endl;
+                if (!suppress_errors) {
+                    std::cerr << Color::RED << "E: Dependency conflict! " << canonical_pkg << " " << queued.version
+                              << " is queued, but " << op << " " << req_version
+                              << " is required." << Color::RESET << std::endl;
+                }
                 return false;
             }
             return true;
@@ -451,14 +465,18 @@ bool resolve_dependencies(
             return true;
         }
 
-        std::cerr << Color::YELLOW << "W: " << canonical_pkg << " " << installed_ver
-                  << " is installed but does not meet requirements (" << op
-                  << " " << req_version << ")." << Color::RESET << std::endl;
+        if (!suppress_errors) {
+            std::cerr << Color::YELLOW << "W: " << canonical_pkg << " " << installed_ver
+                      << " is installed but does not meet requirements (" << op
+                      << " " << req_version << ")." << Color::RESET << std::endl;
+        }
     }
 
     if (is_blocked_import_package(canonical_pkg, verbose)) {
-        std::cerr << Color::RED << "E: Package " << canonical_pkg
-                  << " is blocked by GeminiOS import policy." << Color::RESET << std::endl;
+        if (!suppress_errors) {
+            std::cerr << Color::RED << "E: Package " << canonical_pkg
+                      << " is blocked by GeminiOS import policy." << Color::RESET << std::endl;
+        }
         return false;
     }
 
@@ -478,18 +496,23 @@ bool resolve_dependencies(
                 installed_cache,
                 verbose,
                 force_queue_requested,
-                context
+                context,
+                suppress_errors
             );
         }
 
-        std::cerr << Color::RED << "E: Unable to locate package " << canonical_pkg << Color::RESET << std::endl;
+        if (!suppress_errors) {
+            std::cerr << Color::RED << "E: Unable to locate package " << canonical_pkg << Color::RESET << std::endl;
+        }
         return false;
     }
 
     if (!queued_candidate_satisfies_dependency(meta, requested_dep)) {
-        std::cerr << Color::RED << "E: Package " << canonical_pkg << " found (v" << meta.version
-                  << ") but does not meet requirements (" << op << " " << req_version
-                  << ")" << Color::RESET << std::endl;
+        if (!suppress_errors) {
+            std::cerr << Color::RED << "E: Package " << canonical_pkg << " found (v" << meta.version
+                      << ") but does not meet requirements (" << op << " " << req_version
+                      << ")" << Color::RESET << std::endl;
+        }
         return false;
     }
 
@@ -515,21 +538,53 @@ bool resolve_dependencies(
     }
 
     visited.insert(canonical_pkg);
-    for (const auto& dep_str : collect_transaction_dependency_edges(meta)) {
-        Dependency dep = parse_dependency(dep_str);
+    for (const auto& edge : collect_transaction_dependency_edge_details(meta)) {
+        Dependency dep = parse_dependency(edge.relation);
+        if (dep.name.empty()) continue;
+
+        if (!transaction_dependency_is_optional(edge.kind)) {
+            if (!resolve_dependencies(
+                    dep.name,
+                    dep.op,
+                    dep.version,
+                    install_queue,
+                    visited,
+                    installed_cache,
+                    verbose,
+                    false,
+                    context,
+                    suppress_errors
+                )) {
+                return false;
+            }
+            continue;
+        }
+
+        auto optional_queue = install_queue;
+        auto optional_visited = visited;
         if (!resolve_dependencies(
                 dep.name,
                 dep.op,
                 dep.version,
-                install_queue,
-                visited,
+                optional_queue,
+                optional_visited,
                 installed_cache,
                 verbose,
                 false,
-                context
+                context,
+                true
             )) {
-            return false;
+            VLOG(
+                verbose,
+                "Skipping optional " << transaction_dependency_kind_label(edge.kind)
+                    << " dependency " << edge.relation << " for " << canonical_pkg
+                    << " because no importable candidate is available."
+            );
+            continue;
         }
+
+        install_queue.swap(optional_queue);
+        visited.swap(optional_visited);
     }
 
     VLOG(verbose, "Adding " << canonical_pkg << " to installation queue.");
@@ -598,7 +653,8 @@ bool package_replaces_package(
 
 void sort_transaction_queue_for_install(
     std::vector<PackageMetadata>& queue,
-    bool verbose
+    bool verbose,
+    UpgradeContext* context = nullptr
 ) {
     if (queue.size() < 2) return;
 
@@ -614,7 +670,7 @@ void sort_transaction_queue_for_install(
     };
 
     for (size_t dependent = 0; dependent < n; ++dependent) {
-        for (const auto& dep_str : collect_transaction_dependency_edges(queue[dependent])) {
+        for (const auto& dep_str : collect_required_transaction_dependency_edges(queue[dependent])) {
             Dependency dep = parse_dependency(dep_str);
             if (dep.name.empty()) continue;
 
@@ -632,7 +688,8 @@ void sort_transaction_queue_for_install(
         }
     }
 
-    std::map<std::string, std::vector<std::string>> companion_map = load_upgrade_companions();
+    std::map<std::string, std::vector<std::string>> companion_map =
+        get_planner_upgrade_companion_map(context, verbose);
     std::map<std::string, std::set<std::string>> reverse_companions;
     for (const auto& entry : companion_map) {
         std::string trigger = canonicalize_package_name(entry.first, verbose);
@@ -804,7 +861,7 @@ bool build_transaction_plan(
         if (!dropped[i]) out_plan.install_queue.push_back(working_queue[i]);
     }
 
-    sort_transaction_queue_for_install(out_plan.install_queue, verbose);
+    sort_transaction_queue_for_install(out_plan.install_queue, verbose, context);
 
     std::set<std::string> scheduled_retirements;
     for (const auto& pkg : out_plan.install_queue) {

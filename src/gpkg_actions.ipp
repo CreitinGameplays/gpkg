@@ -213,6 +213,15 @@ UpgradeContext build_upgrade_context(bool verbose) {
         context.base_status_by_package[entry.package] = record;
     }
 
+    std::string catalog_problem;
+    if (load_upgrade_catalog(context.upgrade_catalog, &catalog_problem, verbose)) {
+        context.upgrade_catalog_available = true;
+        context.upgrade_catalog_problem.clear();
+    } else {
+        context.upgrade_catalog_available = false;
+        context.upgrade_catalog_problem = catalog_problem;
+    }
+
     return context;
 }
 
@@ -630,29 +639,17 @@ std::vector<std::string> collect_normalized_upgrade_roots(
     context.shadowed_base_alias_target.clear();
 
     std::set<std::string> raw_roots;
-    for (const auto& pkg : context.exact_live_packages) {
+    for (const auto& pkg : context.registered_package_names) {
         if (!pkg.empty()) raw_roots.insert(canonicalize_package_name(pkg, verbose));
     }
-    for (const auto& pkg : context.present_base_packages) {
+    for (const auto& pkg : context.upgrade_catalog.resolved_roots) {
         if (!pkg.empty()) raw_roots.insert(canonicalize_package_name(pkg, verbose));
-    }
-    for (const auto& entry : load_upgradeable_system_packages()) {
-        Dependency dep = parse_dependency(entry);
-        if (dep.name.empty()) continue;
-        raw_roots.insert(canonicalize_package_name(dep.name, verbose));
     }
 
     std::vector<std::string> normalized_roots;
     std::set<std::string> emitted_targets;
     for (const auto& raw_name : raw_roots) {
         if (raw_name.empty()) continue;
-
-        if (package_is_base_system_provided(raw_name) &&
-            !is_upgradeable_system_package(raw_name)) {
-            VLOG(verbose, "Skipping non-upgradeable base package during normalized upgrade scan: "
-                         << raw_name);
-            continue;
-        }
 
         if (is_blocked_import_package(raw_name, verbose)) {
             VLOG(verbose, "Skipping policy-blocked package during normalized upgrade scan: "
@@ -1481,7 +1478,7 @@ void sort_removal_queue_for_operation(std::vector<std::string>& to_remove, bool 
         auto meta_it = meta_by_name.find(to_remove[i]);
         if (meta_it == meta_by_name.end()) continue;
 
-        for (const auto& dep_str : collect_transaction_dependency_edges(meta_it->second)) {
+        for (const auto& dep_str : collect_required_transaction_dependency_edges(meta_it->second)) {
             Dependency dep = parse_dependency(dep_str);
             if (dep.name.empty()) continue;
 
@@ -1615,7 +1612,7 @@ std::set<std::string> compute_needed_installed_packages(
         PackageMetadata meta;
         if (!get_installed_package_metadata(queue[index], meta)) continue;
 
-        for (const auto& dep_str : collect_transaction_dependency_edges(meta)) {
+        for (const auto& dep_str : collect_required_transaction_dependency_edges(meta)) {
             Dependency dep = parse_dependency(dep_str);
             if (dep.name.empty()) continue;
 
@@ -2245,22 +2242,53 @@ bool queue_upgrade_target(
         }
     }
 
-    for (const auto& dep_str : collect_transaction_dependency_edges(meta)) {
-        Dependency dep = parse_dependency(dep_str);
+    for (const auto& edge : collect_transaction_dependency_edge_details(meta)) {
+        Dependency dep = parse_dependency(edge.relation);
+        if (dep.name.empty()) continue;
+
+        if (!transaction_dependency_is_optional(edge.kind)) {
+            if (!resolve_dependencies(
+                    dep.name,
+                    dep.op,
+                    dep.version,
+                    install_queue,
+                    dependency_visited,
+                    installed_cache,
+                    verbose,
+                    false,
+                    context
+                )) {
+                target_walk.erase(meta.name);
+                return false;
+            }
+            continue;
+        }
+
+        auto optional_queue = install_queue;
+        auto optional_visited = dependency_visited;
         if (!resolve_dependencies(
                 dep.name,
                 dep.op,
                 dep.version,
-                install_queue,
-                dependency_visited,
+                optional_queue,
+                optional_visited,
                 installed_cache,
                 verbose,
                 false,
-                context
+                context,
+                true
             )) {
-            target_walk.erase(meta.name);
-            return false;
+            VLOG(
+                verbose,
+                "Skipping optional " << transaction_dependency_kind_label(edge.kind)
+                    << " dependency " << edge.relation << " for upgrade target "
+                    << meta.name << " because no importable candidate is available."
+            );
+            continue;
         }
+
+        install_queue.swap(optional_queue);
+        dependency_visited.swap(optional_visited);
     }
 
     if (queued_packages.insert(meta.name).second) {
@@ -2346,6 +2374,7 @@ bool prepare_upgrade_transaction(
     PreparedUpgradeState& out_state
 ) {
     out_state = {};
+    if (!context.upgrade_catalog_available) return false;
 
     std::vector<std::string> normalized_roots = collect_normalized_upgrade_roots(context, verbose);
     VLOG(verbose, "Checking " << normalized_roots.size()
@@ -2355,7 +2384,7 @@ bool prepare_upgrade_transaction(
     std::set<std::string> explicit_target_names;
     std::set<std::string> target_walk;
     std::set<std::string> dependency_visited;
-    auto companion_map = load_upgrade_companions();
+    auto companion_map = get_planner_upgrade_companion_map(&context, verbose);
 
     for (const auto& pkg : normalized_roots) {
         std::string current_ver;
@@ -2409,6 +2438,18 @@ bool prepare_upgrade_transaction(
     }
     out_state.upgrade_queue = out_state.plan.install_queue;
     return true;
+}
+
+std::string describe_upgrade_catalog_skip_entry(const UpgradeCatalogSkipEntry& entry) {
+    std::ostringstream out;
+    if (entry.kind == "companion") {
+        out << "runtime companion " << entry.configured_name;
+        if (!entry.trigger.empty()) out << " for " << entry.trigger;
+    } else {
+        out << "runtime family " << entry.configured_name;
+    }
+    out << " was skipped: " << entry.reason;
+    return out.str();
 }
 
 RepairInspection inspect_repair_state(
@@ -2529,6 +2570,14 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
     if (!ensure_repo_package_cache_loaded(verbose)) return 1;
     std::cout << "Optional dependency policy: " << describe_optional_dependency_policy() << std::endl;
     UpgradeContext context = build_upgrade_context(verbose);
+    if (!context.upgrade_catalog_available) {
+        std::cerr << Color::RED << "E: "
+                  << (context.upgrade_catalog_problem.empty()
+                          ? "upgrade catalog is unavailable; run 'gpkg update'"
+                          : context.upgrade_catalog_problem)
+                  << Color::RESET << std::endl;
+        return 1;
+    }
     PreparedUpgradeState prepared;
     if (!prepare_upgrade_transaction(context, verbose, prepared)) return 1;
     std::vector<PackageMetadata>& upgrade_queue = prepared.upgrade_queue;
@@ -2783,6 +2832,15 @@ int handle_doctor(bool verbose) {
     }
 
     UpgradeContext context = build_upgrade_context(verbose);
+    if (!context.upgrade_catalog_available) {
+        repo_section.errors.push_back(
+            context.upgrade_catalog_problem.empty()
+                ? "validated upgrade catalog is unavailable; run 'gpkg update'"
+                : context.upgrade_catalog_problem
+        );
+    } else {
+        repo_section.ok.push_back("validated upgrade catalog is present and current");
+    }
     std::vector<std::string>& registered_packages = context.registered_package_names;
     std::set<std::string>& exact_live_packages = context.exact_live_packages;
     install_section.ok.push_back("gpkg knows about " + std::to_string(registered_packages.size()) + " registered package(s)");
@@ -2811,12 +2869,28 @@ int handle_doctor(bool verbose) {
     bool have_valid_upgrade_plan = false;
     if (!repo_index_present || !g_repo_package_cache_loaded) {
         upgrade_section.errors.push_back("cannot build a dry-run upgrade plan until the local package index is available");
+    } else if (!context.upgrade_catalog_available) {
+        upgrade_section.errors.push_back(
+            context.upgrade_catalog_problem.empty()
+                ? "validated upgrade catalog is unavailable; run 'gpkg update'"
+                : context.upgrade_catalog_problem
+        );
     } else if (!prepare_upgrade_transaction(context, verbose, prepared)) {
         upgrade_section.errors.push_back(
             "gpkg could not build a safe upgrade plan; the next 'gpkg upgrade' would likely fail"
         );
     } else {
         have_valid_upgrade_plan = true;
+    }
+
+    if (context.upgrade_catalog_available) {
+        if (context.upgrade_catalog.skipped_entries.empty()) {
+            upgrade_section.ok.push_back("validated upgrade catalog has no skipped configured runtime families");
+        } else {
+            for (const auto& entry : context.upgrade_catalog.skipped_entries) {
+                upgrade_section.warnings.push_back(describe_upgrade_catalog_skip_entry(entry));
+            }
+        }
     }
 
     std::vector<BaseSystemRegistryEntry>& base_entries = context.base_entries;

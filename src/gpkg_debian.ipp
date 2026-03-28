@@ -627,6 +627,175 @@ std::vector<std::string> apply_dependency_removals(
     return result;
 }
 
+bool debian_dependency_version_satisfies(
+    const std::string& current_ver,
+    const std::string& op,
+    const std::string& req_ver
+) {
+    if (op.empty()) return true;
+
+    int cmp = compare_versions(current_ver, req_ver);
+    if (op == ">>" || op == ">") return cmp > 0;
+    if (op == "<<") return cmp < 0;
+    if (op == ">=") return cmp >= 0;
+    if (op == "<=") return cmp <= 0;
+    if (op == "=" || op == "==") return cmp == 0;
+    return false;
+}
+
+bool debian_meta_satisfies_required_dependency(
+    const PackageMetadata& meta,
+    const RelationAtom& dep
+) {
+    if (dep.name.empty()) return false;
+
+    auto candidate_matches = [&](const std::string& provided_name) {
+        if (provided_name != dep.name) return false;
+        return debian_dependency_version_satisfies(meta.version, dep.op, dep.version);
+    };
+
+    if (candidate_matches(meta.name)) return true;
+
+    for (const auto& provide : meta.provides) {
+        RelationAtom provided = normalize_relation_atom(provide, "any");
+        if (!provided.valid) continue;
+        if (candidate_matches(provided.name)) return true;
+    }
+
+    return false;
+}
+
+std::map<std::string, std::vector<std::string>> build_imported_dependency_index(
+    const std::map<std::string, PackageMetadata>& selected
+) {
+    std::map<std::string, std::vector<std::string>> index;
+
+    auto append = [&](const std::string& provided_name, const std::string& package_name) {
+        if (provided_name.empty() || package_name.empty()) return;
+        auto& entry = index[provided_name];
+        if (std::find(entry.begin(), entry.end(), package_name) == entry.end()) {
+            entry.push_back(package_name);
+        }
+    };
+
+    for (const auto& entry : selected) {
+        append(entry.first, entry.first);
+        for (const auto& provide : entry.second.provides) {
+            RelationAtom provided = normalize_relation_atom(provide, "any");
+            if (!provided.valid) continue;
+            append(provided.name, entry.first);
+        }
+    }
+
+    return index;
+}
+
+std::vector<std::string> find_missing_imported_required_dependencies(
+    const PackageMetadata& meta,
+    const std::map<std::string, PackageMetadata>& selected,
+    const std::map<std::string, std::vector<std::string>>& dependency_index
+) {
+    std::vector<std::string> missing;
+
+    for (const auto& dep_str : meta.depends) {
+        RelationAtom dep = normalize_relation_atom(dep_str, "any");
+        if (!dep.valid) continue;
+
+        bool satisfied = false;
+        auto candidate_it = dependency_index.find(dep.name);
+        if (candidate_it != dependency_index.end()) {
+            for (const auto& candidate_name : candidate_it->second) {
+                auto meta_it = selected.find(candidate_name);
+                if (meta_it == selected.end()) continue;
+                if (debian_meta_satisfies_required_dependency(meta_it->second, dep)) {
+                    satisfied = true;
+                    break;
+                }
+            }
+        }
+
+        if (!satisfied) missing.push_back(dep_str);
+    }
+
+    return missing;
+}
+
+bool imported_dependency_relation_is_available(
+    const std::string& dep_str,
+    const std::map<std::string, PackageMetadata>& selected,
+    const std::map<std::string, std::vector<std::string>>& dependency_index
+) {
+    RelationAtom dep = normalize_relation_atom(dep_str, "any");
+    if (!dep.valid) return false;
+
+    if (is_system_provided(dep.name, dep.op, dep.version)) return true;
+
+    auto candidate_it = dependency_index.find(dep.name);
+    if (candidate_it == dependency_index.end()) return false;
+
+    for (const auto& candidate_name : candidate_it->second) {
+        auto meta_it = selected.find(candidate_name);
+        if (meta_it == selected.end()) continue;
+        if (debian_meta_satisfies_required_dependency(meta_it->second, dep)) return true;
+    }
+
+    return false;
+}
+
+void prune_imported_packages_with_missing_required_dependencies(
+    std::map<std::string, PackageMetadata>& selected,
+    std::vector<std::string>* skipped_policy
+) {
+    while (true) {
+        auto dependency_index = build_imported_dependency_index(selected);
+        std::vector<std::pair<std::string, std::vector<std::string>>> removals;
+
+        for (const auto& entry : selected) {
+            std::vector<std::string> missing = find_missing_imported_required_dependencies(
+                entry.second,
+                selected,
+                dependency_index
+            );
+            if (!missing.empty()) {
+                removals.push_back({entry.first, missing});
+            }
+        }
+
+        if (removals.empty()) break;
+
+        for (const auto& removal : removals) {
+            selected.erase(removal.first);
+            if (skipped_policy) {
+                skipped_policy->push_back(
+                    removal.first + ": required dependency missing from imported set: " +
+                    join_strings(removal.second)
+                );
+            }
+        }
+    }
+}
+
+void prune_imported_optional_dependencies(
+    std::map<std::string, PackageMetadata>& selected
+) {
+    auto dependency_index = build_imported_dependency_index(selected);
+
+    auto filter_relations = [&](std::vector<std::string>& relations) {
+        std::vector<std::string> filtered;
+        filtered.reserve(relations.size());
+        for (const auto& relation : relations) {
+            if (!imported_dependency_relation_is_available(relation, selected, dependency_index)) continue;
+            filtered.push_back(relation);
+        }
+        relations.swap(filtered);
+    };
+
+    for (auto& entry : selected) {
+        filter_relations(entry.second.recommends);
+        filter_relations(entry.second.suggests);
+    }
+}
+
 bool build_debian_package_metadata(
     const DebianPackageRecord& record,
     const DebianBackendConfig& config,
@@ -658,7 +827,7 @@ bool build_debian_package_metadata(
         required_dependency_text,
         record.package,
         config.apt_arch,
-        true,
+        false,
         policy,
         available_packages,
         provider_map,
@@ -837,6 +1006,9 @@ std::vector<PackageMetadata> load_debian_index_entries(
             );
         }
     }
+
+    prune_imported_packages_with_missing_required_dependencies(selected, skipped_policy);
+    prune_imported_optional_dependencies(selected);
 
     std::vector<PackageMetadata> entries;
     for (const auto& entry : selected) entries.push_back(entry.second);
