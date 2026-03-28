@@ -219,6 +219,37 @@ bool package_metadata_satisfies_dependency(
     return false;
 }
 
+bool dependency_matches_conflicting_exact_live_base_alias(
+    const Dependency& dep,
+    const std::string& candidate_name,
+    const PackageMetadata& candidate_meta,
+    UpgradeContext* context
+) {
+    if (!context) return false;
+    if (dep.name.empty() || !dep.op.empty() || !dep.version.empty()) return false;
+
+    std::string canonical_dep = canonicalize_package_name(dep.name);
+    std::string canonical_candidate = canonicalize_package_name(candidate_name);
+    if (canonical_dep.empty() || canonical_candidate.empty() || canonical_dep == canonical_candidate) {
+        return false;
+    }
+
+    if (package_has_exact_live_install_state(canonical_dep, nullptr, context)) return false;
+
+    auto base_it = context->base_presence_by_package.find(canonical_dep);
+    if (base_it == context->base_presence_by_package.end() || !base_it->second) return false;
+
+    if (!package_has_exact_live_install_state(canonical_candidate, nullptr, context)) return false;
+
+    for (const auto& relation : candidate_meta.conflicts) {
+        Dependency conflict_dep = parse_dependency(relation);
+        if (canonicalize_package_name(conflict_dep.name) != canonical_dep) continue;
+        if (conflict_dep.op.empty()) return true;
+    }
+
+    return false;
+}
+
 bool queued_candidate_satisfies_dependency(
     const PackageMetadata& meta,
     const Dependency& dep
@@ -260,7 +291,16 @@ bool find_installed_dependency_provider(
 
             PackageMetadata candidate_meta;
             if (!get_context_live_installed_package_metadata(*context, candidate_name, candidate_meta)) continue;
-            if (!package_metadata_satisfies_dependency(candidate_name, candidate_meta, dep)) continue;
+            bool satisfies_dependency =
+                package_metadata_satisfies_dependency(candidate_name, candidate_meta, dep);
+            bool shadows_base_alias =
+                dependency_matches_conflicting_exact_live_base_alias(
+                    dep,
+                    candidate_name,
+                    candidate_meta,
+                    context
+                );
+            if (!satisfies_dependency && !shadows_base_alias) continue;
 
             if (best_name.empty() || should_prefer_repo_candidate(candidate_meta, best_meta)) {
                 best_name = candidate_name;
@@ -695,6 +735,52 @@ bool build_transaction_plan(
             bool left_conflicts = package_conflicts_with_package(left, right.name, &right);
             bool right_conflicts = package_conflicts_with_package(right, left.name, &left);
             if (!left_conflicts && !right_conflicts) continue;
+
+            auto queue_entry_is_exact_live_shadowing_base_alias =
+                [&](const PackageMetadata& candidate, const PackageMetadata& shadowed) {
+                    if (!context) return false;
+                    if (candidate.name.empty() || shadowed.name.empty()) return false;
+                    if (canonicalize_package_name(candidate.name) ==
+                        canonicalize_package_name(shadowed.name)) {
+                        return false;
+                    }
+
+                    Dependency shadowed_dep{shadowed.name, "", ""};
+                    bool exact_live_conflict_shadow =
+                        dependency_matches_conflicting_exact_live_base_alias(
+                            shadowed_dep,
+                            candidate.name,
+                            candidate,
+                            context
+                        );
+                    bool direct_shadow =
+                        package_metadata_satisfies_dependency(candidate.name, candidate, shadowed_dep) ||
+                        package_replaces_package(candidate, shadowed.name, &shadowed);
+                    if (!exact_live_conflict_shadow && !direct_shadow) return false;
+
+                    auto existing = context->shadowed_base_alias_target.find(shadowed.name);
+                    if (existing == context->shadowed_base_alias_target.end()) {
+                        context->shadowed_base_alias_target[shadowed.name] = candidate.name;
+                    }
+                    auto& aliases = context->shadowed_aliases_by_target[candidate.name];
+                    if (std::find(aliases.begin(), aliases.end(), shadowed.name) == aliases.end()) {
+                        aliases.push_back(shadowed.name);
+                    }
+
+                    VLOG(verbose, "Dropping queued base alias " << shadowed.name
+                                 << " in favor of exact live package family " << candidate.name
+                                 << " because the alias only survives as present base-system state.");
+                    return true;
+                };
+
+            if (queue_entry_is_exact_live_shadowing_base_alias(left, right)) {
+                dropped[j] = true;
+                continue;
+            }
+            if (queue_entry_is_exact_live_shadowing_base_alias(right, left)) {
+                dropped[i] = true;
+                break;
+            }
 
             bool left_replaces = package_replaces_package(left, right.name, &right);
             bool right_replaces = package_replaces_package(right, left.name, &left);

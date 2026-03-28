@@ -523,8 +523,20 @@ std::string find_best_exact_live_family(
 
         PackageMetadata live_meta;
         if (!get_context_live_installed_package_metadata(context, live_name, live_meta)) continue;
-        if (!package_metadata_satisfies_dependency(live_name, live_meta, requested_dep) &&
-            !package_replaces_package(live_meta, requested_dep.name, nullptr)) {
+        bool satisfies_dependency =
+            package_metadata_satisfies_dependency(live_name, live_meta, requested_dep);
+        bool replaces_requested =
+            package_replaces_package(live_meta, requested_dep.name, nullptr);
+        bool conflict_only_shadow =
+            dependency_matches_conflicting_exact_live_base_alias(
+                requested_dep,
+                live_name,
+                live_meta,
+                &context
+            );
+        if (!satisfies_dependency &&
+            !replaces_requested &&
+            !conflict_only_shadow) {
             continue;
         }
 
