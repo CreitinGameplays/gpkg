@@ -1692,6 +1692,7 @@ int execute_removal_plan(
     const std::vector<std::string>& to_purge,
     bool verbose
 ) {
+    const bool mutated_runtime_state = !to_remove.empty() || !to_purge.empty();
     if (to_remove.empty() && to_purge.empty()) {
         std::cout << "Nothing to do." << std::endl;
         return 0;
@@ -1775,6 +1776,7 @@ int execute_removal_plan(
         if (!verbose) finish_progress_line(&purge_progress_width);
     }
 
+    if (mutated_runtime_state) queue_runtime_linker_state_refresh();
     return 0;
 }
 
@@ -2936,6 +2938,7 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
               << format_total_bytes(download_report.downloaded_bytes) << " transferred."
               << Color::RESET << std::endl;
 
+    queue_runtime_linker_state_refresh();
     return 0;
 }
 
@@ -3161,7 +3164,7 @@ int handle_repair(bool verbose) {
 
     if (inspection.detected_issues.empty()) {
         std::cout << "No broken packages found." << std::endl;
-        g_pending_triggers.insert("ldconfig");
+        queue_runtime_linker_state_refresh();
         return 0;
     }
 
@@ -3348,7 +3351,7 @@ int handle_repair(bool verbose) {
     std::cout << "Rechecking package state..." << std::endl;
     RepairInspection after_repair = inspect_repair_state(false);
     if (after_repair.detected_issues.empty()) {
-        g_pending_triggers.insert("ldconfig");
+        queue_runtime_linker_state_refresh();
         std::cout << Color::GREEN << "✓ Repair completed successfully." << Color::RESET << std::endl;
         return 0;
     }
@@ -3441,6 +3444,7 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
     std::vector<std::string> operands = collect_cli_operands(argc, argv, 2);
     std::set<std::string> visited;
     bool needs_repo_index = false;
+    bool mutated_runtime_state = false;
     RawDebianContext raw_context;
 
     if (operands.empty()) {
@@ -3554,6 +3558,7 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
                 }
             }
         }
+        mutated_runtime_state = true;
     }
 
     TransactionPlan install_plan;
@@ -3579,6 +3584,7 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
                 return 1;
             }
         }
+        if (mutated_runtime_state) queue_runtime_linker_state_refresh();
         if (local_files.empty()) std::cout << "Nothing to do." << std::endl;
         return 0;
     }
@@ -3717,11 +3723,13 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
                 }
             }
         }
+        mutated_runtime_state = true;
         ++installed_count;
         if (!verbose) render_package_progress("current", i + 1, install_queue.size(), install_queue[i].name, &install_progress_width);
     }
     if (!verbose) finish_progress_line(&install_progress_width);
 
+    if (mutated_runtime_state) queue_runtime_linker_state_refresh();
     std::cout << Color::GREEN << "✓ Installed " << installed_count << " package(s)." << Color::RESET << std::endl;
     return 0;
 }

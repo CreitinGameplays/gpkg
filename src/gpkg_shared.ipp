@@ -517,6 +517,10 @@ void queue_triggers_for_package(const std::string& pkg_name) {
     check_triggers(read_installed_file_list(pkg_name));
 }
 
+void queue_runtime_linker_state_refresh() {
+    g_pending_triggers.insert("ldconfig");
+}
+
 int run_ldconfig_trigger(bool verbose) {
     std::vector<std::string> argv = {"gpkg-worker", "--refresh-runtime-linker-state"};
     if (verbose) argv.push_back("--verbose");
