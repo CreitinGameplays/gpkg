@@ -65,6 +65,17 @@ struct RawDebianContext {
     std::map<std::string, RawDebianAvailabilityResult> raw_exact_cache;
 };
 
+struct DebianSearchPreviewEntry {
+    PackageMetadata meta;
+    bool installable = false;
+    std::string reason;
+    std::vector<std::string> raw_names;
+};
+
+std::map<std::string, DebianSearchPreviewEntry> g_debian_search_preview_cache;
+bool g_debian_search_preview_cache_loaded = false;
+std::string g_debian_search_preview_cache_problem;
+
 bool ensure_raw_debian_context_loaded(
     RawDebianContext& context,
     bool verbose,
@@ -77,6 +88,32 @@ bool query_raw_debian_exact_package(
     bool verbose,
     std::string* reason_out = nullptr
 );
+void invalidate_debian_search_preview_cache();
+bool ensure_debian_search_preview_cache_loaded(
+    bool verbose,
+    std::string* error_out = nullptr
+);
+const std::map<std::string, DebianSearchPreviewEntry>* get_debian_search_preview_cache(
+    bool verbose,
+    std::string* error_out = nullptr
+);
+bool get_debian_search_preview_exact_package(
+    const std::string& requested_name,
+    DebianSearchPreviewEntry& out_entry,
+    bool verbose,
+    std::string* error_out = nullptr
+);
+std::vector<DebianSearchPreviewEntry> build_debian_search_preview_entries(
+    const std::string& packages_path,
+    const std::vector<PackageMetadata>& installable_entries,
+    const std::vector<std::string>& skipped_policy,
+    bool verbose
+);
+std::string raw_debian_effective_import_name(
+    const DebianPackageRecord& record,
+    const ImportPolicy& policy
+);
+std::string debian_installed_size_kib_to_bytes_string(const std::string& kib_text);
 bool resolve_raw_debian_relation_candidate(
     const std::string& requested_name,
     const std::string& op,
@@ -483,6 +520,31 @@ std::string json_string_field(const std::string& key, const std::string& value) 
     return "\"" + json_escape(key) + "\":\"" + json_escape(value) + "\"";
 }
 
+void populate_raw_debian_preview_metadata_from_sources(
+    const DebianPackageRecord& record,
+    const DebianBackendConfig& config,
+    const ImportPolicy& policy,
+    PackageMetadata& meta
+) {
+    meta = {};
+    meta.name = raw_debian_effective_import_name(record, policy);
+    meta.version = record.version;
+    meta.arch = record.architecture == "all" ? std::string(OS_ARCH) : std::string(OS_ARCH);
+    meta.maintainer = record.maintainer.empty() ? "Debian Maintainers" : record.maintainer;
+    meta.description = record.description.empty() ? record.package : record.description;
+    meta.filename = record.filename;
+    meta.sha256 = record.sha256;
+    meta.source_url = config.base_url;
+    meta.source_kind = "debian";
+    meta.debian_package = record.package;
+    meta.debian_version = record.version;
+    meta.section = sanitize_section_name(record.section);
+    meta.priority = record.priority;
+    meta.size = record.size;
+    meta.installed_size_bytes = debian_installed_size_kib_to_bytes_string(record.installed_size);
+    meta.installed_from = config.packages_url;
+}
+
 std::string package_metadata_to_json(const PackageMetadata& meta) {
     std::vector<std::string> fields;
     fields.push_back(json_string_field("package", meta.name));
@@ -510,6 +572,29 @@ std::string package_metadata_to_json(const PackageMetadata& meta) {
     fields.push_back(json_string_field("installed_size_bytes", meta.installed_size_bytes));
     if (!meta.sha256.empty()) fields.push_back(json_string_field("sha256", meta.sha256));
     if (!meta.sha512.empty()) fields.push_back(json_string_field("sha512", meta.sha512));
+
+    std::ostringstream out;
+    out << "{";
+    for (size_t i = 0; i < fields.size(); ++i) {
+        if (i > 0) out << ",";
+        out << fields[i];
+    }
+    out << "}";
+    return out.str();
+}
+
+std::string debian_search_preview_to_json(const DebianSearchPreviewEntry& entry) {
+    std::vector<std::string> fields;
+    fields.push_back(json_string_field("package", entry.meta.name));
+    fields.push_back(json_string_field("version", entry.meta.version));
+    fields.push_back(json_string_field("description", entry.meta.description));
+    fields.push_back(json_string_field("source_kind", entry.meta.source_kind));
+    fields.push_back(json_string_field("source_url", entry.meta.source_url));
+    fields.push_back(json_string_field("debian_package", entry.meta.debian_package));
+    fields.push_back(json_string_field("debian_version", entry.meta.debian_version));
+    fields.push_back(json_string_field("installable", entry.installable ? "yes" : "no"));
+    fields.push_back(json_string_field("reason", entry.reason));
+    fields.push_back("\"raw_names\":" + json_array_from_strings(entry.raw_names));
 
     std::ostringstream out;
     out << "{";
@@ -1077,6 +1162,116 @@ std::string get_debian_packages_cache_path() {
     return REPO_CACHE_PATH + "debian/Packages";
 }
 
+std::string get_debian_search_preview_path() {
+    return REPO_CACHE_PATH + "debian/Packages.preview.json";
+}
+
+bool should_prefer_debian_search_preview_candidate(
+    const DebianSearchPreviewEntry& candidate,
+    const DebianSearchPreviewEntry& current
+) {
+    if (candidate.installable != current.installable) return candidate.installable;
+    return compare_versions(candidate.meta.version, current.meta.version) > 0;
+}
+
+bool parse_debian_search_preview_skip_entry(
+    const std::string& entry,
+    std::string& package_name,
+    std::string& reason
+) {
+    size_t colon = entry.find(':');
+    if (colon == std::string::npos) return false;
+
+    package_name = trim(entry.substr(0, colon));
+    reason = trim(entry.substr(colon + 1));
+    return !package_name.empty();
+}
+
+std::vector<DebianSearchPreviewEntry> build_debian_search_preview_entries(
+    const std::string& packages_path,
+    const std::vector<PackageMetadata>& installable_entries,
+    const std::vector<std::string>& skipped_policy,
+    bool verbose
+) {
+    DebianBackendConfig config = load_debian_backend_config(verbose);
+    ImportPolicy policy = get_import_policy(verbose);
+    std::vector<DebianPackageRecord> records = parse_debian_packages_file(packages_path, config, verbose);
+
+    std::map<std::string, PackageMetadata> installable_by_name;
+    for (const auto& meta : installable_entries) {
+        auto it = installable_by_name.find(meta.name);
+        if (it == installable_by_name.end() ||
+            compare_versions(meta.version, it->second.version) > 0) {
+            installable_by_name[meta.name] = meta;
+        }
+    }
+
+    std::map<std::string, std::string> skipped_reason_by_name;
+    for (const auto& entry : skipped_policy) {
+        std::string package_name;
+        std::string reason;
+        if (!parse_debian_search_preview_skip_entry(entry, package_name, reason)) continue;
+
+        auto it = skipped_reason_by_name.find(package_name);
+        if (it == skipped_reason_by_name.end() || reason.size() > it->second.size()) {
+            skipped_reason_by_name[package_name] = reason;
+        }
+    }
+
+    std::map<std::string, DebianSearchPreviewEntry> preview_by_name;
+    std::map<std::string, std::vector<std::string>> raw_names_by_import;
+
+    for (const auto& record : records) {
+        std::string import_name = raw_debian_effective_import_name(record, policy);
+        if (import_name.empty()) continue;
+
+        auto& raw_names = raw_names_by_import[import_name];
+        if (std::find(raw_names.begin(), raw_names.end(), record.package) == raw_names.end()) {
+            raw_names.push_back(record.package);
+        }
+
+        DebianSearchPreviewEntry candidate;
+        populate_raw_debian_preview_metadata_from_sources(record, config, policy, candidate.meta);
+        if (record.filename.empty() || record.sha256.empty()) {
+            candidate.reason = "package metadata is incomplete";
+        }
+
+        auto it = preview_by_name.find(import_name);
+        if (it == preview_by_name.end() ||
+            should_prefer_debian_search_preview_candidate(candidate, it->second)) {
+            preview_by_name[import_name] = candidate;
+        }
+    }
+
+    for (auto& entry : preview_by_name) {
+        auto raw_names_it = raw_names_by_import.find(entry.first);
+        if (raw_names_it != raw_names_by_import.end()) {
+            entry.second.raw_names = raw_names_it->second;
+        }
+
+        auto installable_it = installable_by_name.find(entry.first);
+        if (installable_it != installable_by_name.end()) {
+            entry.second.meta = installable_it->second;
+            entry.second.installable = true;
+            entry.second.reason.clear();
+            continue;
+        }
+
+        entry.second.installable = false;
+        auto skipped_it = skipped_reason_by_name.find(entry.first);
+        if (skipped_it != skipped_reason_by_name.end()) {
+            entry.second.reason = skipped_it->second;
+        } else if (entry.second.reason.empty()) {
+            entry.second.reason = "required dependency closure is unsatisfied";
+        }
+    }
+
+    std::vector<DebianSearchPreviewEntry> entries;
+    entries.reserve(preview_by_name.size());
+    for (const auto& entry : preview_by_name) entries.push_back(entry.second);
+    return entries;
+}
+
 std::string raw_debian_effective_import_name(
     const DebianPackageRecord& record,
     const ImportPolicy& policy
@@ -1094,23 +1289,7 @@ void populate_raw_debian_preview_metadata(
     const DebianPackageRecord& record,
     PackageMetadata& meta
 ) {
-    meta = {};
-    meta.name = raw_debian_effective_import_name(record, context.policy);
-    meta.version = record.version;
-    meta.arch = record.architecture == "all" ? std::string(OS_ARCH) : std::string(OS_ARCH);
-    meta.maintainer = record.maintainer.empty() ? "Debian Maintainers" : record.maintainer;
-    meta.description = record.description.empty() ? record.package : record.description;
-    meta.filename = record.filename;
-    meta.sha256 = record.sha256;
-    meta.source_url = context.config.base_url;
-    meta.source_kind = "debian";
-    meta.debian_package = record.package;
-    meta.debian_version = record.version;
-    meta.section = sanitize_section_name(record.section);
-    meta.priority = record.priority;
-    meta.size = record.size;
-    meta.installed_size_bytes = debian_installed_size_kib_to_bytes_string(record.installed_size);
-    meta.installed_from = context.config.packages_url;
+    populate_raw_debian_preview_metadata_from_sources(record, context.config, context.policy, meta);
 }
 
 bool raw_debian_record_is_blocked_by_policy(
@@ -1551,6 +1730,183 @@ bool resolve_raw_debian_relation_candidate(
     return ok;
 }
 
+void invalidate_debian_search_preview_cache() {
+    g_debian_search_preview_cache.clear();
+    g_debian_search_preview_cache_loaded = false;
+    g_debian_search_preview_cache_problem.clear();
+}
+
+void populate_debian_search_preview_from_json(
+    const std::string& obj,
+    DebianSearchPreviewEntry& entry
+) {
+    entry = {};
+    get_json_value(obj, "package", entry.meta.name);
+    get_json_value(obj, "version", entry.meta.version);
+    get_json_value(obj, "description", entry.meta.description);
+    get_json_value(obj, "source_kind", entry.meta.source_kind);
+    get_json_value(obj, "source_url", entry.meta.source_url);
+    get_json_value(obj, "debian_package", entry.meta.debian_package);
+    get_json_value(obj, "debian_version", entry.meta.debian_version);
+    get_json_value(obj, "reason", entry.reason);
+    get_json_array(obj, "raw_names", entry.raw_names);
+
+    std::string installable_value;
+    get_json_value(obj, "installable", installable_value);
+    entry.installable = installable_value == "yes";
+}
+
+bool write_debian_search_preview_cache(
+    const std::vector<DebianSearchPreviewEntry>& entries,
+    std::string* error_out = nullptr
+) {
+    if (error_out) *error_out = "";
+
+    std::string preview_path = get_debian_search_preview_path();
+    if (!mkdir_parent(preview_path)) {
+        if (error_out) *error_out = "failed to create preview cache directory";
+        return false;
+    }
+
+    std::string tmp_path = preview_path + ".tmp";
+    std::ofstream out(tmp_path);
+    if (!out) {
+        if (error_out) *error_out = "failed to open preview cache for writing";
+        return false;
+    }
+
+    out << "[\n";
+    for (size_t i = 0; i < entries.size(); ++i) {
+        if (i > 0) out << ",\n";
+        out << debian_search_preview_to_json(entries[i]);
+    }
+    out << "\n]\n";
+    out.close();
+    if (!out) {
+        remove(tmp_path.c_str());
+        if (error_out) *error_out = "failed to flush preview cache";
+        return false;
+    }
+
+    if (rename(tmp_path.c_str(), preview_path.c_str()) != 0) {
+        remove(tmp_path.c_str());
+        if (error_out) *error_out = strerror(errno);
+        return false;
+    }
+
+    invalidate_debian_search_preview_cache();
+    return true;
+}
+
+bool ensure_debian_search_preview_cache_loaded(
+    bool verbose,
+    std::string* error_out
+) {
+    if (error_out) error_out->clear();
+    if (g_debian_search_preview_cache_loaded) {
+        if (error_out && !g_debian_search_preview_cache_problem.empty()) {
+            *error_out = g_debian_search_preview_cache_problem;
+        }
+        return g_debian_search_preview_cache_problem.empty();
+    }
+
+    g_debian_search_preview_cache.clear();
+    g_debian_search_preview_cache_loaded = true;
+    g_debian_search_preview_cache_problem.clear();
+
+    std::string preview_path = get_debian_search_preview_path();
+    if (access(preview_path.c_str(), F_OK) != 0) {
+        g_debian_search_preview_cache_problem =
+            "cached Debian search preview is unavailable; run 'gpkg update'";
+        if (error_out) *error_out = g_debian_search_preview_cache_problem;
+        return false;
+    }
+
+    foreach_json_object(preview_path, [&](const std::string& obj) {
+        DebianSearchPreviewEntry candidate;
+        populate_debian_search_preview_from_json(obj, candidate);
+        candidate.meta.name = canonicalize_package_name(candidate.meta.name, verbose);
+        candidate.meta.debian_package = canonicalize_package_name(candidate.meta.debian_package, verbose);
+        for (auto& raw_name : candidate.raw_names) {
+            raw_name = canonicalize_package_name(raw_name, verbose);
+        }
+
+        if (candidate.meta.name.empty()) return true;
+
+        auto it = g_debian_search_preview_cache.find(candidate.meta.name);
+        if (it == g_debian_search_preview_cache.end() ||
+            should_prefer_debian_search_preview_candidate(candidate, it->second)) {
+            g_debian_search_preview_cache[candidate.meta.name] = candidate;
+        }
+        return true;
+    });
+
+    if (g_debian_search_preview_cache.empty()) {
+        g_debian_search_preview_cache_problem =
+            "cached Debian search preview could not be parsed; run 'gpkg update'";
+        if (error_out) *error_out = g_debian_search_preview_cache_problem;
+        return false;
+    }
+
+    if (error_out) error_out->clear();
+    VLOG(verbose, "Loaded " << g_debian_search_preview_cache.size()
+                 << " Debian search preview records into memory.");
+    return true;
+}
+
+const std::map<std::string, DebianSearchPreviewEntry>* get_debian_search_preview_cache(
+    bool verbose,
+    std::string* error_out
+) {
+    if (!ensure_debian_search_preview_cache_loaded(verbose, error_out)) return nullptr;
+    return &g_debian_search_preview_cache;
+}
+
+bool get_debian_search_preview_exact_package(
+    const std::string& requested_name,
+    DebianSearchPreviewEntry& out_entry,
+    bool verbose,
+    std::string* error_out
+) {
+    out_entry = {};
+    if (error_out) error_out->clear();
+
+    std::string canonical_requested = canonicalize_package_name(requested_name, verbose);
+    if (canonical_requested.empty()) {
+        if (error_out) *error_out = "invalid package name";
+        return false;
+    }
+
+    if (!ensure_debian_search_preview_cache_loaded(verbose, error_out)) return false;
+
+    auto exact_it = g_debian_search_preview_cache.find(canonical_requested);
+    if (exact_it != g_debian_search_preview_cache.end()) {
+        out_entry = exact_it->second;
+        return true;
+    }
+
+    bool found = false;
+    for (const auto& entry : g_debian_search_preview_cache) {
+        const auto& raw_names = entry.second.raw_names;
+        if (std::find(raw_names.begin(), raw_names.end(), canonical_requested) == raw_names.end()) {
+            continue;
+        }
+
+        if (!found ||
+            should_prefer_debian_search_preview_candidate(entry.second, out_entry)) {
+            out_entry = entry.second;
+            found = true;
+        }
+    }
+
+    if (!found) {
+        if (error_out) *error_out = "package is absent from cached Debian preview metadata";
+        return false;
+    }
+
+    return true;
+}
+
 bool update_debian_backend_index(
     std::ofstream& merged,
     bool& first_object,
@@ -1607,6 +1963,17 @@ bool update_debian_backend_index(
 
     std::vector<std::string> skipped_policy;
     std::vector<PackageMetadata> entries = load_debian_index_entries(packages_txt, verbose, &skipped_policy);
+    std::vector<DebianSearchPreviewEntry> preview_entries =
+        build_debian_search_preview_entries(packages_txt, entries, skipped_policy, verbose);
+    std::string preview_error;
+    if (!write_debian_search_preview_cache(preview_entries, &preview_error)) {
+        std::cerr << Color::YELLOW
+                  << "W: Failed to write Debian search preview cache";
+        if (!preview_error.empty()) std::cerr << " (" << preview_error << ")";
+        std::cerr << ". Search and install diagnostics may be slower."
+                  << Color::RESET << std::endl;
+    }
+
     for (const auto& meta : entries) {
         if (!first_object) merged << ",\n";
         merged << package_metadata_to_json(meta);

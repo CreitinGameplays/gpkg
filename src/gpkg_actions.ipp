@@ -3365,6 +3365,51 @@ int handle_repair(bool verbose) {
     return 1;
 }
 
+bool maybe_report_unavailable_install_target(
+    const std::string& requested_name,
+    bool verbose
+) {
+    std::string canonical_name = canonicalize_package_name(requested_name, verbose);
+    if (canonical_name.empty()) return false;
+
+    PackageUniverseResult available_result;
+    if (resolve_full_universe_relation_candidate(
+            canonical_name,
+            "",
+            "",
+            available_result,
+            verbose,
+            nullptr
+        )) {
+        return false;
+    }
+
+    DebianSearchPreviewEntry preview;
+    std::string preview_error;
+    if (!get_debian_search_preview_exact_package(canonical_name, preview, verbose, &preview_error)) {
+        return false;
+    }
+    if (preview.installable) return false;
+
+    std::cerr << Color::YELLOW
+              << "Package " << requested_name << " is available, but it is not installable."
+              << Color::RESET << std::endl;
+    if (preview.meta.name != canonical_name && !preview.meta.name.empty()) {
+        std::cerr << "  Candidate: " << preview.meta.name << std::endl;
+    }
+    std::string origin = format_package_origin(preview.meta);
+    if (!origin.empty()) {
+        std::cerr << "  Source: " << origin << std::endl;
+    }
+    if (!preview.reason.empty()) {
+        std::cerr << "  Reason: " << preview.reason << std::endl;
+    }
+    std::cerr << Color::RED
+              << "E: Package '" << requested_name << "' has no installation candidate."
+              << Color::RESET << std::endl;
+    return true;
+}
+
 int handle_install(int argc, char* argv[], const std::set<std::string>& installed_cache, bool verbose) {
     std::vector<PackageMetadata> install_queue;
     std::vector<std::string> local_files;
@@ -3397,6 +3442,11 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
             continue;
         }
 
+        if (maybe_report_unavailable_install_target(arg, verbose)) {
+            return 1;
+        }
+
+        std::string failure_reason;
         if (!resolve_dependencies(
                 arg,
                 "",
@@ -3408,10 +3458,14 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
                 g_force_reinstall,
                 nullptr,
                 false,
-                &raw_context
+                &raw_context,
+                &failure_reason
             )) {
-            std::cerr << Color::RED << "E: Failed to resolve dependencies for " << arg
-                      << Color::RESET << std::endl;
+            std::cerr << Color::RED << "E: Failed to resolve dependencies for " << arg;
+            if (!failure_reason.empty()) {
+                std::cerr << " (" << failure_reason << ")";
+            }
+            std::cerr << Color::RESET << std::endl;
             return 1;
         }
     }
