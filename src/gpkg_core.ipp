@@ -250,33 +250,56 @@ std::string inject_repo_url(const std::string& obj, const std::string& repo_url)
         + ",\"source_kind\":\"gpkg_repo\"}";
 }
 
-bool extract_json_object(const std::string& content, size_t& pos, std::string& out_obj) {
-    pos = content.find("{", pos);
-    if (pos == std::string::npos) return false;
-
-    int depth = 0;
-    for (size_t i = pos; i < content.length(); ++i) {
-        if (content[i] == '{') depth++;
-        else if (content[i] == '}' && --depth == 0) {
-            out_obj = content.substr(pos, i - pos + 1);
-            pos = i + 1;
-            return true;
-        }
-    }
-
-    return false;
-}
-
 template <typename Func>
 void foreach_json_object(const std::string& filepath, Func callback) {
     std::ifstream f(filepath);
     if (!f) return;
 
-    std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-    size_t pos = 0;
     std::string obj;
-    while (extract_json_object(content, pos, obj)) {
-        if (!callback(obj)) break;
+    obj.reserve(8192);
+
+    bool in_string = false;
+    bool escape = false;
+    int depth = 0;
+    char ch = '\0';
+    while (f.get(ch)) {
+        if (depth == 0) {
+            if (ch != '{') continue;
+            obj.clear();
+            obj.push_back(ch);
+            depth = 1;
+            in_string = false;
+            escape = false;
+            continue;
+        }
+
+        obj.push_back(ch);
+
+        if (escape) {
+            escape = false;
+            continue;
+        }
+        if (ch == '\\' && in_string) {
+            escape = true;
+            continue;
+        }
+        if (ch == '"') {
+            in_string = !in_string;
+            continue;
+        }
+        if (in_string) continue;
+
+        if (ch == '{') {
+            ++depth;
+            continue;
+        }
+        if (ch == '}') {
+            --depth;
+            if (depth == 0) {
+                if (!callback(obj)) break;
+                obj.clear();
+            }
+        }
     }
 }
 

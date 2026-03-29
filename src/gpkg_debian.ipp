@@ -40,6 +40,11 @@ struct DebianPackagesCacheState {
     long content_length = -1;
 };
 
+struct DebianImportedIndexCacheState {
+    std::string fingerprint;
+    size_t package_count = 0;
+};
+
 struct RawDebianAvailabilityResult {
     bool found = false;
     bool installable = false;
@@ -514,6 +519,109 @@ std::string debian_description_text(const std::string& raw_description) {
     return summary + "\n\n" + body;
 }
 
+std::string* get_debian_record_field_storage(
+    DebianPackageRecord& record,
+    std::string& essential_value,
+    const std::string& key
+) {
+    if (key == "Package") return &record.package;
+    if (key == "Version") return &record.version;
+    if (key == "Architecture") return &record.architecture;
+    if (key == "Maintainer") return &record.maintainer;
+    if (key == "Section") return &record.section;
+    if (key == "Priority") return &record.priority;
+    if (key == "Filename") return &record.filename;
+    if (key == "SHA256") return &record.sha256;
+    if (key == "Size") return &record.size;
+    if (key == "Installed-Size") return &record.installed_size;
+    if (key == "Depends") return &record.depends_raw;
+    if (key == "Pre-Depends") return &record.pre_depends_raw;
+    if (key == "Recommends") return &record.recommends_raw;
+    if (key == "Suggests") return &record.suggests_raw;
+    if (key == "Conflicts") return &record.conflicts_raw;
+    if (key == "Provides") return &record.provides_raw;
+    if (key == "Replaces") return &record.replaces_raw;
+    if (key == "Description") return &record.description;
+    if (key == "Essential") return &essential_value;
+    return nullptr;
+}
+
+template <typename Func>
+bool for_each_debian_package_record(
+    const std::string& packages_path,
+    const DebianBackendConfig& config,
+    bool verbose,
+    Func callback
+) {
+    std::ifstream f(packages_path);
+    if (!f) return false;
+
+    DebianPackageRecord current;
+    std::string essential_value;
+    std::string last_key;
+    std::string* last_value = nullptr;
+
+    auto reset_current = [&]() {
+        current = {};
+        essential_value.clear();
+        last_key.clear();
+        last_value = nullptr;
+    };
+
+    auto flush_current = [&]() -> bool {
+        if (current.package.empty() || current.version.empty()) {
+            reset_current();
+            return true;
+        }
+
+        if (!(current.architecture.empty() ||
+              current.architecture == "all" ||
+              current.architecture == config.apt_arch)) {
+            reset_current();
+            return true;
+        }
+
+        current.description = debian_description_text(current.description);
+        current.essential = !essential_value.empty() && trim(essential_value) == "yes";
+
+        if (verbose && current.filename.empty()) {
+            std::cout << "[DEBUG] Debian record missing Filename: " << current.package << std::endl;
+        }
+
+        DebianPackageRecord ready = current;
+        reset_current();
+        return callback(ready);
+    };
+
+    std::string raw_line;
+    while (std::getline(f, raw_line)) {
+        if (!raw_line.empty() && raw_line.back() == '\r') raw_line.pop_back();
+        if (trim(raw_line).empty()) {
+            if (!flush_current()) return false;
+            continue;
+        }
+
+        if (!raw_line.empty() && std::isspace(static_cast<unsigned char>(raw_line[0]))) {
+            if (last_value) *last_value += "\n" + raw_line.substr(1);
+            continue;
+        }
+
+        size_t colon = raw_line.find(':');
+        if (colon == std::string::npos) {
+            last_key.clear();
+            last_value = nullptr;
+            continue;
+        }
+
+        last_key = raw_line.substr(0, colon);
+        last_value = get_debian_record_field_storage(current, essential_value, last_key);
+        if (!last_value) continue;
+        *last_value = trim(raw_line.substr(colon + 1));
+    }
+
+    return flush_current();
+}
+
 std::string json_array_from_strings(const std::vector<std::string>& items) {
     std::ostringstream out;
     out << "[";
@@ -620,49 +728,16 @@ std::vector<DebianPackageRecord> parse_debian_packages_file(
     const DebianBackendConfig& config,
     bool verbose
 ) {
-    std::ifstream f(packages_path);
-    if (!f) return {};
-    std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-
     std::vector<DebianPackageRecord> parsed;
-    for (const auto& fields : parse_debian_control_stanzas(content)) {
-        DebianPackageRecord record;
-        auto get_field = [&](const std::string& key) -> std::string {
-            auto it = fields.find(key);
-            return it == fields.end() ? "" : it->second;
-        };
-
-        record.package = get_field("Package");
-        record.version = get_field("Version");
-        record.architecture = get_field("Architecture");
-        if (record.package.empty() || record.version.empty()) continue;
-        if (!(record.architecture.empty() || record.architecture == "all" || record.architecture == config.apt_arch)) {
-            continue;
+    for_each_debian_package_record(
+        packages_path,
+        config,
+        verbose,
+        [&](const DebianPackageRecord& record) {
+            parsed.push_back(record);
+            return true;
         }
-
-        record.maintainer = get_field("Maintainer");
-        record.section = get_field("Section");
-        record.priority = get_field("Priority");
-        record.filename = get_field("Filename");
-        record.sha256 = get_field("SHA256");
-        record.size = get_field("Size");
-        record.installed_size = get_field("Installed-Size");
-        record.pre_depends_raw = get_field("Pre-Depends");
-        record.depends_raw = get_field("Depends");
-        record.recommends_raw = get_field("Recommends");
-        record.suggests_raw = get_field("Suggests");
-        record.conflicts_raw = get_field("Conflicts");
-        record.provides_raw = get_field("Provides");
-        record.replaces_raw = get_field("Replaces");
-        record.description = debian_description_text(get_field("Description"));
-        std::string essential = get_field("Essential");
-        record.essential = !essential.empty() && trim(essential) == "yes";
-
-        if (verbose && record.filename.empty()) {
-            std::cout << "[DEBUG] Debian record missing Filename: " << record.package << std::endl;
-        }
-        parsed.push_back(record);
-    }
+    );
 
     return parsed;
 }
@@ -757,15 +832,99 @@ std::vector<std::string> apply_dependency_removals(
 
     std::vector<std::string> result;
     for (const auto& dep : filtered) {
-        if (std::find(
-                package_override.depends_remove.begin(),
-                package_override.depends_remove.end(),
-                dep
-            ) == package_override.depends_remove.end()) {
-            result.push_back(dep);
+        auto matches_override = [&](const std::string& candidate) {
+            std::string trimmed = trim(candidate);
+            if (trimmed.empty()) return false;
+            return std::find(
+                       package_override.depends_remove.begin(),
+                       package_override.depends_remove.end(),
+                       trimmed
+                   ) != package_override.depends_remove.end();
+        };
+
+        if (matches_override(dep)) continue;
+
+        RelationAtom parsed = normalize_relation_atom(dep, "any");
+        if (parsed.valid &&
+            (matches_override(parsed.name) || matches_override(parsed.normalized))) {
+            continue;
         }
+
+        result.push_back(dep);
     }
     return result;
+}
+
+bool dependency_relation_matches_override_removal(
+    const std::string& relation_text,
+    const PackageOverridePolicy& package_override,
+    const std::string& apt_arch,
+    const ImportPolicy* policy = nullptr
+) {
+    if (package_override.depends_remove.empty()) return false;
+
+    auto matches_override = [&](const std::string& candidate) {
+        std::string trimmed = trim(candidate);
+        if (trimmed.empty()) return false;
+        return std::find(
+                   package_override.depends_remove.begin(),
+                   package_override.depends_remove.end(),
+                   trimmed
+               ) != package_override.depends_remove.end();
+    };
+
+    std::string trimmed_relation = trim(relation_text);
+    if (trimmed_relation.empty()) return false;
+    if (matches_override(trimmed_relation)) return true;
+
+    RelationAtom parsed = normalize_relation_atom(trimmed_relation, apt_arch);
+    if (!parsed.valid) return false;
+    if (matches_override(parsed.name) || matches_override(parsed.normalized)) return true;
+
+    if (!policy) return false;
+
+    std::string rewritten_name = apply_dependency_rewrite_name(
+        parsed.name,
+        policy->dependency_rewrites,
+        &policy->package_aliases
+    );
+    if (rewritten_name.empty() || rewritten_name == parsed.name) return false;
+    if (matches_override(rewritten_name)) return true;
+
+    std::string rewritten_normalized = parsed.op.empty()
+        ? rewritten_name
+        : rewritten_name + " (" + parsed.op + " " + parsed.version + ")";
+    return matches_override(rewritten_normalized);
+}
+
+std::string apply_dependency_removals_to_raw_value(
+    const std::string& raw_value,
+    const PackageOverridePolicy& package_override,
+    const std::string& apt_arch,
+    const ImportPolicy& policy
+) {
+    if (raw_value.empty() || package_override.depends_remove.empty()) return raw_value;
+
+    std::vector<std::string> filtered_groups;
+    for (const auto& group : split_top_level_text(raw_value, ',')) {
+        std::vector<std::string> kept_alternatives;
+        for (const auto& alternative : split_top_level_text(group, '|')) {
+            if (dependency_relation_matches_override_removal(
+                    alternative,
+                    package_override,
+                    apt_arch,
+                    &policy
+                )) {
+                continue;
+            }
+            kept_alternatives.push_back(trim(alternative));
+        }
+
+        if (kept_alternatives.empty()) continue;
+        filtered_groups.push_back(join_strings(kept_alternatives, " | "));
+    }
+
+    return join_strings(filtered_groups, ", ");
 }
 
 bool debian_dependency_version_satisfies(
@@ -838,6 +997,12 @@ std::map<std::string, std::vector<std::string>> build_imported_dependency_index(
     return index;
 }
 
+bool imported_dependency_relation_is_available(
+    const std::string& dep_str,
+    const std::map<std::string, PackageMetadata>& selected,
+    const std::map<std::string, std::vector<std::string>>& dependency_index
+);
+
 std::vector<std::string> find_missing_imported_required_dependencies(
     const PackageMetadata& meta,
     const std::map<std::string, PackageMetadata>& selected,
@@ -846,23 +1011,9 @@ std::vector<std::string> find_missing_imported_required_dependencies(
     std::vector<std::string> missing;
 
     for (const auto& dep_str : meta.depends) {
-        RelationAtom dep = normalize_relation_atom(dep_str, "any");
-        if (!dep.valid) continue;
-
-        bool satisfied = false;
-        auto candidate_it = dependency_index.find(dep.name);
-        if (candidate_it != dependency_index.end()) {
-            for (const auto& candidate_name : candidate_it->second) {
-                auto meta_it = selected.find(candidate_name);
-                if (meta_it == selected.end()) continue;
-                if (debian_meta_satisfies_required_dependency(meta_it->second, dep)) {
-                    satisfied = true;
-                    break;
-                }
-            }
+        if (!imported_dependency_relation_is_available(dep_str, selected, dependency_index)) {
+            missing.push_back(dep_str);
         }
-
-        if (!satisfied) missing.push_back(dep_str);
     }
 
     return missing;
@@ -969,6 +1120,12 @@ bool build_debian_package_metadata(
         if (!required_dependency_text.empty()) required_dependency_text += ", ";
         required_dependency_text += record.depends_raw;
     }
+    required_dependency_text = apply_dependency_removals_to_raw_value(
+        required_dependency_text,
+        package_override,
+        config.apt_arch,
+        policy
+    );
 
     std::vector<std::string> unresolved_required_groups;
     std::vector<std::string> depends = normalize_dependency_relation_value(
@@ -998,7 +1155,12 @@ bool build_debian_package_metadata(
     depends = apply_dependency_removals(depends, package_override);
     std::vector<std::string> recommends = apply_dependency_removals(
         normalize_dependency_relation_value(
-            record.recommends_raw,
+            apply_dependency_removals_to_raw_value(
+                record.recommends_raw,
+                package_override,
+                config.apt_arch,
+                policy
+            ),
             record.package,
             config.apt_arch,
             false,
@@ -1011,7 +1173,12 @@ bool build_debian_package_metadata(
     );
     std::vector<std::string> suggests = apply_dependency_removals(
         normalize_dependency_relation_value(
-            record.suggests_raw,
+            apply_dependency_removals_to_raw_value(
+                record.suggests_raw,
+                package_override,
+                config.apt_arch,
+                policy
+            ),
             record.package,
             config.apt_arch,
             false,
@@ -1058,15 +1225,13 @@ bool build_debian_package_metadata(
     return true;
 }
 
-std::vector<PackageMetadata> load_debian_index_entries(
-    const std::string& packages_path,
+std::vector<PackageMetadata> load_debian_index_entries_from_records(
+    const std::vector<DebianPackageRecord>& records,
+    const DebianBackendConfig& config,
+    const ImportPolicy& policy,
     bool verbose,
     std::vector<std::string>* skipped_policy = nullptr
 ) {
-    DebianBackendConfig config = load_debian_backend_config(verbose);
-    ImportPolicy policy = get_import_policy(verbose);
-    std::vector<DebianPackageRecord> records = parse_debian_packages_file(packages_path, config, verbose);
-
     std::set<std::string> available_packages;
     for (const auto& record : records) available_packages.insert(record.package);
     std::vector<std::string> system_drop_patterns = build_system_drop_patterns(policy, available_packages);
@@ -1163,6 +1328,17 @@ std::vector<PackageMetadata> load_debian_index_entries(
     return entries;
 }
 
+std::vector<PackageMetadata> load_debian_index_entries(
+    const std::string& packages_path,
+    bool verbose,
+    std::vector<std::string>* skipped_policy
+) {
+    DebianBackendConfig config = load_debian_backend_config(verbose);
+    ImportPolicy policy = get_import_policy(verbose);
+    std::vector<DebianPackageRecord> records = parse_debian_packages_file(packages_path, config, verbose);
+    return load_debian_index_entries_from_records(records, config, policy, verbose, skipped_policy);
+}
+
 std::string get_debian_packages_gz_cache_path() {
     return REPO_CACHE_PATH + "debian/Packages.gz";
 }
@@ -1173,6 +1349,14 @@ std::string get_debian_packages_cache_path() {
 
 std::string get_debian_search_preview_path() {
     return REPO_CACHE_PATH + "debian/Packages.preview.json";
+}
+
+std::string get_debian_imported_index_cache_path() {
+    return REPO_CACHE_PATH + "debian/Packages.imported.json";
+}
+
+std::string get_debian_imported_index_state_path() {
+    return REPO_CACHE_PATH + "debian/Packages.imported.state";
 }
 
 bool should_prefer_debian_search_preview_candidate(
@@ -1196,16 +1380,13 @@ bool parse_debian_search_preview_skip_entry(
     return !package_name.empty();
 }
 
-std::vector<DebianSearchPreviewEntry> build_debian_search_preview_entries(
-    const std::string& packages_path,
+std::vector<DebianSearchPreviewEntry> build_debian_search_preview_entries_from_records(
+    const std::vector<DebianPackageRecord>& records,
+    const DebianBackendConfig& config,
+    const ImportPolicy& policy,
     const std::vector<PackageMetadata>& installable_entries,
-    const std::vector<std::string>& skipped_policy,
-    bool verbose
+    const std::vector<std::string>& skipped_policy
 ) {
-    DebianBackendConfig config = load_debian_backend_config(verbose);
-    ImportPolicy policy = get_import_policy(verbose);
-    std::vector<DebianPackageRecord> records = parse_debian_packages_file(packages_path, config, verbose);
-
     std::map<std::string, PackageMetadata> installable_by_name;
     for (const auto& meta : installable_entries) {
         auto it = installable_by_name.find(meta.name);
@@ -1279,6 +1460,24 @@ std::vector<DebianSearchPreviewEntry> build_debian_search_preview_entries(
     entries.reserve(preview_by_name.size());
     for (const auto& entry : preview_by_name) entries.push_back(entry.second);
     return entries;
+}
+
+std::vector<DebianSearchPreviewEntry> build_debian_search_preview_entries(
+    const std::string& packages_path,
+    const std::vector<PackageMetadata>& installable_entries,
+    const std::vector<std::string>& skipped_policy,
+    bool verbose
+) {
+    DebianBackendConfig config = load_debian_backend_config(verbose);
+    ImportPolicy policy = get_import_policy(verbose);
+    std::vector<DebianPackageRecord> records = parse_debian_packages_file(packages_path, config, verbose);
+    return build_debian_search_preview_entries_from_records(
+        records,
+        config,
+        policy,
+        installable_entries,
+        skipped_policy
+    );
 }
 
 std::string raw_debian_effective_import_name(
@@ -1605,27 +1804,36 @@ bool ensure_raw_debian_context_loaded(
         return false;
     }
 
-    std::vector<DebianPackageRecord> records =
-        parse_debian_packages_file(context.packages_path, context.config, verbose);
-    if (records.empty()) {
+    bool parsed_any_records = false;
+    if (!for_each_debian_package_record(
+            context.packages_path,
+            context.config,
+            verbose,
+            [&](const DebianPackageRecord& record) {
+                parsed_any_records = true;
+                context.available_packages.insert(record.package);
+
+                auto existing = context.records_by_name.find(record.package);
+                if (existing == context.records_by_name.end() ||
+                    compare_versions(record.version, existing->second.version) > 0) {
+                    context.records_by_name[record.package] = record;
+                }
+                return true;
+            }
+        ) ||
+        !parsed_any_records) {
         context.problem = "cached Debian metadata could not be parsed; run 'gpkg update'";
         if (error_out) *error_out = context.problem;
         return false;
     }
 
-    for (const auto& record : records) {
-        context.available_packages.insert(record.package);
+    std::vector<DebianPackageRecord> latest_records;
+    latest_records.reserve(context.records_by_name.size());
+    for (const auto& entry : context.records_by_name) {
+        latest_records.push_back(entry.second);
     }
     context.system_drop_patterns = build_system_drop_patterns(context.policy, context.available_packages);
-    context.provider_map = build_debian_provider_map(records, context.config.apt_arch);
-
-    for (const auto& record : records) {
-        auto existing = context.records_by_name.find(record.package);
-        if (existing == context.records_by_name.end() ||
-            compare_versions(record.version, existing->second.version) > 0) {
-            context.records_by_name[record.package] = record;
-        }
-    }
+    context.provider_map = build_debian_provider_map(latest_records, context.config.apt_arch);
 
     for (const auto& entry : context.records_by_name) {
         std::string import_name = raw_debian_effective_import_name(entry.second, context.policy);
@@ -1891,6 +2099,165 @@ bool write_debian_search_preview_cache(
     return true;
 }
 
+std::string debian_cache_fingerprint_component(const std::string& path) {
+    struct stat st {};
+    if (lstat(path.c_str(), &st) != 0) return path + ":missing";
+
+    std::ostringstream out;
+    out << path << ":" << static_cast<long long>(st.st_size)
+        << ":" << static_cast<long long>(st.st_mtime);
+    return out.str();
+}
+
+std::string build_debian_imported_index_cache_fingerprint(
+    const std::string& packages_path
+) {
+    return "v1|" +
+        debian_cache_fingerprint_component(packages_path) + "|" +
+        debian_cache_fingerprint_component(IMPORT_POLICY_PATH) + "|" +
+        debian_cache_fingerprint_component(DEBIAN_CONFIG_PATH) + "|" +
+        debian_cache_fingerprint_component(SYSTEM_PROVIDES_PATH) + "|" +
+        debian_cache_fingerprint_component(UPGRADEABLE_SYSTEM_PATH);
+}
+
+bool load_debian_imported_index_cache_state(
+    const std::string& path,
+    DebianImportedIndexCacheState& state
+) {
+    std::ifstream f(path);
+    if (!f) return false;
+
+    state = {};
+    std::string line;
+    while (std::getline(f, line)) {
+        line = trim(line);
+        if (line.empty() || line[0] == '#') continue;
+
+        size_t eq = line.find('=');
+        if (eq == std::string::npos) continue;
+
+        std::string key = trim(line.substr(0, eq));
+        std::string value = line.substr(eq + 1);
+        if (key == "FINGERPRINT") state.fingerprint = value;
+        else if (key == "PACKAGE_COUNT") state.package_count = static_cast<size_t>(std::strtoull(value.c_str(), nullptr, 10));
+    }
+
+    return !state.fingerprint.empty();
+}
+
+bool save_debian_imported_index_cache_state(
+    const std::string& path,
+    const DebianImportedIndexCacheState& state
+) {
+    if (!mkdir_parent(path)) return false;
+
+    std::string temp_path = path + ".tmp";
+    std::ofstream out(temp_path, std::ios::trunc);
+    if (!out) return false;
+
+    out << "FINGERPRINT=" << state.fingerprint << "\n";
+    out << "PACKAGE_COUNT=" << state.package_count << "\n";
+    out.close();
+
+    if (!out) {
+        remove(temp_path.c_str());
+        return false;
+    }
+
+    if (rename(temp_path.c_str(), path.c_str()) != 0) {
+        remove(temp_path.c_str());
+        return false;
+    }
+
+    return true;
+}
+
+bool write_debian_imported_index_cache(
+    const std::vector<PackageMetadata>& entries,
+    const std::string& fingerprint,
+    std::string* error_out = nullptr
+) {
+    if (error_out) *error_out = "";
+
+    std::string cache_path = get_debian_imported_index_cache_path();
+    if (!mkdir_parent(cache_path)) {
+        if (error_out) *error_out = "failed to create imported index cache directory";
+        return false;
+    }
+
+    std::string temp_path = cache_path + ".tmp";
+    std::ofstream out(temp_path);
+    if (!out) {
+        if (error_out) *error_out = "failed to open imported index cache for writing";
+        return false;
+    }
+
+    out << "[\n";
+    for (size_t i = 0; i < entries.size(); ++i) {
+        if (i > 0) out << ",\n";
+        out << package_metadata_to_json(entries[i]);
+    }
+    out << "\n]\n";
+    out.close();
+    if (!out) {
+        remove(temp_path.c_str());
+        if (error_out) *error_out = "failed to flush imported index cache";
+        return false;
+    }
+
+    if (rename(temp_path.c_str(), cache_path.c_str()) != 0) {
+        remove(temp_path.c_str());
+        if (error_out) *error_out = strerror(errno);
+        return false;
+    }
+
+    DebianImportedIndexCacheState state;
+    state.fingerprint = fingerprint;
+    state.package_count = entries.size();
+    if (!save_debian_imported_index_cache_state(get_debian_imported_index_state_path(), state)) {
+        if (error_out) *error_out = "failed to persist imported index cache state";
+        return false;
+    }
+
+    return true;
+}
+
+bool append_cached_debian_imported_index(
+    std::ofstream& merged,
+    bool& first_object,
+    int& total_packages,
+    const std::string& fingerprint,
+    bool verbose
+) {
+    std::string cache_path = get_debian_imported_index_cache_path();
+    std::string state_path = get_debian_imported_index_state_path();
+    std::string preview_path = get_debian_search_preview_path();
+    if (access(cache_path.c_str(), F_OK) != 0 ||
+        access(state_path.c_str(), F_OK) != 0 ||
+        access(preview_path.c_str(), F_OK) != 0) {
+        return false;
+    }
+
+    DebianImportedIndexCacheState state;
+    if (!load_debian_imported_index_cache_state(state_path, state)) return false;
+    if (state.fingerprint != fingerprint) return false;
+
+    int appended_count = 0;
+    foreach_json_object(cache_path, [&](const std::string& obj) {
+        if (!first_object) merged << ",\n";
+        merged << obj;
+        first_object = false;
+        ++appended_count;
+        ++total_packages;
+        return true;
+    });
+
+    if (appended_count <= 0) return false;
+
+    VLOG(verbose, "Reused cached imported Debian index (" << appended_count << " packages).");
+    return true;
+}
+
 bool ensure_debian_search_preview_cache_loaded(
     bool verbose,
     std::string* error_out
@@ -2054,16 +2421,45 @@ bool update_debian_backend_index(
         }
     }
 
+    std::string import_cache_fingerprint =
+        build_debian_imported_index_cache_fingerprint(packages_txt);
+    if (!needs_download) {
+        int cached_total_before = total_packages;
+        if (append_cached_debian_imported_index(
+                merged,
+                first_object,
+                total_packages,
+                import_cache_fingerprint,
+                verbose
+            )) {
+            std::cout << Color::GREEN << "✓ Reused cached packages index"
+                      << " (" << (total_packages - cached_total_before) << " packages)"
+                      << Color::RESET << std::endl;
+            return true;
+        }
+    }
+
+    ImportPolicy policy = get_import_policy(verbose);
+    std::vector<DebianPackageRecord> records = parse_debian_packages_file(packages_txt, config, verbose);
     std::vector<std::string> skipped_policy;
-    std::vector<PackageMetadata> entries = load_debian_index_entries(packages_txt, verbose, &skipped_policy);
+    std::vector<PackageMetadata> entries =
+        load_debian_index_entries_from_records(records, config, policy, verbose, &skipped_policy);
     std::vector<DebianSearchPreviewEntry> preview_entries =
-        build_debian_search_preview_entries(packages_txt, entries, skipped_policy, verbose);
+        build_debian_search_preview_entries_from_records(records, config, policy, entries, skipped_policy);
     std::string preview_error;
     if (!write_debian_search_preview_cache(preview_entries, &preview_error)) {
         std::cerr << Color::YELLOW
                   << "W: Failed to write Debian search preview cache";
         if (!preview_error.empty()) std::cerr << " (" << preview_error << ")";
         std::cerr << ". Search and install diagnostics may be slower."
+                  << Color::RESET << std::endl;
+    }
+    std::string import_cache_error;
+    if (!write_debian_imported_index_cache(entries, import_cache_fingerprint, &import_cache_error)) {
+        std::cerr << Color::YELLOW
+                  << "W: Failed to write imported Debian index cache";
+        if (!import_cache_error.empty()) std::cerr << " (" << import_cache_error << ")";
+        std::cerr << ". Future 'gpkg update' runs may be slower."
                   << Color::RESET << std::endl;
     }
 
