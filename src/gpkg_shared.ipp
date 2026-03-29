@@ -285,9 +285,23 @@ bool is_known_cli_option(const std::string& arg) {
            is_optional_dependency_option(arg);
 }
 
+int find_cli_action_index(int argc, char* argv[]) {
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (is_known_cli_option(arg)) continue;
+        if (arg.empty() || arg[0] == '-') continue;
+        return i;
+    }
+    return -1;
+}
+
 std::vector<std::string> collect_cli_operands(int argc, char* argv[], int start_index = 2) {
     std::vector<std::string> operands;
-    for (int i = start_index; i < argc; ++i) {
+    int action_index = find_cli_action_index(argc, argv);
+    int effective_start = start_index;
+    if (action_index >= 0) effective_start = std::max(start_index, action_index + 1);
+
+    for (int i = effective_start; i < argc; ++i) {
         std::string arg = argv[i];
         if (is_known_cli_option(arg)) continue;
         operands.push_back(arg);
