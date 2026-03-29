@@ -40,6 +40,53 @@ struct DebianPackagesCacheState {
     long content_length = -1;
 };
 
+struct RawDebianAvailabilityResult {
+    bool found = false;
+    bool installable = false;
+    std::string requested_name;
+    std::string resolved_name;
+    std::string reason;
+    PackageMetadata meta;
+};
+
+struct RawDebianContext {
+    bool loaded = false;
+    bool available = false;
+    std::string problem;
+    DebianBackendConfig config;
+    ImportPolicy policy;
+    std::string packages_path;
+    std::string state_path;
+    std::map<std::string, DebianPackageRecord> records_by_name;
+    std::map<std::string, std::vector<std::string>> import_name_to_raw_names;
+    std::map<std::string, std::vector<std::string>> provider_map;
+    std::set<std::string> available_packages;
+    std::vector<std::string> system_drop_patterns;
+    std::map<std::string, RawDebianAvailabilityResult> raw_exact_cache;
+};
+
+bool ensure_raw_debian_context_loaded(
+    RawDebianContext& context,
+    bool verbose,
+    std::string* error_out = nullptr
+);
+bool query_raw_debian_exact_package(
+    const std::string& requested_name,
+    RawDebianContext& context,
+    RawDebianAvailabilityResult& out_result,
+    bool verbose,
+    std::string* reason_out = nullptr
+);
+bool resolve_raw_debian_relation_candidate(
+    const std::string& requested_name,
+    const std::string& op,
+    const std::string& version,
+    RawDebianContext& context,
+    RawDebianAvailabilityResult& out_result,
+    bool verbose,
+    std::string* reason_out = nullptr
+);
+
 std::string sanitize_section_name(const std::string& raw_section) {
     std::string top_level = raw_section;
     size_t slash = top_level.find('/');
@@ -649,17 +696,24 @@ bool debian_meta_satisfies_required_dependency(
 ) {
     if (dep.name.empty()) return false;
 
-    auto candidate_matches = [&](const std::string& provided_name) {
-        if (provided_name != dep.name) return false;
-        return debian_dependency_version_satisfies(meta.version, dep.op, dep.version);
-    };
-
-    if (candidate_matches(meta.name)) return true;
+    if (meta.name == dep.name &&
+        debian_dependency_version_satisfies(meta.version, dep.op, dep.version)) {
+        return true;
+    }
 
     for (const auto& provide : meta.provides) {
         RelationAtom provided = normalize_relation_atom(provide, "any");
         if (!provided.valid) continue;
-        if (candidate_matches(provided.name)) return true;
+        if (provided.name != dep.name) continue;
+        if (dep.op.empty()) return true;
+        if (!provided.version.empty() &&
+            debian_dependency_version_satisfies(provided.version, dep.op, dep.version)) {
+            return true;
+        }
+        if (provided.version.empty() &&
+            debian_dependency_version_satisfies(meta.version, dep.op, dep.version)) {
+            return true;
+        }
     }
 
     return false;
@@ -1021,6 +1075,480 @@ std::string get_debian_packages_gz_cache_path() {
 
 std::string get_debian_packages_cache_path() {
     return REPO_CACHE_PATH + "debian/Packages";
+}
+
+std::string raw_debian_effective_import_name(
+    const DebianPackageRecord& record,
+    const ImportPolicy& policy
+) {
+    auto override_it = policy.package_overrides.find(record.package);
+    if (override_it != policy.package_overrides.end() &&
+        !override_it->second.rename.empty()) {
+        return override_it->second.rename;
+    }
+    return record.package;
+}
+
+void populate_raw_debian_preview_metadata(
+    const RawDebianContext& context,
+    const DebianPackageRecord& record,
+    PackageMetadata& meta
+) {
+    meta = {};
+    meta.name = raw_debian_effective_import_name(record, context.policy);
+    meta.version = record.version;
+    meta.arch = record.architecture == "all" ? std::string(OS_ARCH) : std::string(OS_ARCH);
+    meta.maintainer = record.maintainer.empty() ? "Debian Maintainers" : record.maintainer;
+    meta.description = record.description.empty() ? record.package : record.description;
+    meta.filename = record.filename;
+    meta.sha256 = record.sha256;
+    meta.source_url = context.config.base_url;
+    meta.source_kind = "debian";
+    meta.debian_package = record.package;
+    meta.debian_version = record.version;
+    meta.section = sanitize_section_name(record.section);
+    meta.priority = record.priority;
+    meta.size = record.size;
+    meta.installed_size_bytes = debian_installed_size_kib_to_bytes_string(record.installed_size);
+    meta.installed_from = context.config.packages_url;
+}
+
+bool raw_debian_record_is_blocked_by_policy(
+    const RawDebianContext& context,
+    const DebianPackageRecord& record,
+    std::string* reason_out = nullptr
+) {
+    if (reason_out) reason_out->clear();
+
+    if (record.essential &&
+        !matches_any_pattern(record.package, context.policy.allow_essential_packages)) {
+        if (reason_out) *reason_out = "blocked by GeminiOS policy because the package is marked Essential: yes";
+        return true;
+    }
+
+    if (matches_any_pattern(record.package, context.policy.skip_packages)) {
+        if (reason_out) *reason_out = "blocked by GeminiOS import policy";
+        return true;
+    }
+
+    return false;
+}
+
+std::vector<std::string> collect_raw_debian_exact_candidate_names(
+    const std::string& requested_name,
+    const RawDebianContext& context
+) {
+    std::vector<std::string> candidates;
+    std::set<std::string> seen;
+
+    auto append = [&](const std::string& raw_name) {
+        if (raw_name.empty()) return;
+        if (!seen.insert(raw_name).second) return;
+        candidates.push_back(raw_name);
+    };
+
+    auto exact_it = context.records_by_name.find(requested_name);
+    if (exact_it != context.records_by_name.end()) append(exact_it->first);
+
+    auto import_it = context.import_name_to_raw_names.find(requested_name);
+    if (import_it != context.import_name_to_raw_names.end()) {
+        for (const auto& raw_name : import_it->second) append(raw_name);
+    }
+
+    return candidates;
+}
+
+bool raw_debian_result_satisfies_relation(
+    const RawDebianAvailabilityResult& result,
+    const RelationAtom& relation
+) {
+    if (!result.installable) return false;
+    return debian_meta_satisfies_required_dependency(result.meta, relation);
+}
+
+bool should_prefer_raw_debian_availability(
+    const RawDebianAvailabilityResult& candidate,
+    const RawDebianAvailabilityResult& current
+) {
+    if (current.meta.name.empty()) return true;
+
+    bool candidate_exact_requested = candidate.meta.name == candidate.requested_name;
+    bool current_exact_requested = current.meta.name == current.requested_name;
+    if (candidate_exact_requested != current_exact_requested) {
+        return candidate_exact_requested;
+    }
+
+    return compare_versions(candidate.meta.version, current.meta.version) > 0;
+}
+
+RawDebianAvailabilityResult evaluate_raw_debian_exact_package_recursive(
+    RawDebianContext& context,
+    const std::string& raw_name,
+    std::set<std::string>& walk,
+    bool verbose
+);
+
+bool resolve_raw_debian_relation_candidate_recursive(
+    const RelationAtom& relation,
+    RawDebianContext& context,
+    RawDebianAvailabilityResult& out_result,
+    std::set<std::string>& walk,
+    bool verbose,
+    std::string* reason_out
+);
+
+RawDebianAvailabilityResult evaluate_raw_debian_exact_package_recursive(
+    RawDebianContext& context,
+    const std::string& raw_name,
+    std::set<std::string>& walk,
+    bool verbose
+) {
+    auto cached_it = context.raw_exact_cache.find(raw_name);
+    if (cached_it != context.raw_exact_cache.end()) return cached_it->second;
+
+    RawDebianAvailabilityResult result;
+    result.requested_name = raw_name;
+
+    if (!context.available) {
+        result.reason = context.problem.empty()
+            ? "cached Debian metadata is unavailable; run 'gpkg update'"
+            : context.problem;
+        return result;
+    }
+
+    auto record_it = context.records_by_name.find(raw_name);
+    if (record_it == context.records_by_name.end()) {
+        result.reason = "package is absent from cached Debian metadata";
+        return result;
+    }
+
+    const DebianPackageRecord& record = record_it->second;
+    result.found = true;
+    populate_raw_debian_preview_metadata(context, record, result.meta);
+    result.resolved_name = result.meta.name;
+
+    std::string policy_reason;
+    if (raw_debian_record_is_blocked_by_policy(context, record, &policy_reason)) {
+        result.reason = policy_reason;
+        context.raw_exact_cache[raw_name] = result;
+        return result;
+    }
+
+    std::string build_reason;
+    PackageMetadata meta;
+    if (!build_debian_package_metadata(
+            record,
+            context.config,
+            context.policy,
+            context.available_packages,
+            context.provider_map,
+            context.system_drop_patterns,
+            meta,
+            &build_reason
+        )) {
+        result.reason = build_reason.empty()
+            ? "required dependency closure is unsatisfied"
+            : build_reason;
+        context.raw_exact_cache[raw_name] = result;
+        return result;
+    }
+
+    result.meta = meta;
+    result.resolved_name = meta.name;
+    if (!walk.insert(raw_name).second) {
+        result.installable = true;
+        return result;
+    }
+
+    for (const auto& dep_str : meta.depends) {
+        RelationAtom dep = normalize_relation_atom(dep_str, "any");
+        if (!dep.valid || dep.name.empty()) continue;
+        if (is_system_provided(dep.name, dep.op, dep.version)) continue;
+
+        RawDebianAvailabilityResult dep_result;
+        std::string dep_reason;
+        if (!resolve_raw_debian_relation_candidate_recursive(
+                dep,
+                context,
+                dep_result,
+                walk,
+                verbose,
+                &dep_reason
+            )) {
+            result.reason = dep_reason.empty()
+                ? ("required dependency closure is unsatisfied via " + dep_str)
+                : dep_reason;
+            walk.erase(raw_name);
+            context.raw_exact_cache[raw_name] = result;
+            return result;
+        }
+    }
+
+    walk.erase(raw_name);
+    result.installable = true;
+    result.reason.clear();
+    context.raw_exact_cache[raw_name] = result;
+    VLOG(verbose, "Raw Debian package " << raw_name
+                 << " is available for on-demand install as " << result.meta.name
+                 << " (" << result.meta.version << ")");
+    return result;
+}
+
+bool resolve_raw_debian_relation_candidate_recursive(
+    const RelationAtom& relation,
+    RawDebianContext& context,
+    RawDebianAvailabilityResult& out_result,
+    std::set<std::string>& walk,
+    bool verbose,
+    std::string* reason_out
+) {
+    out_result = {};
+    if (reason_out) reason_out->clear();
+
+    if (!context.available) {
+        if (reason_out) {
+            *reason_out = context.problem.empty()
+                ? "cached Debian metadata is unavailable; run 'gpkg update'"
+                : context.problem;
+        }
+        return false;
+    }
+
+    bool found_any_candidate = false;
+    RawDebianAvailabilityResult best_result;
+    std::string best_reason;
+
+    for (const auto& raw_name : collect_raw_debian_exact_candidate_names(relation.name, context)) {
+        RawDebianAvailabilityResult candidate =
+            evaluate_raw_debian_exact_package_recursive(context, raw_name, walk, verbose);
+        if (!candidate.found) continue;
+        found_any_candidate = true;
+        if (!raw_debian_result_satisfies_relation(candidate, relation)) {
+            if (best_reason.empty()) {
+                best_reason = candidate.reason.empty()
+                    ? ("cached Debian candidate does not satisfy " + relation.name)
+                    : candidate.reason;
+            }
+            continue;
+        }
+        if (!candidate.installable) {
+            if (best_reason.empty()) best_reason = candidate.reason;
+            continue;
+        }
+        if (!best_result.installable ||
+            should_prefer_raw_debian_availability(candidate, best_result)) {
+            best_result = candidate;
+        }
+    }
+
+    auto provider_it = context.provider_map.find(relation.name);
+    if (provider_it != context.provider_map.end()) {
+        for (const auto& provider_raw_name : provider_it->second) {
+            RawDebianAvailabilityResult candidate =
+                evaluate_raw_debian_exact_package_recursive(context, provider_raw_name, walk, verbose);
+            if (!candidate.found) continue;
+            found_any_candidate = true;
+            if (!raw_debian_result_satisfies_relation(candidate, relation)) {
+                if (best_reason.empty()) {
+                    best_reason = candidate.reason.empty()
+                        ? ("no cached Debian provider satisfies " + relation.name)
+                        : candidate.reason;
+                }
+                continue;
+            }
+            if (!candidate.installable) {
+                if (best_reason.empty()) best_reason = candidate.reason;
+                continue;
+            }
+            if (!best_result.installable ||
+                should_prefer_raw_debian_availability(candidate, best_result)) {
+                best_result = candidate;
+            }
+        }
+    }
+
+    if (best_result.installable) {
+        out_result = best_result;
+        return true;
+    }
+
+    if (reason_out) {
+        if (!best_reason.empty()) *reason_out = best_reason;
+        else if (found_any_candidate) *reason_out = "no cached Debian candidate satisfies the required relation";
+        else *reason_out = "package is absent from cached Debian metadata";
+    }
+    return false;
+}
+
+bool ensure_raw_debian_context_loaded(
+    RawDebianContext& context,
+    bool verbose,
+    std::string* error_out
+) {
+    if (error_out) error_out->clear();
+    if (context.loaded) {
+        if (error_out && !context.available) *error_out = context.problem;
+        return context.available;
+    }
+
+    context = {};
+    context.loaded = true;
+    context.config = load_debian_backend_config(verbose);
+    context.policy = get_import_policy(verbose);
+    context.packages_path = get_debian_packages_cache_path();
+    context.state_path = get_debian_packages_state_path();
+
+    DebianPackagesCacheState cached_state;
+    if (!load_debian_packages_cache_state(context.state_path, cached_state)) {
+        context.problem = "cached Debian metadata is stale or incomplete; run 'gpkg update'";
+        if (error_out) *error_out = context.problem;
+        return false;
+    }
+
+    if (cached_state.packages_url != context.config.packages_url) {
+        context.problem = "cached Debian metadata does not match the current Debian backend; run 'gpkg update'";
+        if (error_out) *error_out = context.problem;
+        return false;
+    }
+
+    if (access(context.packages_path.c_str(), F_OK) != 0) {
+        context.problem = "cached Debian metadata is missing; run 'gpkg update'";
+        if (error_out) *error_out = context.problem;
+        return false;
+    }
+
+    std::vector<DebianPackageRecord> records =
+        parse_debian_packages_file(context.packages_path, context.config, verbose);
+    if (records.empty()) {
+        context.problem = "cached Debian metadata could not be parsed; run 'gpkg update'";
+        if (error_out) *error_out = context.problem;
+        return false;
+    }
+
+    for (const auto& record : records) {
+        context.available_packages.insert(record.package);
+    }
+    context.system_drop_patterns = build_system_drop_patterns(context.policy, context.available_packages);
+    context.provider_map = build_debian_provider_map(records, context.config.apt_arch);
+
+    for (const auto& record : records) {
+        auto existing = context.records_by_name.find(record.package);
+        if (existing == context.records_by_name.end() ||
+            compare_versions(record.version, existing->second.version) > 0) {
+            context.records_by_name[record.package] = record;
+        }
+    }
+
+    for (const auto& entry : context.records_by_name) {
+        std::string import_name = raw_debian_effective_import_name(entry.second, context.policy);
+        auto& raw_names = context.import_name_to_raw_names[import_name];
+        if (std::find(raw_names.begin(), raw_names.end(), entry.first) == raw_names.end()) {
+            raw_names.push_back(entry.first);
+        }
+    }
+
+    context.available = true;
+    if (error_out) error_out->clear();
+    VLOG(verbose, "Loaded " << context.records_by_name.size()
+                 << " raw Debian package records into the on-demand cache.");
+    return true;
+}
+
+bool query_raw_debian_exact_package(
+    const std::string& requested_name,
+    RawDebianContext& context,
+    RawDebianAvailabilityResult& out_result,
+    bool verbose,
+    std::string* reason_out
+) {
+    out_result = {};
+    if (reason_out) reason_out->clear();
+
+    std::string load_error;
+    if (!ensure_raw_debian_context_loaded(context, verbose, &load_error)) {
+        if (reason_out) *reason_out = load_error;
+        return false;
+    }
+
+    std::string canonical_requested = canonicalize_package_name(requested_name, verbose);
+    RawDebianAvailabilityResult best_result;
+    std::string best_reason;
+    bool found_any = false;
+    std::set<std::string> walk;
+    for (const auto& raw_name : collect_raw_debian_exact_candidate_names(canonical_requested, context)) {
+        RawDebianAvailabilityResult candidate =
+            evaluate_raw_debian_exact_package_recursive(context, raw_name, walk, verbose);
+        if (!candidate.found) continue;
+        candidate.requested_name = canonical_requested;
+        found_any = true;
+        if (!candidate.installable) {
+            if (best_reason.empty()) best_reason = candidate.reason;
+            if (best_result.meta.name.empty()) best_result = candidate;
+            continue;
+        }
+        if (!best_result.installable ||
+            should_prefer_raw_debian_availability(candidate, best_result)) {
+            best_result = candidate;
+        }
+    }
+
+    if (!found_any) {
+        if (reason_out) *reason_out = "package is absent from cached Debian metadata";
+        return false;
+    }
+
+    if (best_result.meta.name.empty()) {
+        if (reason_out) *reason_out = best_reason;
+        return false;
+    }
+
+    out_result = best_result;
+    if (reason_out) *reason_out = best_result.reason;
+    return true;
+}
+
+bool resolve_raw_debian_relation_candidate(
+    const std::string& requested_name,
+    const std::string& op,
+    const std::string& version,
+    RawDebianContext& context,
+    RawDebianAvailabilityResult& out_result,
+    bool verbose,
+    std::string* reason_out
+) {
+    out_result = {};
+    if (reason_out) reason_out->clear();
+
+    std::string load_error;
+    if (!ensure_raw_debian_context_loaded(context, verbose, &load_error)) {
+        if (reason_out) *reason_out = load_error;
+        return false;
+    }
+
+    RelationAtom relation;
+    relation.name = canonicalize_package_name(requested_name, verbose);
+    relation.op = op;
+    relation.version = version;
+    relation.valid = !relation.name.empty();
+    relation.normalized = relation.op.empty()
+        ? relation.name
+        : (relation.name + " (" + relation.op + " " + relation.version + ")");
+    if (!relation.valid) {
+        if (reason_out) *reason_out = "invalid package relation";
+        return false;
+    }
+
+    std::set<std::string> walk;
+    bool ok = resolve_raw_debian_relation_candidate_recursive(
+        relation,
+        context,
+        out_result,
+        walk,
+        verbose,
+        reason_out
+    );
+    if (ok) out_result.requested_name = relation.name;
+    return ok;
 }
 
 bool update_debian_backend_index(

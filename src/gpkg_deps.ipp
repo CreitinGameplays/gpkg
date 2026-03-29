@@ -175,19 +175,25 @@ bool package_is_base_system_provided(const std::string& pkg_name, std::string* r
     return true;
 }
 
-bool repo_has_satisfying_dependency(const Dependency& dep, bool verbose) {
-    PackageMetadata repo_meta;
-    if (get_repo_package_info(dep.name, repo_meta) &&
-        version_satisfies(repo_meta.version, dep.op, dep.version)) {
-        VLOG(verbose, dep.name << " is available from the repository as "
-             << repo_meta.version << " and can replace the base runtime.");
-        return true;
-    }
-
-    std::string provider = find_provider(dep.name, dep.op, dep.version, verbose);
-    if (!provider.empty()) {
-        VLOG(verbose, dep.name << " can be satisfied by repository provider " << provider
-             << " instead of the base runtime.");
+bool repo_has_satisfying_dependency(
+    const Dependency& dep,
+    bool verbose,
+    RawDebianContext* raw_context = nullptr
+) {
+    PackageUniverseResult result;
+    if (resolve_full_universe_relation_candidate(
+            dep.name,
+            dep.op,
+            dep.version,
+            result,
+            verbose,
+            raw_context
+        )) {
+        VLOG(verbose, dep.name << " is available from the "
+             << (result.raw_only ? "cached Debian" : "repository")
+             << " universe as " << result.meta.name
+             << " " << result.meta.version
+             << " and can replace the base runtime.");
         return true;
     }
 
@@ -340,7 +346,8 @@ bool is_dependency_satisfied_locally(
     const std::set<std::string>& installed_cache,
     bool verbose,
     std::string* provider_out = nullptr,
-    UpgradeContext* context = nullptr
+    UpgradeContext* context = nullptr,
+    RawDebianContext* raw_context = nullptr
 ) {
     if (provider_out) provider_out->clear();
 
@@ -358,7 +365,8 @@ bool is_dependency_satisfied_locally(
     }
 
     if (is_system_provided(dep.name, dep.op, dep.version)) {
-        if (is_upgradeable_system_package(dep.name) && repo_has_satisfying_dependency(dep, verbose)) {
+        if (is_upgradeable_system_package(dep.name) &&
+            repo_has_satisfying_dependency(dep, verbose, raw_context)) {
             VLOG(verbose, dep.name << " is base-provided but marked upgradeable; preferring repository candidate.");
             return false;
         }
@@ -412,8 +420,11 @@ bool resolve_dependencies(
     bool verbose,
     bool force_queue_requested = false,
     UpgradeContext* context = nullptr,
-    bool suppress_errors = false
+    bool suppress_errors = false,
+    RawDebianContext* raw_context = nullptr,
+    std::string* failure_reason_out = nullptr
 ) {
+    if (failure_reason_out) failure_reason_out->clear();
     std::string canonical_pkg = canonicalize_package_name(pkg, verbose);
     Dependency requested_dep{canonical_pkg, op, req_version};
 
@@ -443,7 +454,8 @@ bool resolve_dependencies(
             installed_cache,
             verbose,
             &provider_name,
-            context
+            context,
+            raw_context
         )) {
         if (provider_name == BASE_SYSTEM_PROVIDER) {
             VLOG(verbose, canonical_pkg << " is satisfied by the base-system policy.");
@@ -473,6 +485,9 @@ bool resolve_dependencies(
     }
 
     if (is_blocked_import_package(canonical_pkg, verbose)) {
+        if (failure_reason_out) {
+            *failure_reason_out = "package is blocked by GeminiOS import policy";
+        }
         if (!suppress_errors) {
             std::cerr << Color::RED << "E: Package " << canonical_pkg
                       << " is blocked by GeminiOS import policy." << Color::RESET << std::endl;
@@ -481,33 +496,59 @@ bool resolve_dependencies(
     }
 
     PackageMetadata meta;
-    bool found_exact = get_repo_package_info(canonical_pkg, meta);
-    if (!found_exact) {
-        VLOG(verbose, "Exact match for " << canonical_pkg << " not found. Searching for providers...");
-        std::string provider = find_provider(canonical_pkg, op, req_version, verbose);
-        if (!provider.empty()) {
-            VLOG(verbose, "Redirecting " << canonical_pkg << " -> " << provider);
-            return resolve_dependencies(
-                provider,
-                "",
-                "",
-                install_queue,
-                visited,
-                installed_cache,
-                verbose,
-                force_queue_requested,
-                context,
-                suppress_errors
-            );
+    PackageUniverseResult universe_result;
+    if (!resolve_full_universe_relation_candidate(
+            canonical_pkg,
+            op,
+            req_version,
+            universe_result,
+            verbose,
+            raw_context
+        )) {
+        if (failure_reason_out && failure_reason_out->empty()) {
+            *failure_reason_out = universe_result.reason.empty()
+                ? "package was not found in the local package universe"
+                : universe_result.reason;
         }
 
         if (!suppress_errors) {
-            std::cerr << Color::RED << "E: Unable to locate package " << canonical_pkg << Color::RESET << std::endl;
+            std::string message = "Unable to locate package " + canonical_pkg;
+            if (failure_reason_out && !failure_reason_out->empty()) {
+                message += " (" + *failure_reason_out + ")";
+            }
+            std::cerr << Color::RED << "E: " << message << Color::RESET << std::endl;
         }
         return false;
     }
 
+    meta = universe_result.meta;
+    if (meta.name != canonical_pkg &&
+        package_metadata_satisfies_dependency(meta.name, meta, requested_dep)) {
+        VLOG(verbose, "Redirecting " << canonical_pkg << " -> " << meta.name
+                     << " from the "
+                     << (universe_result.raw_only ? "full cached Debian" : "repository")
+                     << " universe");
+        return resolve_dependencies(
+            meta.name,
+            "",
+            "",
+            install_queue,
+            visited,
+            installed_cache,
+            verbose,
+            force_queue_requested,
+            context,
+            suppress_errors,
+            raw_context,
+            failure_reason_out
+        );
+    }
+
     if (!queued_candidate_satisfies_dependency(meta, requested_dep)) {
+        if (failure_reason_out) {
+            *failure_reason_out = "candidate version " + meta.version +
+                " does not satisfy " + op + " " + req_version;
+        }
         if (!suppress_errors) {
             std::cerr << Color::RED << "E: Package " << canonical_pkg << " found (v" << meta.version
                       << ") but does not meet requirements (" << op << " " << req_version
@@ -553,7 +594,9 @@ bool resolve_dependencies(
                     verbose,
                     false,
                     context,
-                    suppress_errors
+                    suppress_errors,
+                    raw_context,
+                    failure_reason_out
                 )) {
                 return false;
             }
@@ -572,7 +615,8 @@ bool resolve_dependencies(
                 verbose,
                 false,
                 context,
-                true
+                true,
+                raw_context
             )) {
             VLOG(
                 verbose,

@@ -1944,6 +1944,7 @@ struct PreparedUpgradeState {
     std::vector<PackageMetadata> upgrade_queue;
     std::vector<UpgradePlanEntry> explicit_targets;
     TransactionPlan plan;
+    std::vector<std::string> skipped_managed_packages;
 };
 
 void prune_shadowed_upgrade_targets(
@@ -2102,28 +2103,43 @@ bool should_auto_import_base_runtime_companion(
     return true;
 }
 
+bool package_metadata_is_managed_debian_package(const PackageMetadata& meta) {
+    return meta.source_kind == "debian" || !meta.debian_package.empty();
+}
+
+bool get_live_package_metadata_for_upgrade_resolution(
+    const std::string& pkg_name,
+    PackageMetadata& out_meta,
+    UpgradeContext* context = nullptr
+) {
+    if (context && get_context_live_installed_package_metadata(*context, pkg_name, out_meta)) {
+        return true;
+    }
+    return get_installed_package_metadata(pkg_name, out_meta);
+}
+
 bool resolve_upgrade_target_metadata(
     const Dependency& requested_dep,
     PackageMetadata& out_meta,
-    bool verbose
+    bool verbose,
+    RawDebianContext* raw_context = nullptr,
+    const PackageMetadata* installed_meta = nullptr,
+    std::string* reason_out = nullptr
 ) {
-    std::string requested_name = canonicalize_package_name(requested_dep.name, verbose);
-    PackageMetadata exact_meta;
-    if (get_repo_package_info(requested_name, exact_meta) &&
-        version_satisfies(exact_meta.version, requested_dep.op, requested_dep.version)) {
-        out_meta = exact_meta;
-        return true;
-    }
-
-    std::string provider = find_provider(
-        requested_name,
+    PackageUniverseResult result;
+    bool ok = resolve_full_universe_relation_candidate(
+        requested_dep.name,
         requested_dep.op,
         requested_dep.version,
-        verbose
+        result,
+        verbose,
+        raw_context,
+        installed_meta
     );
-    if (provider.empty()) return false;
-
-    return get_repo_package_info(provider, out_meta);
+    if (reason_out) *reason_out = result.reason;
+    if (!ok) return false;
+    out_meta = result.meta;
+    return true;
 }
 
 bool redirect_upgrade_target_to_live_provider(
@@ -2131,7 +2147,8 @@ bool redirect_upgrade_target_to_live_provider(
     const std::set<std::string>& installed_cache,
     bool verbose,
     Dependency& redirected_dep,
-    UpgradeContext* context = nullptr
+    UpgradeContext* context = nullptr,
+    RawDebianContext* raw_context = nullptr
 ) {
     redirected_dep = requested_dep;
 
@@ -2155,7 +2172,20 @@ bool redirect_upgrade_target_to_live_provider(
     if (provider_name.empty() || provider_name == canonical_requested) return false;
 
     PackageMetadata provider_repo_meta;
-    if (!get_repo_package_info(provider_name, provider_repo_meta)) return false;
+    PackageMetadata provider_live_meta;
+    PackageMetadata* provider_live_meta_ptr = nullptr;
+    if (get_live_package_metadata_for_upgrade_resolution(provider_name, provider_live_meta, context)) {
+        provider_live_meta_ptr = &provider_live_meta;
+    }
+    if (!resolve_upgrade_target_metadata(
+            {provider_name, "", ""},
+            provider_repo_meta,
+            verbose,
+            raw_context,
+            provider_live_meta_ptr
+        )) {
+        return false;
+    }
     if (!package_metadata_satisfies_dependency(provider_name, provider_repo_meta, requested_dep)) return false;
 
     VLOG(verbose, "Redirecting upgrade target " << canonical_requested
@@ -2176,19 +2206,35 @@ bool queue_upgrade_target(
     const std::set<std::string>& installed_cache,
     bool verbose,
     bool force_reinstall = false,
-    UpgradeContext* context = nullptr
+    UpgradeContext* context = nullptr,
+    RawDebianContext* raw_context = nullptr,
+    std::string* failure_reason_out = nullptr
 ) {
+    if (failure_reason_out) failure_reason_out->clear();
     Dependency effective_dep = requested_dep;
     redirect_upgrade_target_to_live_provider(
         requested_dep,
         installed_cache,
         verbose,
         effective_dep,
-        context
+        context,
+        raw_context
     );
 
     PackageMetadata meta;
-    if (!resolve_upgrade_target_metadata(effective_dep, meta, verbose)) {
+    PackageMetadata live_meta;
+    PackageMetadata* live_meta_ptr = nullptr;
+    if (get_live_package_metadata_for_upgrade_resolution(effective_dep.name, live_meta, context)) {
+        live_meta_ptr = &live_meta;
+    }
+    if (!resolve_upgrade_target_metadata(
+            effective_dep,
+            meta,
+            verbose,
+            raw_context,
+            live_meta_ptr,
+            failure_reason_out
+        )) {
         VLOG(verbose, "No repository candidate available for upgrade target " << requested_dep.name);
         return true;
     }
@@ -2235,7 +2281,9 @@ bool queue_upgrade_target(
                 installed_cache,
                 verbose,
                 force_reinstall,
-                context
+                context,
+                raw_context,
+                failure_reason_out
             )) {
             target_walk.erase(meta.name);
             return false;
@@ -2256,7 +2304,10 @@ bool queue_upgrade_target(
                     installed_cache,
                     verbose,
                     false,
-                    context
+                    context,
+                    false,
+                    raw_context,
+                    failure_reason_out
                 )) {
                 target_walk.erase(meta.name);
                 return false;
@@ -2276,7 +2327,8 @@ bool queue_upgrade_target(
                 verbose,
                 false,
                 context,
-                true
+                true,
+                raw_context
             )) {
             VLOG(
                 verbose,
@@ -2368,6 +2420,24 @@ bool expand_runtime_upgrade_companions(
     return true;
 }
 
+bool package_should_use_raw_debian_upgrade_fallback(
+    const std::string& pkg_name,
+    UpgradeContext& context
+) {
+    if (context.registered_package_set.count(pkg_name) == 0) return false;
+    if (std::find(
+            context.upgrade_catalog.resolved_roots.begin(),
+            context.upgrade_catalog.resolved_roots.end(),
+            pkg_name
+        ) != context.upgrade_catalog.resolved_roots.end()) {
+        return false;
+    }
+
+    PackageMetadata meta;
+    if (!get_live_package_metadata_for_upgrade_resolution(pkg_name, meta, &context)) return false;
+    return package_metadata_is_managed_debian_package(meta);
+}
+
 bool prepare_upgrade_transaction(
     UpgradeContext& context,
     bool verbose,
@@ -2385,13 +2455,39 @@ bool prepare_upgrade_transaction(
     std::set<std::string> target_walk;
     std::set<std::string> dependency_visited;
     auto companion_map = get_planner_upgrade_companion_map(&context, verbose);
+    RawDebianContext raw_context;
 
     for (const auto& pkg : normalized_roots) {
         std::string current_ver;
         bool was_installed = get_local_installed_package_version(pkg, &current_ver, &context);
+        bool allow_raw_fallback = package_should_use_raw_debian_upgrade_fallback(pkg, context);
 
         PackageMetadata repo_meta;
-        if (!get_repo_package_info(pkg, repo_meta)) continue;
+        std::string resolve_reason;
+        PackageMetadata installed_meta;
+        PackageMetadata* installed_meta_ptr = nullptr;
+        if (allow_raw_fallback &&
+            get_live_package_metadata_for_upgrade_resolution(pkg, installed_meta, &context)) {
+            installed_meta_ptr = &installed_meta;
+        }
+        if (!resolve_upgrade_target_metadata(
+                {pkg, "", ""},
+                repo_meta,
+                verbose,
+                allow_raw_fallback ? &raw_context : nullptr,
+                installed_meta_ptr,
+                &resolve_reason
+            )) {
+            if (allow_raw_fallback) {
+                out_state.skipped_managed_packages.push_back(
+                    pkg + " was skipped: " +
+                    (resolve_reason.empty()
+                        ? "no cached Debian upgrade candidate is currently available"
+                        : resolve_reason)
+                );
+            }
+            continue;
+        }
         if (was_installed &&
             !g_force_reinstall &&
             compare_versions(repo_meta.version, current_ver) <= 0) {
@@ -2407,6 +2503,47 @@ bool prepare_upgrade_transaction(
                          << " at repository version " << repo_meta.version);
         }
         Dependency dep{pkg, "", ""};
+        if (allow_raw_fallback) {
+            auto queue_copy = out_state.upgrade_queue;
+            auto explicit_copy = out_state.explicit_targets;
+            auto queued_copy = queued_packages;
+            auto explicit_target_copy = explicit_target_names;
+            auto target_walk_copy = target_walk;
+            auto dependency_copy = dependency_visited;
+            std::string queue_failure_reason;
+            if (!queue_upgrade_target(
+                    dep,
+                    companion_map,
+                    queue_copy,
+                    explicit_copy,
+                    queued_copy,
+                    explicit_target_copy,
+                    target_walk_copy,
+                    dependency_copy,
+                    context.exact_live_packages,
+                    verbose,
+                    g_force_reinstall,
+                    &context,
+                    &raw_context,
+                    &queue_failure_reason
+                )) {
+                out_state.skipped_managed_packages.push_back(
+                    pkg + " was skipped: " +
+                    (queue_failure_reason.empty()
+                        ? "dependency resolution failed under current GeminiOS policy"
+                        : queue_failure_reason)
+                );
+                continue;
+            }
+            out_state.upgrade_queue.swap(queue_copy);
+            out_state.explicit_targets.swap(explicit_copy);
+            queued_packages.swap(queued_copy);
+            explicit_target_names.swap(explicit_target_copy);
+            target_walk.swap(target_walk_copy);
+            dependency_visited.swap(dependency_copy);
+            continue;
+        }
+
         if (!queue_upgrade_target(
                 dep,
                 companion_map,
@@ -2457,6 +2594,7 @@ RepairInspection inspect_repair_state(
     bool verbose
 ) {
     RepairInspection inspection;
+    RawDebianContext raw_context;
     std::set<std::string> installed_cache(registered_packages.begin(), registered_packages.end());
     std::set<std::string> reinstall_targets;
     std::set<std::string> visited;
@@ -2505,7 +2643,11 @@ RepairInspection inspect_repair_state(
                         inspection.install_queue,
                         visited,
                         installed_cache,
-                        verbose
+                        verbose,
+                        false,
+                        nullptr,
+                        false,
+                        &raw_context
                     )) {
                     append_unique_message(
                         inspection.unresolved_issues,
@@ -2540,8 +2682,20 @@ RepairInspection inspect_repair_state(
     for (const auto& pkg : reinstall_targets) {
         if (queued_names.count(pkg)) continue;
 
+        PackageMetadata installed_meta;
+        PackageMetadata* installed_meta_ptr = nullptr;
+        if (get_installed_package_metadata(pkg, installed_meta)) installed_meta_ptr = &installed_meta;
+
         PackageMetadata repo_meta;
-        if (!get_repo_package_info(pkg, repo_meta)) {
+        std::string resolve_reason;
+        if (!resolve_upgrade_target_metadata(
+                {pkg, "", ""},
+                repo_meta,
+                verbose,
+                &raw_context,
+                installed_meta_ptr,
+                &resolve_reason
+            )) {
             append_unique_message(inspection.unresolved_issues, describe_missing_repair_candidate(pkg));
             append_unique_name(inspection.missing_repo_packages, pkg);
             if (is_upgradeable_system_package(pkg)) {
@@ -2585,8 +2739,15 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
     TransactionPlan& upgrade_plan = prepared.plan;
 
     if (upgrade_queue.empty()) {
+        for (const auto& warning : prepared.skipped_managed_packages) {
+            std::cout << Color::YELLOW << "W: " << warning << Color::RESET << std::endl;
+        }
         std::cout << "All packages are up to date." << std::endl;
         return 0;
+    }
+
+    for (const auto& warning : prepared.skipped_managed_packages) {
+        std::cout << Color::YELLOW << "W: " << warning << Color::RESET << std::endl;
     }
 
     std::set<std::string> planned_names;
@@ -2883,6 +3044,10 @@ int handle_doctor(bool verbose) {
         have_valid_upgrade_plan = true;
     }
 
+    for (const auto& warning : prepared.skipped_managed_packages) {
+        upgrade_section.warnings.push_back(warning);
+    }
+
     if (context.upgrade_catalog_available) {
         if (context.upgrade_catalog.skipped_entries.empty()) {
             upgrade_section.ok.push_back("validated upgrade catalog has no skipped configured runtime families");
@@ -2996,6 +3161,7 @@ int handle_repair(bool verbose) {
 
     if (inspection.detected_issues.empty()) {
         std::cout << "No broken packages found." << std::endl;
+        g_pending_triggers.insert("ldconfig");
         return 0;
     }
 
@@ -3182,6 +3348,7 @@ int handle_repair(bool verbose) {
     std::cout << "Rechecking package state..." << std::endl;
     RepairInspection after_repair = inspect_repair_state(false);
     if (after_repair.detected_issues.empty()) {
+        g_pending_triggers.insert("ldconfig");
         std::cout << Color::GREEN << "✓ Repair completed successfully." << Color::RESET << std::endl;
         return 0;
     }
@@ -3205,6 +3372,7 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
     std::vector<std::string> operands = collect_cli_operands(argc, argv, 2);
     std::set<std::string> visited;
     bool needs_repo_index = false;
+    RawDebianContext raw_context;
 
     if (operands.empty()) {
         std::cerr << "Usage: gpkg install <package_name> [options]" << std::endl;
@@ -3229,7 +3397,19 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
             continue;
         }
 
-        if (!resolve_dependencies(arg, "", "", install_queue, visited, installed_cache, verbose, g_force_reinstall)) {
+        if (!resolve_dependencies(
+                arg,
+                "",
+                "",
+                install_queue,
+                visited,
+                installed_cache,
+                verbose,
+                g_force_reinstall,
+                nullptr,
+                false,
+                &raw_context
+            )) {
             std::cerr << Color::RED << "E: Failed to resolve dependencies for " << arg
                       << Color::RESET << std::endl;
             return 1;

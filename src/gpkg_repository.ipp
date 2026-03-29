@@ -5,12 +5,45 @@ std::map<std::string, std::vector<std::string>> g_repo_provider_cache;
 std::set<std::string> g_repo_available_package_cache;
 bool g_repo_package_cache_loaded = false;
 
+struct PackageUniverseResult {
+    bool found = false;
+    bool installable = false;
+    bool raw_only = false;
+    std::string reason;
+    PackageMetadata meta;
+};
+
 bool ensure_repo_package_cache_loaded(bool verbose);
 bool should_prefer_repo_candidate(const PackageMetadata& candidate, const PackageMetadata& current);
+bool query_full_universe_exact_package(
+    const std::string& pkg_name,
+    PackageUniverseResult& out_result,
+    bool verbose,
+    RawDebianContext* raw_context = nullptr
+);
+bool resolve_full_universe_relation_candidate(
+    const std::string& pkg_name,
+    const std::string& op,
+    const std::string& req_version,
+    PackageUniverseResult& out_result,
+    bool verbose,
+    RawDebianContext* raw_context = nullptr,
+    const PackageMetadata* installed_meta = nullptr
+);
 
 std::string relation_name_from_text(const std::string& relation) {
     size_t open_paren = relation.find('(');
     return trim(open_paren == std::string::npos ? relation : relation.substr(0, open_paren));
+}
+
+bool repo_index_file_present() {
+    return access((REPO_CACHE_PATH + "Packages.json").c_str(), F_OK) == 0;
+}
+
+bool try_ensure_repo_package_cache_loaded(bool verbose) {
+    if (g_repo_package_cache_loaded) return true;
+    if (!repo_index_file_present()) return false;
+    return ensure_repo_package_cache_loaded(verbose);
 }
 
 bool catalog_version_satisfies(
@@ -875,6 +908,162 @@ bool get_repo_package_info(const std::string& pkg_name, PackageMetadata& out_met
     return true;
 }
 
+bool query_full_universe_exact_package(
+    const std::string& pkg_name,
+    PackageUniverseResult& out_result,
+    bool verbose,
+    RawDebianContext* raw_context
+) {
+    out_result = {};
+    std::string canonical_name = canonicalize_package_name(pkg_name, verbose);
+    if (canonical_name.empty()) {
+        out_result.reason = "invalid package name";
+        return false;
+    }
+
+    if (try_ensure_repo_package_cache_loaded(verbose)) {
+        PackageMetadata repo_meta;
+        if (get_loaded_repo_package_info(canonical_name, repo_meta)) {
+            out_result.found = true;
+            out_result.installable = true;
+            out_result.raw_only = false;
+            out_result.meta = repo_meta;
+            return true;
+        }
+    }
+
+    if (!raw_context) {
+        out_result.reason = "package is absent from the curated local package universe";
+        return false;
+    }
+
+    RawDebianAvailabilityResult raw_result;
+    std::string raw_reason;
+    if (!query_raw_debian_exact_package(
+            canonical_name,
+            *raw_context,
+            raw_result,
+            verbose,
+            &raw_reason
+        )) {
+        out_result.reason = raw_reason.empty()
+            ? "package is absent from cached Debian metadata"
+            : raw_reason;
+        return false;
+    }
+
+    out_result.found = raw_result.found;
+    out_result.installable = raw_result.installable;
+    out_result.raw_only = true;
+    out_result.reason = raw_result.reason;
+    out_result.meta = raw_result.meta;
+    return true;
+}
+
+bool resolve_full_universe_relation_candidate(
+    const std::string& pkg_name,
+    const std::string& op,
+    const std::string& req_version,
+    PackageUniverseResult& out_result,
+    bool verbose,
+    RawDebianContext* raw_context,
+    const PackageMetadata* installed_meta
+) {
+    out_result = {};
+    std::string canonical_name = canonicalize_package_name(pkg_name, verbose);
+    if (canonical_name.empty()) {
+        out_result.reason = "invalid package relation";
+        return false;
+    }
+
+    if (try_ensure_repo_package_cache_loaded(verbose)) {
+        PackageMetadata repo_meta;
+        if (get_loaded_repo_package_info(canonical_name, repo_meta) &&
+            catalog_version_satisfies(repo_meta.version, op, req_version)) {
+            out_result.found = true;
+            out_result.installable = true;
+            out_result.meta = repo_meta;
+            return true;
+        }
+
+        RelationAtom relation;
+        relation.name = canonical_name;
+        relation.op = op;
+        relation.version = req_version;
+        relation.valid = !relation.name.empty();
+        relation.normalized = relation.op.empty()
+            ? relation.name
+            : (relation.name + " (" + relation.op + " " + relation.version + ")");
+        auto provider_it = g_repo_provider_cache.find(canonical_name);
+        if (provider_it != g_repo_provider_cache.end()) {
+            bool found = false;
+            PackageMetadata best_meta;
+            for (const auto& provider_name : provider_it->second) {
+                PackageMetadata candidate;
+                if (!get_loaded_repo_package_info(provider_name, candidate)) continue;
+                if (!catalog_meta_satisfies_relation(provider_name, candidate, relation)) continue;
+                if (!found || should_prefer_repo_candidate(candidate, best_meta)) {
+                    best_meta = candidate;
+                    found = true;
+                }
+            }
+            if (found) {
+                out_result.found = true;
+                out_result.installable = true;
+                out_result.meta = best_meta;
+                return true;
+            }
+        }
+    }
+
+    if (!raw_context) {
+        out_result.reason = "no repository package or provider candidate";
+        return false;
+    }
+
+    std::vector<std::string> raw_queries;
+    auto append_query = [&](const std::string& value) {
+        if (value.empty()) return;
+        std::string canonical = canonicalize_package_name(value, verbose);
+        if (canonical.empty()) return;
+        if (std::find(raw_queries.begin(), raw_queries.end(), canonical) == raw_queries.end()) {
+            raw_queries.push_back(canonical);
+        }
+    };
+    if (installed_meta && !installed_meta->debian_package.empty()) {
+        append_query(installed_meta->debian_package);
+    }
+    append_query(canonical_name);
+
+    std::string best_reason;
+    for (const auto& query_name : raw_queries) {
+        RawDebianAvailabilityResult raw_result;
+        std::string raw_reason;
+        if (resolve_raw_debian_relation_candidate(
+                query_name,
+                op,
+                req_version,
+                *raw_context,
+                raw_result,
+                verbose,
+                &raw_reason
+            )) {
+            out_result.found = true;
+            out_result.installable = true;
+            out_result.raw_only = true;
+            out_result.reason.clear();
+            out_result.meta = raw_result.meta;
+            return true;
+        }
+        if (best_reason.empty() && !raw_reason.empty()) best_reason = raw_reason;
+    }
+
+    out_result.reason = best_reason.empty()
+        ? "no cached Debian candidate satisfies the required relation"
+        : best_reason;
+    return false;
+}
+
 int handle_list_repos() {
     auto urls = get_repo_urls();
     DebianBackendConfig debian = load_debian_backend_config(false);
@@ -1017,21 +1206,70 @@ int handle_update(bool verbose) {
 }
 
 int handle_search(const std::string& query, bool verbose) {
-    if (!ensure_repo_package_cache_loaded(verbose)) return 1;
-
-    VLOG(verbose, "Searching for '" << query << "' in " << REPO_CACHE_PATH << "Packages.json");
+    bool have_repo_cache = try_ensure_repo_package_cache_loaded(verbose);
+    VLOG(verbose, "Searching for '" << query << "' in the local package universe");
     std::map<std::string, PackageMetadata> matches;
-    for (const auto& entry : g_repo_package_cache) {
-        const PackageMetadata& meta = entry.second;
-        if (meta.name.find(query) != std::string::npos || meta.description.find(query) != std::string::npos) {
-            auto it = matches.find(meta.name);
-            if (it == matches.end() || should_prefer_repo_candidate(meta, it->second)) {
-                matches[meta.name] = meta;
+    if (have_repo_cache) {
+        for (const auto& entry : g_repo_package_cache) {
+            const PackageMetadata& meta = entry.second;
+            if (meta.name.find(query) != std::string::npos || meta.description.find(query) != std::string::npos) {
+                auto it = matches.find(meta.name);
+                if (it == matches.end() || should_prefer_repo_candidate(meta, it->second)) {
+                    matches[meta.name] = meta;
+                }
             }
         }
     }
 
-    if (matches.empty()) {
+    RawDebianContext raw_context;
+    std::string raw_load_error;
+    bool raw_available = ensure_raw_debian_context_loaded(raw_context, verbose, &raw_load_error);
+    std::map<std::string, RawDebianAvailabilityResult> raw_matches;
+    auto should_prefer_raw_search_result = [&](const RawDebianAvailabilityResult& candidate,
+                                               const RawDebianAvailabilityResult& current) {
+        if (candidate.installable != current.installable) return candidate.installable;
+        return compare_versions(candidate.meta.version, current.meta.version) > 0;
+    };
+    if (raw_available) {
+        for (const auto& entry : raw_context.import_name_to_raw_names) {
+            bool matched = entry.first.find(query) != std::string::npos;
+            if (!matched) {
+                for (const auto& raw_name : entry.second) {
+                    if (raw_name.find(query) != std::string::npos) {
+                        matched = true;
+                        break;
+                    }
+                }
+            }
+
+            RawDebianAvailabilityResult result;
+            std::string raw_reason;
+            if (!query_raw_debian_exact_package(entry.first, raw_context, result, verbose, &raw_reason)) {
+                continue;
+            }
+            if (!matched &&
+                result.meta.description.find(query) == std::string::npos) {
+                continue;
+            }
+            if (g_repo_package_cache.count(result.meta.name) != 0) continue;
+
+            auto existing = raw_matches.find(result.meta.name);
+            if (existing == raw_matches.end() ||
+                should_prefer_raw_search_result(result, existing->second)) {
+                raw_matches[result.meta.name] = result;
+            }
+        }
+    }
+
+    if (matches.empty() && raw_matches.empty()) {
+        if (!raw_available) {
+            std::cerr << Color::RED << "E: "
+                      << (raw_load_error.empty()
+                              ? "cached Debian metadata is unavailable; run 'gpkg update'"
+                              : raw_load_error)
+                      << Color::RESET << std::endl;
+            return 1;
+        }
         std::cout << "No matches found for '" << query << "'" << std::endl;
         return 0;
     }
@@ -1062,20 +1300,51 @@ int handle_search(const std::string& query, bool verbose) {
                   << std::endl;
     }
 
+    for (const auto& entry : raw_matches) {
+        const auto& result = entry.second;
+        const auto& meta = result.meta;
+        std::string installed_ver;
+        std::string status_str;
+        if (is_installed(meta.name, &installed_ver)) {
+            if (compare_versions(installed_ver, meta.version) == 0) {
+                status_str = Color::BLUE + " [installed]" + Color::RESET;
+            } else {
+                status_str = Color::BLUE + " [installed: " + installed_ver + "]" + Color::RESET;
+            }
+        } else if (package_is_base_system_provided(meta.name)) {
+            status_str = Color::BLUE + " [base system]" + Color::RESET;
+        }
+
+        std::string availability_str = result.installable
+            ? (Color::CYAN + " [on-demand Debian install]" + Color::RESET)
+            : (Color::YELLOW + " [on-demand unavailable: " + result.reason + "]" + Color::RESET);
+        std::string repo_str = format_package_origin(meta).empty() ? ""
+            : (Color::CYAN + " [source: " + format_package_origin(meta) + "]" + Color::RESET);
+
+        std::cout << Color::GREEN << meta.name << Color::RESET
+                  << " (" << meta.version << ")"
+                  << status_str
+                  << availability_str
+                  << repo_str
+                  << " - "
+                  << description_summary(meta.description)
+                  << std::endl;
+    }
+
     return 0;
 }
 
 int handle_show(const std::string& pkg_name, bool verbose) {
-    if (!ensure_repo_index_available()) return 1;
-
     VLOG(verbose, "Showing package metadata for '" << pkg_name << "'");
-    PackageMetadata meta;
-    if (!get_repo_package_info(pkg_name, meta)) {
-        std::cerr << Color::RED << "E: Package '" << pkg_name
-                  << "' was not found in the local index. Run 'gpkg update' first."
-                  << Color::RESET << std::endl;
+    RawDebianContext raw_context;
+    PackageUniverseResult result;
+    if (!query_full_universe_exact_package(pkg_name, result, verbose, &raw_context)) {
+        std::cerr << Color::RED << "E: Package '" << pkg_name << "' was not found in the local package universe";
+        if (!result.reason.empty()) std::cerr << " (" << result.reason << ")";
+        std::cerr << "." << Color::RESET << std::endl;
         return 1;
     }
+    PackageMetadata meta = result.meta;
 
     std::cout << Color::GREEN << meta.name << Color::RESET << std::endl;
     std::cout << "  Version:     " << meta.version << std::endl;
@@ -1090,6 +1359,13 @@ int handle_show(const std::string& pkg_name, bool verbose) {
     if (!meta.conflicts.empty()) print_wrapped_block("  Conflicts:   ", join_strings(meta.conflicts));
     if (!meta.provides.empty()) print_wrapped_block("  Provides:    ", join_strings(meta.provides));
     if (!meta.replaces.empty()) print_wrapped_block("  Replaces:    ", join_strings(meta.replaces));
+    if (result.raw_only) {
+        std::cout << "  Availability: "
+                  << (result.installable
+                          ? "available via on-demand Debian install"
+                          : ("unavailable (" + result.reason + ")"))
+                  << std::endl;
+    }
 
     std::string installed_ver;
     if (is_installed(meta.name, &installed_ver)) {
