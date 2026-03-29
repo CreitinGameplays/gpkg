@@ -3372,6 +3372,7 @@ bool maybe_report_unavailable_install_target(
     std::string canonical_name = canonicalize_package_name(requested_name, verbose);
     if (canonical_name.empty()) return false;
 
+    RawDebianContext raw_context;
     PackageUniverseResult available_result;
     if (resolve_full_universe_relation_candidate(
             canonical_name,
@@ -3379,9 +3380,32 @@ bool maybe_report_unavailable_install_target(
             "",
             available_result,
             verbose,
-            nullptr
+            &raw_context
         )) {
         return false;
+    }
+
+    PackageUniverseResult exact_result;
+    if (query_full_universe_exact_package(canonical_name, exact_result, verbose, &raw_context)) {
+        if (exact_result.installable) return false;
+
+        std::cerr << Color::YELLOW
+                  << "Package " << requested_name << " is available, but it is not installable."
+                  << Color::RESET << std::endl;
+        if (exact_result.meta.name != canonical_name && !exact_result.meta.name.empty()) {
+            std::cerr << "  Candidate: " << exact_result.meta.name << std::endl;
+        }
+        std::string origin = format_package_origin(exact_result.meta);
+        if (!origin.empty()) {
+            std::cerr << "  Source: " << origin << std::endl;
+        }
+        if (!exact_result.reason.empty()) {
+            std::cerr << "  Reason: " << exact_result.reason << std::endl;
+        }
+        std::cerr << Color::RED
+                  << "E: Package '" << requested_name << "' has no installation candidate."
+                  << Color::RESET << std::endl;
+        return true;
     }
 
     DebianSearchPreviewEntry preview;

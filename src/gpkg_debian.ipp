@@ -88,6 +88,15 @@ bool query_raw_debian_exact_package(
     bool verbose,
     std::string* reason_out = nullptr
 );
+bool query_raw_debian_relation_availability(
+    const std::string& requested_name,
+    const std::string& op,
+    const std::string& version,
+    RawDebianContext& context,
+    RawDebianAvailabilityResult& out_result,
+    bool verbose,
+    std::string* reason_out = nullptr
+);
 void invalidate_debian_search_preview_cache();
 bool ensure_debian_search_preview_cache_loaded(
     bool verbose,
@@ -1686,7 +1695,7 @@ bool query_raw_debian_exact_package(
     return true;
 }
 
-bool resolve_raw_debian_relation_candidate(
+bool query_raw_debian_relation_availability(
     const std::string& requested_name,
     const std::string& op,
     const std::string& version,
@@ -1717,17 +1726,101 @@ bool resolve_raw_debian_relation_candidate(
         return false;
     }
 
+    bool found_any_candidate = false;
+    RawDebianAvailabilityResult best_result;
+    std::string best_reason;
     std::set<std::string> walk;
-    bool ok = resolve_raw_debian_relation_candidate_recursive(
-        relation,
-        context,
-        out_result,
-        walk,
-        verbose,
-        reason_out
-    );
-    if (ok) out_result.requested_name = relation.name;
-    return ok;
+
+    auto consider_candidate = [&](const RawDebianAvailabilityResult& candidate, const std::string& fallback_reason) {
+        if (!candidate.found) return;
+        found_any_candidate = true;
+
+        RawDebianAvailabilityResult normalized = candidate;
+        normalized.requested_name = relation.name;
+
+        if (raw_debian_result_satisfies_relation(candidate, relation) && candidate.installable) {
+            if (!best_result.installable ||
+                should_prefer_raw_debian_availability(normalized, best_result)) {
+                best_result = normalized;
+            }
+            return;
+        }
+
+        if (best_reason.empty()) {
+            best_reason = normalized.reason.empty() ? fallback_reason : normalized.reason;
+        }
+        if (best_result.meta.name.empty() ||
+            (!best_result.installable &&
+             should_prefer_raw_debian_availability(normalized, best_result))) {
+            best_result = normalized;
+        }
+    };
+
+    for (const auto& raw_name : collect_raw_debian_exact_candidate_names(relation.name, context)) {
+        RawDebianAvailabilityResult candidate =
+            evaluate_raw_debian_exact_package_recursive(context, raw_name, walk, verbose);
+        consider_candidate(candidate, "cached Debian candidate does not satisfy " + relation.name);
+    }
+
+    auto provider_it = context.provider_map.find(relation.name);
+    if (provider_it != context.provider_map.end()) {
+        for (const auto& provider_raw_name : provider_it->second) {
+            RawDebianAvailabilityResult candidate =
+                evaluate_raw_debian_exact_package_recursive(context, provider_raw_name, walk, verbose);
+            consider_candidate(candidate, "no cached Debian provider satisfies " + relation.name);
+        }
+    }
+
+    if (!found_any_candidate) {
+        if (reason_out) *reason_out = "package is absent from cached Debian metadata";
+        return false;
+    }
+
+    if (best_result.meta.name.empty()) {
+        if (reason_out) {
+            *reason_out = best_reason.empty()
+                ? "no cached Debian candidate satisfies the required relation"
+                : best_reason;
+        }
+        return false;
+    }
+
+    if (!best_result.installable && best_result.reason.empty()) {
+        best_result.reason = best_reason;
+    }
+    out_result = best_result;
+    if (reason_out) *reason_out = best_result.reason.empty() ? best_reason : best_result.reason;
+    return true;
+}
+
+bool resolve_raw_debian_relation_candidate(
+    const std::string& requested_name,
+    const std::string& op,
+    const std::string& version,
+    RawDebianContext& context,
+    RawDebianAvailabilityResult& out_result,
+    bool verbose,
+    std::string* reason_out
+) {
+    RawDebianAvailabilityResult availability;
+    std::string availability_reason;
+    if (!query_raw_debian_relation_availability(
+            requested_name,
+            op,
+            version,
+            context,
+            availability,
+            verbose,
+            &availability_reason
+        )) {
+        out_result = {};
+        if (reason_out) *reason_out = availability_reason;
+        return false;
+    }
+
+    out_result = availability;
+    if (reason_out) *reason_out = availability_reason;
+    return out_result.installable;
 }
 
 void invalidate_debian_search_preview_cache() {

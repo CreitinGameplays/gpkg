@@ -222,6 +222,21 @@ size_t visible_text_width(const std::string& value) {
     return width;
 }
 
+std::string ascii_lower_copy(const std::string& value) {
+    std::string lowered = value;
+    std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return lowered;
+}
+
+bool stdout_is_interactive_terminal() {
+    if (!isatty(STDOUT_FILENO) || !isatty(STDIN_FILENO)) return false;
+    const char* term_env = getenv("TERM");
+    if (!term_env || term_env[0] == '\0') return false;
+    return std::string(term_env) != "dumb";
+}
+
 size_t get_terminal_width(size_t fallback = 80) {
     const char* columns_env = getenv("COLUMNS");
     if (columns_env) {
@@ -236,6 +251,69 @@ size_t get_terminal_width(size_t fallback = 80) {
     }
 
     return fallback;
+}
+
+std::string default_interactive_pager_command() {
+    if (is_executable_command_available("less")) {
+        return "LESS=FRXMK less -R";
+    }
+    if (is_executable_command_available("pager")) return "pager";
+    if (is_executable_command_available("more")) return "more";
+    return "";
+}
+
+std::string resolve_interactive_pager_command() {
+    const char* gpkg_pager_env = getenv("GPKG_PAGER");
+    if (gpkg_pager_env) {
+        std::string pager = gpkg_pager_env;
+        if (pager == "0" || ascii_lower_copy(pager) == "none" || ascii_lower_copy(pager) == "cat") {
+            return "";
+        }
+        if (pager == "1") return default_interactive_pager_command();
+        if (!pager.empty()) return pager;
+    }
+
+    const char* pager_env = getenv("PAGER");
+    if (pager_env && pager_env[0] != '\0') {
+        std::string pager = pager_env;
+        if (ascii_lower_copy(pager) == "cat" || ascii_lower_copy(pager) == "none") return "";
+        return pager;
+    }
+
+    return default_interactive_pager_command();
+}
+
+bool write_text_via_pager(const std::string& text, bool verbose) {
+    if (!stdout_is_interactive_terminal()) return false;
+
+    std::string pager_command = resolve_interactive_pager_command();
+    if (pager_command.empty()) return false;
+
+    char tmpl[] = "/tmp/gpkg-pager-XXXXXX";
+    int fd = mkstemp(tmpl);
+    if (fd < 0) return false;
+
+    bool wrote_all = true;
+    ssize_t offset = 0;
+    while (offset < static_cast<ssize_t>(text.size())) {
+        ssize_t written = write(fd, text.data() + offset, static_cast<size_t>(text.size() - offset));
+        if (written < 0) {
+            if (errno == EINTR) continue;
+            wrote_all = false;
+            break;
+        }
+        offset += written;
+    }
+    close(fd);
+
+    if (!wrote_all) {
+        unlink(tmpl);
+        return false;
+    }
+
+    int rc = decode_command_exit_status(run_command(pager_command + " " + shell_quote(tmpl), verbose));
+    unlink(tmpl);
+    return rc == 0;
 }
 
 std::string truncate_progress_label(const std::string& value, size_t max_len) {

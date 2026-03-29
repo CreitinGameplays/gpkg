@@ -930,6 +930,32 @@ bool query_full_universe_exact_package(
             out_result.meta = repo_meta;
             return true;
         }
+
+        auto provider_it = g_repo_provider_cache.find(canonical_name);
+        if (provider_it != g_repo_provider_cache.end()) {
+            bool found = false;
+            PackageMetadata best_meta;
+            RelationAtom relation;
+            relation.name = canonical_name;
+            relation.valid = true;
+            relation.normalized = canonical_name;
+            for (const auto& provider_name : provider_it->second) {
+                PackageMetadata candidate;
+                if (!get_loaded_repo_package_info(provider_name, candidate)) continue;
+                if (!catalog_meta_satisfies_relation(provider_name, candidate, relation)) continue;
+                if (!found || should_prefer_repo_candidate(candidate, best_meta)) {
+                    best_meta = candidate;
+                    found = true;
+                }
+            }
+            if (found) {
+                out_result.found = true;
+                out_result.installable = true;
+                out_result.raw_only = false;
+                out_result.meta = best_meta;
+                return true;
+            }
+        }
     }
 
     if (!raw_context) {
@@ -939,25 +965,44 @@ bool query_full_universe_exact_package(
 
     RawDebianAvailabilityResult raw_result;
     std::string raw_reason;
-    if (!query_raw_debian_exact_package(
+    if (query_raw_debian_exact_package(
             canonical_name,
             *raw_context,
             raw_result,
             verbose,
             &raw_reason
         )) {
-        out_result.reason = raw_reason.empty()
-            ? "package is absent from cached Debian metadata"
-            : raw_reason;
-        return false;
+        out_result.found = raw_result.found;
+        out_result.installable = raw_result.installable;
+        out_result.raw_only = true;
+        out_result.reason = raw_result.reason;
+        out_result.meta = raw_result.meta;
+        return true;
     }
 
-    out_result.found = raw_result.found;
-    out_result.installable = raw_result.installable;
-    out_result.raw_only = true;
-    out_result.reason = raw_result.reason;
-    out_result.meta = raw_result.meta;
-    return true;
+    RawDebianAvailabilityResult raw_relation_result;
+    std::string raw_relation_reason;
+    if (query_raw_debian_relation_availability(
+            canonical_name,
+            "",
+            "",
+            *raw_context,
+            raw_relation_result,
+            verbose,
+            &raw_relation_reason
+        )) {
+        out_result.found = raw_relation_result.found;
+        out_result.installable = raw_relation_result.installable;
+        out_result.raw_only = true;
+        out_result.reason = raw_relation_result.reason.empty() ? raw_relation_reason : raw_relation_result.reason;
+        out_result.meta = raw_relation_result.meta;
+        return true;
+    }
+
+    out_result.reason = !raw_reason.empty()
+        ? raw_reason
+        : (raw_relation_reason.empty() ? "package is absent from cached Debian metadata" : raw_relation_reason);
+    return false;
 }
 
 bool resolve_full_universe_relation_candidate(
@@ -1218,7 +1263,44 @@ std::string search_result_channel_label(const SearchResultDisplay& result) {
     return result.meta.source_kind.empty() ? "unknown" : result.meta.source_kind;
 }
 
-void print_search_result_display(const SearchResultDisplay& result) {
+size_t find_case_insensitive_substring(const std::string& haystack, const std::string& normalized_needle) {
+    if (normalized_needle.empty()) return 0;
+    return ascii_lower_copy(haystack).find(normalized_needle);
+}
+
+struct SearchResultSortKey {
+    int bucket = 100;
+    size_t position = std::numeric_limits<size_t>::max();
+};
+
+SearchResultSortKey compute_search_result_sort_key(const SearchResultDisplay& result, const std::string& normalized_query) {
+    const auto& meta = result.meta;
+
+    size_t pos = find_case_insensitive_substring(meta.name, normalized_query);
+    if (pos == 0 && ascii_lower_copy(meta.name) == normalized_query) return {0, 0};
+    if (!meta.debian_package.empty()) {
+        size_t debian_pos = find_case_insensitive_substring(meta.debian_package, normalized_query);
+        if (debian_pos == 0 && ascii_lower_copy(meta.debian_package) == normalized_query) return {1, 0};
+    }
+    if (pos == 0) return {2, 0};
+    if (!meta.debian_package.empty()) {
+        size_t debian_pos = find_case_insensitive_substring(meta.debian_package, normalized_query);
+        if (debian_pos == 0) return {3, 0};
+    }
+    if (pos != std::string::npos) return {4, pos};
+    if (!meta.debian_package.empty()) {
+        size_t debian_pos = find_case_insensitive_substring(meta.debian_package, normalized_query);
+        if (debian_pos != std::string::npos) return {5, debian_pos};
+    }
+
+    pos = find_case_insensitive_substring(meta.description, normalized_query);
+    if (pos == 0) return {6, 0};
+    if (pos != std::string::npos) return {7, pos};
+
+    return {};
+}
+
+std::string render_search_result_display(const SearchResultDisplay& result) {
     const auto& meta = result.meta;
 
     std::string installed_ver;
@@ -1233,26 +1315,30 @@ void print_search_result_display(const SearchResultDisplay& result) {
         flags.push_back(Color::BLUE + "[base system]" + Color::RESET);
     }
 
-    std::cout << Color::GREEN << meta.name << Color::RESET
-              << "/" << Color::CYAN << search_result_channel_label(result) << Color::RESET
-              << " " << meta.version;
+    std::ostringstream out;
+    out << Color::GREEN << meta.name << Color::RESET
+        << "/" << Color::CYAN << search_result_channel_label(result) << Color::RESET
+        << " " << meta.version;
     for (const auto& flag : flags) {
-        std::cout << " " << flag;
+        out << " " << flag;
     }
-    std::cout << std::endl;
+    out << std::endl;
 
     std::string summary = description_summary(meta.description);
-    if (!summary.empty()) std::cout << "  " << summary << std::endl;
+    if (!summary.empty()) out << "  " << summary << std::endl;
+    return out.str();
 }
 
 int handle_search(const std::string& query, bool verbose) {
     bool have_repo_cache = try_ensure_repo_package_cache_loaded(verbose);
     VLOG(verbose, "Searching for '" << query << "' in the local package universe");
+    const std::string normalized_query = ascii_lower_copy(query);
     std::map<std::string, SearchResultDisplay> matches;
     if (have_repo_cache) {
         for (const auto& entry : g_repo_package_cache) {
             const PackageMetadata& meta = entry.second;
-            if (meta.name.find(query) != std::string::npos || meta.description.find(query) != std::string::npos) {
+            if (find_case_insensitive_substring(meta.name, normalized_query) != std::string::npos ||
+                find_case_insensitive_substring(meta.description, normalized_query) != std::string::npos) {
                 auto it = matches.find(meta.name);
                 if (it == matches.end() || should_prefer_repo_candidate(meta, it->second.meta)) {
                     SearchResultDisplay display;
@@ -1271,14 +1357,15 @@ int handle_search(const std::string& query, bool verbose) {
             const auto& preview = entry.second;
             if (matches.count(preview.meta.name) != 0) continue;
 
-            bool matched = preview.meta.name.find(query) != std::string::npos ||
-                preview.meta.description.find(query) != std::string::npos;
-            if (!matched && preview.meta.debian_package.find(query) != std::string::npos) {
+            bool matched = find_case_insensitive_substring(preview.meta.name, normalized_query) != std::string::npos ||
+                find_case_insensitive_substring(preview.meta.description, normalized_query) != std::string::npos;
+            if (!matched &&
+                find_case_insensitive_substring(preview.meta.debian_package, normalized_query) != std::string::npos) {
                 matched = true;
             }
             if (!matched) {
                 for (const auto& raw_name : preview.raw_names) {
-                    if (raw_name.find(query) != std::string::npos) {
+                    if (find_case_insensitive_substring(raw_name, normalized_query) != std::string::npos) {
                         matched = true;
                         break;
                     }
@@ -1308,10 +1395,10 @@ int handle_search(const std::string& query, bool verbose) {
         };
         if (raw_available) {
             for (const auto& entry : raw_context.import_name_to_raw_names) {
-                bool matched = entry.first.find(query) != std::string::npos;
+                bool matched = find_case_insensitive_substring(entry.first, normalized_query) != std::string::npos;
                 if (!matched) {
                     for (const auto& raw_name : entry.second) {
-                        if (raw_name.find(query) != std::string::npos) {
+                        if (find_case_insensitive_substring(raw_name, normalized_query) != std::string::npos) {
                             matched = true;
                             break;
                         }
@@ -1324,7 +1411,7 @@ int handle_search(const std::string& query, bool verbose) {
                     continue;
                 }
                 if (!matched &&
-                    result.meta.description.find(query) == std::string::npos) {
+                    find_case_insensitive_substring(result.meta.description, normalized_query) == std::string::npos) {
                     continue;
                 }
                 if (g_repo_package_cache.count(result.meta.name) != 0) continue;
@@ -1362,8 +1449,32 @@ int handle_search(const std::string& query, bool verbose) {
         return 0;
     }
 
+    std::vector<SearchResultDisplay> ordered_matches;
+    ordered_matches.reserve(matches.size());
     for (const auto& entry : matches) {
-        print_search_result_display(entry.second);
+        ordered_matches.push_back(entry.second);
+    }
+    std::stable_sort(ordered_matches.begin(), ordered_matches.end(),
+        [&](const SearchResultDisplay& lhs, const SearchResultDisplay& rhs) {
+            SearchResultSortKey lhs_key = compute_search_result_sort_key(lhs, normalized_query);
+            SearchResultSortKey rhs_key = compute_search_result_sort_key(rhs, normalized_query);
+            if (lhs_key.bucket != rhs_key.bucket) return lhs_key.bucket < rhs_key.bucket;
+            if (lhs_key.position != rhs_key.position) return lhs_key.position < rhs_key.position;
+
+            std::string lhs_name = ascii_lower_copy(lhs.meta.name);
+            std::string rhs_name = ascii_lower_copy(rhs.meta.name);
+            if (lhs_name != rhs_name) return lhs_name < rhs_name;
+            return compare_versions(lhs.meta.version, rhs.meta.version) > 0;
+        });
+
+    std::ostringstream rendered;
+    for (const auto& result : ordered_matches) {
+        rendered << render_search_result_display(result);
+    }
+
+    const std::string output = rendered.str();
+    if (!write_text_via_pager(output, verbose)) {
+        std::cout << output;
     }
 
     return 0;
@@ -1374,10 +1485,20 @@ int handle_show(const std::string& pkg_name, bool verbose) {
     RawDebianContext raw_context;
     PackageUniverseResult result;
     if (!query_full_universe_exact_package(pkg_name, result, verbose, &raw_context)) {
-        std::cerr << Color::RED << "E: Package '" << pkg_name << "' was not found in the local package universe";
-        if (!result.reason.empty()) std::cerr << " (" << result.reason << ")";
-        std::cerr << "." << Color::RESET << std::endl;
-        return 1;
+        DebianSearchPreviewEntry preview;
+        std::string preview_error;
+        if (get_debian_search_preview_exact_package(pkg_name, preview, verbose, &preview_error)) {
+            result.found = true;
+            result.installable = preview.installable;
+            result.raw_only = true;
+            result.reason = preview.reason;
+            result.meta = preview.meta;
+        } else {
+            std::cerr << Color::RED << "E: Package '" << pkg_name << "' was not found in the local package universe";
+            if (!result.reason.empty()) std::cerr << " (" << result.reason << ")";
+            std::cerr << "." << Color::RESET << std::endl;
+            return 1;
+        }
     }
     PackageMetadata meta = result.meta;
 
