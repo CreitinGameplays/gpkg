@@ -175,31 +175,6 @@ bool package_is_base_system_provided(const std::string& pkg_name, std::string* r
     return true;
 }
 
-bool repo_has_satisfying_dependency(
-    const Dependency& dep,
-    bool verbose,
-    RawDebianContext* raw_context = nullptr
-) {
-    PackageUniverseResult result;
-    if (resolve_full_universe_relation_candidate(
-            dep.name,
-            dep.op,
-            dep.version,
-            result,
-            verbose,
-            raw_context
-        )) {
-        VLOG(verbose, dep.name << " is available from the "
-             << (result.raw_only ? "cached Debian" : "repository")
-             << " universe as " << result.meta.name
-             << " " << result.meta.version
-             << " and can replace the base runtime.");
-        return true;
-    }
-
-    return false;
-}
-
 bool package_metadata_satisfies_dependency(
     const std::string& package_name,
     const PackageMetadata& meta,
@@ -350,9 +325,10 @@ bool is_dependency_satisfied_locally(
     RawDebianContext* raw_context = nullptr
 ) {
     if (provider_out) provider_out->clear();
+    (void)raw_context;
 
     std::string installed_ver;
-    if (package_has_exact_live_install_state(dep.name, &installed_ver, context) &&
+    if (get_local_installed_package_version(dep.name, &installed_ver, context) &&
         version_satisfies(installed_ver, dep.op, dep.version)) {
         if (provider_out) *provider_out = dep.name;
         return true;
@@ -365,17 +341,17 @@ bool is_dependency_satisfied_locally(
     }
 
     if (is_system_provided(dep.name, dep.op, dep.version)) {
-        if (is_upgradeable_system_package(dep.name) &&
-            repo_has_satisfying_dependency(dep, verbose, raw_context)) {
-            VLOG(verbose, dep.name << " is base-provided but marked upgradeable; preferring repository candidate.");
-            return false;
+        if (is_upgradeable_system_package(dep.name)) {
+            VLOG(verbose, dep.name
+                 << " is provided by the GeminiOS base image and remains satisfied locally"
+                 << " unless an explicit upgrade or versioned dependency requires a repo candidate.");
         }
         if (provider_out) *provider_out = BASE_SYSTEM_PROVIDER;
         return true;
     }
 
     if (verbose && !dep.op.empty() &&
-        package_has_exact_live_install_state(dep.name, &installed_ver, context)) {
+        get_local_installed_package_version(dep.name, &installed_ver, context)) {
         VLOG(verbose, dep.name << " is installed as " << installed_ver
              << " but does not satisfy " << dep.op << " " << dep.version);
     }
