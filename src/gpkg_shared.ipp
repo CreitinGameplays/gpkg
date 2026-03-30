@@ -458,9 +458,13 @@ OptionalDependencyPolicy g_optional_dependency_policy;
 
 bool is_optional_dependency_option(const std::string& arg) {
     return arg == "--recommended-yes" ||
+           arg == "-rec" ||
            arg == "--recommended-no" ||
+           arg == "-nrec" ||
            arg == "--suggested-yes" ||
-           arg == "--suggested-no";
+           arg == "-sug" ||
+           arg == "--suggested-no" ||
+           arg == "-nsug";
 }
 
 bool is_known_cli_option(const std::string& arg) {
