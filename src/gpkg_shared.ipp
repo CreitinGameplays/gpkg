@@ -170,6 +170,75 @@ bool mkdir_p(const std::string& path) {
     return true;
 }
 
+bool remove_path_recursive(const std::string& path) {
+    if (path.empty() || path == "/" || path == "." || path == "..") return false;
+
+    struct stat st {};
+    if (lstat(path.c_str(), &st) != 0) {
+        return errno == ENOENT;
+    }
+
+    if (S_ISDIR(st.st_mode) && !S_ISLNK(st.st_mode)) {
+        DIR* dir = opendir(path.c_str());
+        if (!dir) return false;
+
+        bool ok = true;
+        while (true) {
+            errno = 0;
+            dirent* entry = readdir(dir);
+            if (!entry) break;
+
+            std::string name = entry->d_name;
+            if (name == "." || name == "..") continue;
+            if (!remove_path_recursive(path + "/" + name)) ok = false;
+        }
+
+        int read_errno = errno;
+        closedir(dir);
+        if (read_errno != 0) return false;
+        if (!ok) return false;
+        return rmdir(path.c_str()) == 0 || errno == ENOENT;
+    }
+
+    return unlink(path.c_str()) == 0 || errno == ENOENT;
+}
+
+size_t prune_directory_entries_with_prefixes(
+    const std::string& dir_path,
+    const std::vector<std::string>& prefixes
+) {
+    if (dir_path.empty() || prefixes.empty()) return 0;
+
+    DIR* dir = opendir(dir_path.c_str());
+    if (!dir) return 0;
+
+    size_t removed_count = 0;
+    while (true) {
+        errno = 0;
+        dirent* entry = readdir(dir);
+        if (!entry) break;
+
+        std::string name = entry->d_name;
+        if (name == "." || name == "..") continue;
+
+        bool matches = false;
+        for (const auto& prefix : prefixes) {
+            if (!prefix.empty() && name.rfind(prefix, 0) == 0) {
+                matches = true;
+                break;
+            }
+        }
+        if (!matches) continue;
+
+        if (remove_path_recursive(dir_path + "/" + name)) {
+            ++removed_count;
+        }
+    }
+
+    closedir(dir);
+    return removed_count;
+}
+
 bool is_system_provided(const std::string& pkg, const std::string& op = "", const std::string& req_version = "");
 bool is_upgradeable_system_package(const std::string& pkg);
 bool package_is_base_system_provided(const std::string& pkg_name, std::string* reason_out = nullptr);
@@ -202,6 +271,25 @@ bool is_executable_command_available(const std::string& cmd) {
     }
 
     return false;
+}
+
+std::string resolve_gpkg_worker_command() {
+    const std::vector<std::string> candidates = {
+        ROOT_PREFIX + "/bin/apps/system/gpkg-worker",
+        ROOT_PREFIX + "/bin/gpkg-worker",
+        "/bin/apps/system/gpkg-worker",
+        "/bin/gpkg-worker",
+        "/usr/bin/gpkg-worker",
+        "/usr/local/bin/gpkg-worker",
+    };
+
+    for (const auto& candidate : candidates) {
+        if (candidate.empty()) continue;
+        if (access(candidate.c_str(), X_OK) == 0) return candidate;
+    }
+
+    if (is_executable_command_available("gpkg-worker")) return "gpkg-worker";
+    return "";
 }
 
 size_t visible_text_width(const std::string& value) {
@@ -334,7 +422,8 @@ size_t recommended_parallel_worker_count(size_t task_count) {
 }
 
 std::set<std::string> g_pending_triggers;
-const std::string SELINUX_RELABEL_TRIGGER = "selinux-relabel";
+bool g_pending_runtime_linker_refresh = false;
+bool g_pending_selinux_relabel = false;
 bool g_assume_yes = false;
 bool g_force_reinstall = false;
 OptionalDependencyPolicy g_optional_dependency_policy;
@@ -508,7 +597,7 @@ void check_triggers(const std::vector<std::string>& files) {
             g_pending_triggers.insert("update-desktop-database /usr/share/applications");
         }
         if (file.find("lib/") != std::string::npos || file.find("lib64/") != std::string::npos) {
-            g_pending_triggers.insert("ldconfig");
+            g_pending_runtime_linker_refresh = true;
         }
     }
 }
@@ -518,11 +607,20 @@ void queue_triggers_for_package(const std::string& pkg_name) {
 }
 
 void queue_runtime_linker_state_refresh() {
-    g_pending_triggers.insert("ldconfig");
+    g_pending_runtime_linker_refresh = true;
 }
 
-int run_ldconfig_trigger(bool verbose) {
-    std::vector<std::string> argv = {"gpkg-worker", "--refresh-runtime-linker-state"};
+void queue_selinux_label_state_refresh() {
+    g_pending_selinux_relabel = true;
+}
+
+int run_ldconfig_trigger(bool verbose, const std::string& worker_command = "") {
+    std::string resolved_worker = worker_command.empty()
+        ? resolve_gpkg_worker_command()
+        : worker_command;
+    if (resolved_worker.empty()) return 127;
+
+    std::vector<std::string> argv = {resolved_worker, "--refresh-runtime-linker-state"};
     if (verbose) argv.push_back("--verbose");
     if (!ROOT_PREFIX.empty()) {
         argv.push_back("--root");
@@ -532,8 +630,13 @@ int run_ldconfig_trigger(bool verbose) {
     return decode_command_exit_status(run_command_argv(argv, verbose));
 }
 
-int run_selinux_relabel_trigger(bool verbose) {
-    std::vector<std::string> argv = {"gpkg-worker", "--refresh-selinux-label-state"};
+int run_selinux_relabel_trigger(bool verbose, const std::string& worker_command = "") {
+    std::string resolved_worker = worker_command.empty()
+        ? resolve_gpkg_worker_command()
+        : worker_command;
+    if (resolved_worker.empty()) return 127;
+
+    std::vector<std::string> argv = {resolved_worker, "--refresh-selinux-label-state"};
     if (verbose) argv.push_back("--verbose");
     if (!ROOT_PREFIX.empty()) {
         argv.push_back("--root");
@@ -544,43 +647,49 @@ int run_selinux_relabel_trigger(bool verbose) {
 }
 
 void run_triggers(bool verbose) {
-    if (g_pending_triggers.empty()) return;
+    bool pending_runtime_refresh = g_pending_runtime_linker_refresh;
+    bool pending_selinux_relabel = g_pending_selinux_relabel;
+    std::set<std::string> pending_commands = g_pending_triggers;
+
+    if (pending_commands.empty() &&
+        !pending_runtime_refresh &&
+        !pending_selinux_relabel) {
+        return;
+    }
+
+    g_pending_triggers.clear();
+    g_pending_runtime_linker_refresh = false;
+    g_pending_selinux_relabel = false;
 
     std::cout << Color::CYAN << "Processing triggers..." << Color::RESET << std::endl;
-    if (verbose) std::cout << "[DEBUG] " << g_pending_triggers.size() << " triggers pending." << std::endl;
+    if (verbose) {
+        size_t pending_count = pending_commands.size();
+        if (pending_runtime_refresh) ++pending_count;
+        if (pending_selinux_relabel) ++pending_count;
+        std::cout << "[DEBUG] " << pending_count << " triggers pending." << std::endl;
+    }
 
     std::vector<std::string> failed_triggers;
-    for (const auto& cmd : g_pending_triggers) {
-        if (cmd == "ldconfig") {
-            if (!is_executable_command_available("gpkg-worker")) {
-                if (verbose) {
-                    std::cout << "[DEBUG] Skipping ldconfig trigger because gpkg-worker is unavailable."
-                              << std::endl;
-                }
-                continue;
-            }
-            if (verbose) std::cout << "[DEBUG] Running trigger via gpkg-worker: " << cmd << std::endl;
-            if (run_ldconfig_trigger(verbose) != 0) {
-                failed_triggers.push_back(cmd);
-            }
-            continue;
-        }
+    std::string worker_command = resolve_gpkg_worker_command();
 
-        if (cmd == SELINUX_RELABEL_TRIGGER) {
-            if (!is_executable_command_available("gpkg-worker")) {
-                if (verbose) {
-                    std::cout << "[DEBUG] Skipping SELinux relabel trigger because gpkg-worker is unavailable."
-                              << std::endl;
-                }
-                continue;
+    if (pending_runtime_refresh) {
+        if (worker_command.empty()) {
+            if (verbose) {
+                std::cout << "[DEBUG] Skipping runtime linker refresh because gpkg-worker is unavailable."
+                          << std::endl;
             }
-            if (verbose) std::cout << "[DEBUG] Running trigger via gpkg-worker: " << cmd << std::endl;
-            if (run_selinux_relabel_trigger(verbose) != 0) {
-                failed_triggers.push_back(cmd);
+        } else {
+            if (verbose) {
+                std::cout << "[DEBUG] Running trigger via gpkg-worker: --refresh-runtime-linker-state"
+                          << std::endl;
             }
-            continue;
+            if (run_ldconfig_trigger(verbose, worker_command) != 0) {
+                failed_triggers.push_back("gpkg-worker --refresh-runtime-linker-state");
+            }
         }
+    }
 
+    for (const auto& cmd : pending_commands) {
         if (!is_executable_command_available(cmd)) {
             if (verbose) {
                 std::cout << "[DEBUG] Skipping trigger because its command is unavailable: "
@@ -601,7 +710,23 @@ void run_triggers(bool verbose) {
             failed_triggers.push_back(cmd);
         }
     }
-    g_pending_triggers.clear();
+
+    if (pending_selinux_relabel) {
+        if (worker_command.empty()) {
+            if (verbose) {
+                std::cout << "[DEBUG] Skipping SELinux relabel trigger because gpkg-worker is unavailable."
+                          << std::endl;
+            }
+        } else {
+            if (verbose) {
+                std::cout << "[DEBUG] Running trigger via gpkg-worker: --refresh-selinux-label-state"
+                          << std::endl;
+            }
+            if (run_selinux_relabel_trigger(verbose, worker_command) != 0) {
+                failed_triggers.push_back("gpkg-worker --refresh-selinux-label-state");
+            }
+        }
+    }
 
     if (!failed_triggers.empty()) {
         std::ostringstream joined;
@@ -629,8 +754,14 @@ struct ScopedLock {
         }
     }
 
+    void release() {
+        if (!locked) return;
+        release_lock(verbose);
+        locked = false;
+    }
+
     ~ScopedLock() {
-        if (locked) release_lock(verbose);
+        release();
     }
 };
 
@@ -642,7 +773,9 @@ struct TransactionGuard {
     TransactionGuard(bool need_lock, bool v) : lock(need_lock, v), active(need_lock), verbose(v) {}
 
     ~TransactionGuard() {
-        if (active) run_triggers(verbose);
+        if (!active) return;
+        lock.release();
+        run_triggers(verbose);
     }
 };
 

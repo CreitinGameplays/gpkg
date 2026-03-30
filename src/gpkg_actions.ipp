@@ -746,7 +746,9 @@ std::vector<std::string> build_worker_command_argv(
     bool defer_runtime_refresh = false,
     bool defer_selinux_relabel = false
 ) {
-    std::vector<std::string> argv = {"gpkg-worker", mode, value};
+    std::string worker_command = resolve_gpkg_worker_command();
+    if (worker_command.empty()) worker_command = "gpkg-worker";
+    std::vector<std::string> argv = {worker_command, mode, value};
     if (verbose) argv.push_back("--verbose");
     if (defer_runtime_refresh) argv.push_back("--defer-runtime-linker-refresh");
     if (defer_selinux_relabel) argv.push_back("--defer-selinux-relabel");
@@ -763,7 +765,7 @@ InstallCommandResult install_package_from_file(const std::string& pkg_file, bool
         verbose,
         "gpkg-install"
     );
-    if (result.exit_code == 0) g_pending_triggers.insert(SELINUX_RELABEL_TRIGGER);
+    if (result.exit_code == 0) queue_selinux_label_state_refresh();
     return {result.exit_code == 0, result.log_path};
 }
 
@@ -773,7 +775,7 @@ InstallCommandResult retire_package_by_name(const std::string& pkg_name, bool ve
         verbose,
         "gpkg-retire"
     );
-    if (result.exit_code == 0) g_pending_triggers.insert(SELINUX_RELABEL_TRIGGER);
+    if (result.exit_code == 0) queue_selinux_label_state_refresh();
     return {result.exit_code == 0, result.log_path};
 }
 
@@ -783,7 +785,7 @@ InstallCommandResult remove_package_by_name(const std::string& pkg_name, bool ve
         verbose,
         "gpkg-remove"
     );
-    if (result.exit_code == 0) g_pending_triggers.insert(SELINUX_RELABEL_TRIGGER);
+    if (result.exit_code == 0) queue_selinux_label_state_refresh();
     return {result.exit_code == 0, result.log_path};
 }
 
@@ -793,7 +795,7 @@ InstallCommandResult purge_package_by_name(const std::string& pkg_name, bool ver
         verbose,
         "gpkg-purge"
     );
-    if (result.exit_code == 0) g_pending_triggers.insert(SELINUX_RELABEL_TRIGGER);
+    if (result.exit_code == 0) queue_selinux_label_state_refresh();
     return {result.exit_code == 0, result.log_path};
 }
 
@@ -843,6 +845,20 @@ bool prepare_install_archives(
 ) {
     failures.clear();
     if (packages.empty()) return true;
+
+    size_t pruned_temp_roots = prune_directory_entries_with_prefixes(
+        "/tmp",
+        {
+            "gpkg-deb-import-",
+            "gpkg-import-build-",
+            "gpkg-disk-estimate-",
+            "gpkg-deb-disk-estimate-"
+        }
+    );
+    if (verbose && pruned_temp_roots > 0) {
+        std::cout << "[DEBUG] Pruned " << pruned_temp_roots
+                  << " stale gpkg temporary workspace(s) from /tmp." << std::endl;
+    }
 
     std::cout << Color::CYAN << "[*] Preparing " << packages.size()
               << " package(s)..." << Color::RESET << std::endl;
@@ -1169,33 +1185,33 @@ bool inspect_gpkg_archive_payload_for_disk_estimate(
     std::string archive_error;
     std::string outer_tar = temp_root + "/archive.tar";
     if (!GpkgArchive::decompress_zstd_file(archive_path, outer_tar, &archive_error)) {
-        run_command("rm -rf " + shell_quote(temp_root), false);
+        remove_path_recursive(temp_root);
         return false;
     }
 
     std::string unpack_root = temp_root + "/unpack";
     if (!mkdir_p(unpack_root) ||
         !GpkgArchive::tar_extract_to_directory(outer_tar, unpack_root, {}, &archive_error)) {
-        run_command("rm -rf " + shell_quote(temp_root), false);
+        remove_path_recursive(temp_root);
         return false;
     }
 
     std::string data_archive;
     if (!locate_deb_data_archive(unpack_root, data_archive)) {
-        run_command("rm -rf " + shell_quote(temp_root), false);
+        remove_path_recursive(temp_root);
         return false;
     }
 
     std::string payload_tar;
     if (!materialize_deb_payload_tar(data_archive, temp_root, payload_tar, &archive_error)) {
-        run_command("rm -rf " + shell_quote(temp_root), false);
+        remove_path_recursive(temp_root);
         return false;
     }
 
     CachedArchivePayloadInfo info = inspect_payload_tar_for_disk_estimate(payload_tar);
     ok = info.available;
     if (out_info) *out_info = info;
-    run_command("rm -rf " + shell_quote(temp_root), false);
+    remove_path_recursive(temp_root);
     return ok;
 }
 
@@ -1213,26 +1229,26 @@ bool inspect_debian_archive_payload_for_disk_estimate(
     bool ok = false;
     std::string archive_error;
     if (!GpkgArchive::extract_ar_archive_to_directory(archive_path, temp_root, &archive_error)) {
-        run_command("rm -rf " + shell_quote(temp_root), false);
+        remove_path_recursive(temp_root);
         return false;
     }
 
     std::string data_archive;
     if (!locate_deb_data_archive(temp_root, data_archive)) {
-        run_command("rm -rf " + shell_quote(temp_root), false);
+        remove_path_recursive(temp_root);
         return false;
     }
 
     std::string payload_tar;
     if (!materialize_deb_payload_tar(data_archive, temp_root, payload_tar, &archive_error)) {
-        run_command("rm -rf " + shell_quote(temp_root), false);
+        remove_path_recursive(temp_root);
         return false;
     }
 
     CachedArchivePayloadInfo info = inspect_payload_tar_for_disk_estimate(payload_tar);
     ok = info.available;
     if (out_info) *out_info = info;
-    run_command("rm -rf " + shell_quote(temp_root), false);
+    remove_path_recursive(temp_root);
     return ok;
 }
 
@@ -1580,12 +1596,53 @@ std::string resolve_requested_package_for_manual_marking(
 
     std::string provider_name;
     if (find_installed_dependency_provider(requested_dep, installed_cache, &provider_name)) {
-        return provider_name;
+        if (provider_name != BASE_SYSTEM_PROVIDER && is_installed(provider_name)) {
+            return provider_name;
+        }
     }
 
     std::string installed_ver;
     if (is_installed(requested_dep.name, &installed_ver)) return requested_dep.name;
     return "";
+}
+
+bool explicit_install_target_requires_queue(
+    const std::string& requested_name,
+    bool verbose,
+    RawDebianContext* raw_context = nullptr
+) {
+    std::string canonical_requested = canonicalize_package_name(requested_name, verbose);
+    if (canonical_requested.empty()) return false;
+
+    PackageUniverseResult result;
+    if (!resolve_full_universe_relation_candidate(
+            canonical_requested,
+            "",
+            "",
+            result,
+            verbose,
+            raw_context
+        )) {
+        return false;
+    }
+
+    const std::string candidate_name =
+        result.meta.name.empty() ? canonical_requested : canonicalize_package_name(result.meta.name, verbose);
+    if (candidate_name.empty()) return false;
+
+    std::string managed_version;
+    if (is_installed(candidate_name, &managed_version)) {
+        return compare_versions(result.meta.version, managed_version) > 0;
+    }
+
+    PackageMetadata live_meta;
+    if (!get_live_installed_package_metadata(candidate_name, live_meta)) return false;
+    if (live_meta.version.empty()) return true;
+
+    int version_cmp = compare_versions(result.meta.version, live_meta.version);
+    if (version_cmp > 0) return true;
+    if (version_cmp == 0) return true;
+    return false;
 }
 
 std::set<std::string> compute_needed_installed_packages(
@@ -3475,6 +3532,8 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
         }
 
         std::string failure_reason;
+        bool force_explicit_queue =
+            g_force_reinstall || explicit_install_target_requires_queue(arg, verbose, &raw_context);
         if (!resolve_dependencies(
                 arg,
                 "",
@@ -3483,7 +3542,7 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
                 visited,
                 installed_cache,
                 verbose,
-                g_force_reinstall,
+                force_explicit_queue,
                 nullptr,
                 false,
                 &raw_context,

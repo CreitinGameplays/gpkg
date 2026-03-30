@@ -1303,6 +1303,25 @@ SearchResultSortKey compute_search_result_sort_key(const SearchResultDisplay& re
 std::string render_search_result_display(const SearchResultDisplay& result) {
     const auto& meta = result.meta;
 
+    auto get_live_display_version = [](const std::string& pkg_name, std::string* version_out = nullptr) {
+        if (version_out) version_out->clear();
+
+        PackageStatusRecord status_record;
+        if (get_dpkg_package_status_record(pkg_name, &status_record) &&
+            package_status_is_installed_like(status_record.status)) {
+            if (version_out) *version_out = status_record.version;
+            return true;
+        }
+
+        if (get_base_system_package_status_record(pkg_name, &status_record) &&
+            package_status_is_installed_like(status_record.status)) {
+            if (version_out) *version_out = status_record.version;
+            return true;
+        }
+
+        return false;
+    };
+
     std::string installed_ver;
     std::vector<std::string> flags;
     if (is_installed(meta.name, &installed_ver)) {
@@ -1311,8 +1330,21 @@ std::string render_search_result_display(const SearchResultDisplay& result) {
         } else {
             flags.push_back(Color::BLUE + "[installed: " + installed_ver + "]" + Color::RESET);
         }
-    } else if (package_is_base_system_provided(meta.name)) {
-        flags.push_back(Color::BLUE + "[base system]" + Color::RESET);
+    } else {
+        std::string live_version;
+        if (get_live_display_version(meta.name, &live_version)) {
+            if (package_is_base_system_provided(meta.name)) {
+                flags.push_back(
+                    Color::BLUE + "[base system: " + live_version + "]" + Color::RESET
+                );
+            } else {
+                flags.push_back(
+                    Color::BLUE + "[live: " + live_version + "]" + Color::RESET
+                );
+            }
+        } else if (package_is_base_system_provided(meta.name)) {
+            flags.push_back(Color::BLUE + "[base system]" + Color::RESET);
+        }
     }
 
     std::ostringstream out;
@@ -1526,10 +1558,38 @@ int handle_show(const std::string& pkg_name, bool verbose) {
     std::string installed_ver;
     if (is_installed(meta.name, &installed_ver)) {
         std::cout << "  Installed:   yes (" << installed_ver << ")" << std::endl;
-    } else if (package_is_base_system_provided(meta.name)) {
-        std::cout << "  Installed:   base system" << std::endl;
     } else {
-        std::cout << "  Installed:   no" << std::endl;
+        PackageStatusRecord live_status;
+        bool have_live_status =
+            get_dpkg_package_status_record(meta.name, &live_status) &&
+            package_status_is_installed_like(live_status.status);
+        if (!have_live_status) {
+            have_live_status =
+                get_base_system_package_status_record(meta.name, &live_status) &&
+                package_status_is_installed_like(live_status.status);
+        }
+
+        if (have_live_status) {
+            if (package_is_base_system_provided(meta.name)) {
+                std::cout << "  Installed:   base system";
+                if (!live_status.version.empty()) {
+                    std::cout << " (" << live_status.version << ")";
+                }
+                std::cout << std::endl;
+            } else {
+                std::cout << "  Installed:   yes";
+                if (!live_status.version.empty()) {
+                    std::cout << " (" << live_status.version << "; unmanaged live system)";
+                } else {
+                    std::cout << " (unmanaged live system)";
+                }
+                std::cout << std::endl;
+            }
+        } else if (package_is_base_system_provided(meta.name)) {
+            std::cout << "  Installed:   base system" << std::endl;
+        } else {
+            std::cout << "  Installed:   no" << std::endl;
+        }
     }
 
     return 0;
