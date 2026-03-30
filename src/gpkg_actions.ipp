@@ -646,6 +646,36 @@ std::vector<std::string> collect_normalized_upgrade_roots(
         if (!pkg.empty()) raw_roots.insert(canonicalize_package_name(pkg, verbose));
     }
 
+    auto seed_repo_native_base_image_upgrade_root = [&](const std::string& pkg_name,
+                                                        const std::vector<std::string>& probe_paths) {
+        if (pkg_name.empty()) return;
+        if (package_has_exact_live_install_state(pkg_name, nullptr, &context)) return;
+
+        bool live_payload_present = false;
+        for (const auto& probe_path : probe_paths) {
+            if (probe_path.empty()) continue;
+            if (access((ROOT_PREFIX + probe_path).c_str(), F_OK) == 0) {
+                live_payload_present = true;
+                break;
+            }
+        }
+        if (!live_payload_present) return;
+
+        PackageMetadata repo_meta;
+        if (!get_repo_package_info(pkg_name, repo_meta)) return;
+
+        VLOG(verbose, "Seeding repo-native base-image upgrade root " << pkg_name
+                     << " because its live payload exists without exact package state.");
+        raw_roots.insert(canonicalize_package_name(pkg_name, verbose));
+    };
+
+    // Some GeminiOS-native tools ship in the base image before gpkg owns them by exact
+    // package name. Seed those roots so a later repository package can self-upgrade/import.
+    seed_repo_native_base_image_upgrade_root("gpkg", {
+        "/bin/apps/system/gpkg",
+        "/bin/gpkg",
+    });
+
     std::vector<std::string> normalized_roots;
     std::set<std::string> emitted_targets;
     for (const auto& raw_name : raw_roots) {
@@ -1853,6 +1883,13 @@ bool package_is_config_files_only(const std::string& pkg_name, std::string* out_
 bool package_is_removal_protected(const std::string& pkg_name, std::string* reason_out) {
     if (reason_out) reason_out->clear();
     if (pkg_name.empty()) return false;
+
+    // gpkg can be imported/upgraded from the repository, but the package manager itself
+    // must never offer a self-removal transaction.
+    if (canonicalize_package_name(pkg_name) == "gpkg") {
+        if (reason_out) *reason_out = "it is the GeminiOS package manager";
+        return true;
+    }
 
     const ImportPolicy& policy = get_import_policy(false);
     if (matches_any_pattern(pkg_name, policy.allow_essential_packages)) {
@@ -3836,6 +3873,13 @@ int handle_remove(int argc, char* argv[], bool verbose, bool purge, bool autorem
     bool target_config_files = package_is_config_files_only(target_pkg);
 
     std::string protection_reason;
+    if (package_is_removal_protected(target_pkg, &protection_reason)) {
+        std::cerr << Color::RED << "E: Refusing to remove '" << target_pkg << "' because "
+                  << protection_reason << "."
+                  << Color::RESET << std::endl;
+        return 1;
+    }
+
     if (!target_installed && !(purge && target_config_files) &&
         package_is_base_system_provided(target_pkg, &protection_reason)) {
         std::cerr << Color::RED << "E: Refusing to remove '" << target_pkg << "' because "
@@ -3846,13 +3890,6 @@ int handle_remove(int argc, char* argv[], bool verbose, bool purge, bool autorem
 
     if (!target_installed && !(purge && target_config_files)) {
         std::cerr << Color::RED << "E: Package '" << target_pkg << "' is not installed."
-                  << Color::RESET << std::endl;
-        return 1;
-    }
-
-    if (package_is_removal_protected(target_pkg, &protection_reason)) {
-        std::cerr << Color::RED << "E: Refusing to remove '" << target_pkg << "' because "
-                  << protection_reason << "."
                   << Color::RESET << std::endl;
         return 1;
     }
