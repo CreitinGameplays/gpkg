@@ -136,10 +136,10 @@ void print_help() {
               << "  -y, --yes       Assume yes for confirmation prompts\n"
               << "  -r, --repair    Repair broken dependencies and damaged installs\n"
               << "  --reinstall     Reinstall requested packages even if the same version is already installed\n"
-              << "  --recommended-yes, --rec  Force installation of Debian Recommends for this transaction\n"
-              << "  --recommended-no, --no-rec  Do not install Debian Recommends for this transaction\n"
+              << "  --recommended-yes, -rec  Force installation of Debian Recommends for this transaction\n"
+              << "  --recommended-no, -nrec  Do not install Debian Recommends for this transaction\n"
               << "  --suggested-yes, -sug  Force installation of Debian Suggests for this transaction\n"
-              << "  --suggested-no, --no-sug  Do not install Debian Suggests for this transaction\n"
+              << "  --suggested-no, -nsug  Do not install Debian Suggests for this transaction\n"
               << "  --autoremove    Remove newly unneeded dependency packages during remove\n"
               << "  --purge         Also purge package conffiles during remove/autoremove\n"
               << "  -V, --version   Show version\n\n"
@@ -186,10 +186,10 @@ int main(int argc, char* argv[]) {
         else if (arg == "--autoremove") autoremove = true;
         else if (arg == "-r" || arg == "--repair") repair = true;
         else if (arg == "--reinstall") reinstall = true;
-        else if (arg == "--recommended-yes" || arg == "--rec") recommended_yes = true;
-        else if (arg == "--recommended-no" || arg == "--no-rec") recommended_no = true;
+        else if (arg == "--recommended-yes" || arg == "-rec") recommended_yes = true;
+        else if (arg == "--recommended-no" || arg == "-nrec") recommended_no = true;
         else if (arg == "--suggested-yes" || arg == "-sug") suggested_yes = true;
-        else if (arg == "--suggested-no" || arg == "--no-sug") suggested_no = true;
+        else if (arg == "--suggested-no" || arg == "-nsug") suggested_no = true;
         else if (arg == "-h" || arg == "--help") {
             action = "help";
         } else if (arg == "-V" || arg == "--version") {
