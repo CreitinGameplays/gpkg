@@ -23,6 +23,7 @@
 #include <mutex>
 #include <openssl/sha.h>
 #include <regex>
+#include <sched.h>
 #include <set>
 #include <sstream>
 #include <string>
@@ -411,6 +412,33 @@ std::string truncate_progress_label(const std::string& value, size_t max_len) {
 }
 
 size_t detected_cpu_worker_count() {
+    const char* env = getenv("GPKG_WORKERS");
+    if (env && env[0] != '\0') {
+        char* end = nullptr;
+        errno = 0;
+        unsigned long requested = std::strtoul(env, &end, 10);
+        while (end && *end != '\0' && std::isspace(static_cast<unsigned char>(*end))) ++end;
+        if (errno == 0 &&
+            end != env &&
+            (!end || *end == '\0') &&
+            requested > 0 &&
+            requested <= std::numeric_limits<size_t>::max()) {
+            return static_cast<size_t>(requested);
+        }
+    }
+
+#ifdef __linux__
+    cpu_set_t affinity_set;
+    CPU_ZERO(&affinity_set);
+    if (sched_getaffinity(0, sizeof(affinity_set), &affinity_set) == 0) {
+        size_t affinity_count = static_cast<size_t>(CPU_COUNT(&affinity_set));
+        if (affinity_count > 0) return affinity_count;
+    }
+#endif
+
+    long online = sysconf(_SC_NPROCESSORS_ONLN);
+    if (online > 0) return static_cast<size_t>(online);
+
     unsigned int count = std::thread::hardware_concurrency();
     if (count == 0) return 1;
     return static_cast<size_t>(count);

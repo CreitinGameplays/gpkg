@@ -67,6 +67,44 @@ struct DebianIncrementalImportResult {
     size_t rebuilt_records = 0;
 };
 
+struct DebianParsedRecordCacheState {
+    std::string schema_fingerprint;
+    std::string packages_fingerprint;
+    size_t record_count = 0;
+};
+
+struct DebianParsedRecordCacheEntry {
+    std::string stanza_fingerprint;
+    DebianPackageRecord record;
+};
+
+struct DebianParsedRecordLoadResult {
+    std::vector<DebianPackageRecord> records;
+    std::vector<DebianParsedRecordCacheEntry> cache_entries;
+    size_t reused_records = 0;
+    size_t reparsed_records = 0;
+};
+
+struct DebianStanzaSpan {
+    std::streamoff offset = 0;
+    size_t size = 0;
+};
+
+struct DebianDiffIndexEntry {
+    std::string hash;
+    long size = -1;
+    std::string name;
+    std::string remote_name;
+};
+
+struct DebianPackagesDiffIndex {
+    std::string current_hash;
+    long current_size = -1;
+    std::map<std::string, DebianDiffIndexEntry> history_by_hash;
+    std::map<std::string, DebianDiffIndexEntry> patches_by_name;
+    std::map<std::string, DebianDiffIndexEntry> downloads_by_name;
+};
+
 struct RawDebianAvailabilityResult {
     bool found = false;
     bool installable = false;
@@ -160,6 +198,8 @@ bool resolve_raw_debian_relation_candidate(
     std::string* reason_out = nullptr
 );
 std::string fingerprint_debian_package_record(const DebianPackageRecord& record);
+std::string sha256_hex_digest(const std::string& value);
+std::string sha256_hex_file(const std::string& path);
 std::vector<std::string> collect_debian_record_provided_symbols(
     const DebianPackageRecord& record,
     const DebianBackendConfig& config
@@ -174,6 +214,30 @@ bool dependency_watch_symbols_intersect(
     const std::set<std::string>& changed_symbols
 );
 std::string build_debian_compiled_record_cache_policy_fingerprint();
+std::string describe_debian_cache_rebuild_reason(
+    const std::string& cache_name,
+    const std::string& reason
+);
+std::string build_debian_parsed_record_cache_schema_fingerprint(const DebianBackendConfig& config);
+std::string build_debian_parsed_record_packages_fingerprint(const std::string& packages_path);
+std::string get_debian_parsed_record_cache_path();
+std::string get_debian_parsed_record_state_path();
+bool load_current_debian_parsed_record_cache(
+    const std::string& packages_path,
+    const DebianBackendConfig& config,
+    std::vector<DebianPackageRecord>& records,
+    std::string* error_out = nullptr
+);
+bool collect_debian_package_stanza_spans(
+    const std::string& packages_path,
+    std::vector<DebianStanzaSpan>& spans,
+    std::string* error_out = nullptr
+);
+DebianParsedRecordLoadResult load_debian_package_records_incremental(
+    const std::string& packages_path,
+    const DebianBackendConfig& config,
+    bool verbose
+);
 bool load_debian_compiled_record_cache(
     const std::string& policy_fingerprint,
     std::map<std::string, DebianCompiledRecordCacheEntry>& entries_by_package,
@@ -500,6 +564,45 @@ bool remote_packages_index_matches_cache(
     return false;
 }
 
+std::string sha256_hex_digest(const std::string& value) {
+    unsigned char hash[SHA256_DIGEST_LENGTH];
+    SHA256_CTX ctx;
+    SHA256_Init(&ctx);
+    if (!value.empty()) {
+        SHA256_Update(&ctx, value.data(), value.size());
+    }
+    SHA256_Final(hash, &ctx);
+
+    std::ostringstream out;
+    for (int i = 0; i < SHA256_DIGEST_LENGTH; ++i) {
+        out << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(hash[i]);
+    }
+    return out.str();
+}
+
+std::string sha256_hex_file(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return "";
+
+    SHA256_CTX ctx;
+    SHA256_Init(&ctx);
+
+    char buffer[32768];
+    while (in.read(buffer, sizeof(buffer)) || in.gcount() > 0) {
+        SHA256_Update(&ctx, buffer, static_cast<size_t>(in.gcount()));
+    }
+    if (in.bad()) return "";
+
+    unsigned char hash[SHA256_DIGEST_LENGTH];
+    SHA256_Final(hash, &ctx);
+
+    std::ostringstream out;
+    for (int i = 0; i < SHA256_DIGEST_LENGTH; ++i) {
+        out << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(hash[i]);
+    }
+    return out.str();
+}
+
 std::vector<std::map<std::string, std::string>> parse_debian_control_stanzas(const std::string& text) {
     std::vector<std::map<std::string, std::string>> stanzas;
     std::map<std::string, std::string> current;
@@ -588,6 +691,71 @@ std::string* get_debian_record_field_storage(
     return nullptr;
 }
 
+bool finalize_debian_package_record(
+    DebianPackageRecord current,
+    const std::string& essential_value,
+    const DebianBackendConfig& config,
+    bool verbose,
+    DebianPackageRecord& ready
+) {
+    ready = {};
+    if (current.package.empty() || current.version.empty()) return false;
+
+    if (!(current.architecture.empty() ||
+          current.architecture == "all" ||
+          current.architecture == config.apt_arch)) {
+        return false;
+    }
+
+    current.description = debian_description_text(current.description);
+    current.essential = !essential_value.empty() && trim(essential_value) == "yes";
+
+    if (verbose && current.filename.empty()) {
+        std::cout << "[DEBUG] Debian record missing Filename: " << current.package << std::endl;
+    }
+
+    ready = std::move(current);
+    return true;
+}
+
+bool parse_debian_package_record_from_stanza(
+    const std::string& stanza_text,
+    const DebianBackendConfig& config,
+    bool verbose,
+    DebianPackageRecord& ready
+) {
+    DebianPackageRecord current;
+    std::string essential_value;
+    std::string last_key;
+    std::string* last_value = nullptr;
+
+    std::istringstream input(stanza_text);
+    std::string raw_line;
+    while (std::getline(input, raw_line)) {
+        if (!raw_line.empty() && raw_line.back() == '\r') raw_line.pop_back();
+        if (trim(raw_line).empty()) continue;
+
+        if (!raw_line.empty() && std::isspace(static_cast<unsigned char>(raw_line[0]))) {
+            if (last_value) *last_value += "\n" + raw_line.substr(1);
+            continue;
+        }
+
+        size_t colon = raw_line.find(':');
+        if (colon == std::string::npos) {
+            last_key.clear();
+            last_value = nullptr;
+            continue;
+        }
+
+        last_key = raw_line.substr(0, colon);
+        last_value = get_debian_record_field_storage(current, essential_value, last_key);
+        if (!last_value) continue;
+        *last_value = trim(raw_line.substr(colon + 1));
+    }
+
+    return finalize_debian_package_record(current, essential_value, config, verbose, ready);
+}
+
 template <typename Func>
 bool for_each_debian_package_record(
     const std::string& packages_path,
@@ -611,27 +779,10 @@ bool for_each_debian_package_record(
     };
 
     auto flush_current = [&]() -> bool {
-        if (current.package.empty() || current.version.empty()) {
-            reset_current();
-            return true;
-        }
-
-        if (!(current.architecture.empty() ||
-              current.architecture == "all" ||
-              current.architecture == config.apt_arch)) {
-            reset_current();
-            return true;
-        }
-
-        current.description = debian_description_text(current.description);
-        current.essential = !essential_value.empty() && trim(essential_value) == "yes";
-
-        if (verbose && current.filename.empty()) {
-            std::cout << "[DEBUG] Debian record missing Filename: " << current.package << std::endl;
-        }
-
-        DebianPackageRecord ready = current;
+        DebianPackageRecord ready;
+        bool valid = finalize_debian_package_record(current, essential_value, config, verbose, ready);
         reset_current();
+        if (!valid) return true;
         return callback(ready);
     };
 
@@ -766,6 +917,7 @@ std::string debian_search_preview_to_json(const DebianSearchPreviewEntry& entry)
 }
 
 const uint32_t DEBIAN_COMPILED_CACHE_VERSION = 1;
+const char DEBIAN_PARSED_RECORD_CACHE_MAGIC[8] = {'G','P','K','R','A','W','1','\0'};
 const char DEBIAN_COMPILED_RECORD_CACHE_MAGIC[8] = {'G','P','K','R','E','C','1','\0'};
 const char DEBIAN_IMPORTED_CACHE_MAGIC[8] = {'G','P','K','I','M','P','1','\0'};
 const char DEBIAN_PREVIEW_CACHE_MAGIC[8] = {'G','P','K','P','R','V','1','\0'};
@@ -910,6 +1062,74 @@ bool read_package_metadata_binary(std::istream& in, PackageMetadata& meta) {
         read_binary_string_vector(in, meta.conflicts) &&
         read_binary_string_vector(in, meta.provides) &&
         read_binary_string_vector(in, meta.replaces);
+}
+
+bool write_debian_package_record_binary(std::ostream& out, const DebianPackageRecord& record) {
+    return
+        write_binary_string(out, record.package) &&
+        write_binary_string(out, record.version) &&
+        write_binary_string(out, record.architecture) &&
+        write_binary_string(out, record.maintainer) &&
+        write_binary_string(out, record.section) &&
+        write_binary_string(out, record.priority) &&
+        write_binary_string(out, record.filename) &&
+        write_binary_string(out, record.sha256) &&
+        write_binary_string(out, record.size) &&
+        write_binary_string(out, record.installed_size) &&
+        write_binary_string(out, record.depends_raw) &&
+        write_binary_string(out, record.pre_depends_raw) &&
+        write_binary_string(out, record.recommends_raw) &&
+        write_binary_string(out, record.suggests_raw) &&
+        write_binary_string(out, record.conflicts_raw) &&
+        write_binary_string(out, record.provides_raw) &&
+        write_binary_string(out, record.replaces_raw) &&
+        write_binary_string(out, record.description) &&
+        write_binary_u8(out, record.essential ? 1 : 0);
+}
+
+bool read_debian_package_record_binary(std::istream& in, DebianPackageRecord& record) {
+    record = {};
+    uint8_t essential = 0;
+    return
+        read_binary_string(in, record.package) &&
+        read_binary_string(in, record.version) &&
+        read_binary_string(in, record.architecture) &&
+        read_binary_string(in, record.maintainer) &&
+        read_binary_string(in, record.section) &&
+        read_binary_string(in, record.priority) &&
+        read_binary_string(in, record.filename) &&
+        read_binary_string(in, record.sha256) &&
+        read_binary_string(in, record.size) &&
+        read_binary_string(in, record.installed_size) &&
+        read_binary_string(in, record.depends_raw) &&
+        read_binary_string(in, record.pre_depends_raw) &&
+        read_binary_string(in, record.recommends_raw) &&
+        read_binary_string(in, record.suggests_raw) &&
+        read_binary_string(in, record.conflicts_raw) &&
+        read_binary_string(in, record.provides_raw) &&
+        read_binary_string(in, record.replaces_raw) &&
+        read_binary_string(in, record.description) &&
+        read_binary_u8(in, essential) &&
+        ((record.essential = essential != 0), true);
+}
+
+bool write_debian_parsed_record_cache_entry_binary(
+    std::ostream& out,
+    const DebianParsedRecordCacheEntry& entry
+) {
+    return
+        write_binary_string(out, entry.stanza_fingerprint) &&
+        write_debian_package_record_binary(out, entry.record);
+}
+
+bool read_debian_parsed_record_cache_entry_binary(
+    std::istream& in,
+    DebianParsedRecordCacheEntry& entry
+) {
+    entry = {};
+    return
+        read_binary_string(in, entry.stanza_fingerprint) &&
+        read_debian_package_record_binary(in, entry.record);
 }
 
 bool write_debian_search_preview_entry_binary(
@@ -1120,17 +1340,22 @@ std::vector<DebianPackageRecord> parse_debian_packages_file(
     bool verbose
 ) {
     std::vector<DebianPackageRecord> parsed;
-    for_each_debian_package_record(
-        packages_path,
-        config,
-        verbose,
-        [&](const DebianPackageRecord& record) {
-            parsed.push_back(record);
-            return true;
-        }
-    );
+    std::string cache_error;
+    if (load_current_debian_parsed_record_cache(packages_path, config, parsed, &cache_error)) {
+        VLOG(verbose, "Loaded " << parsed.size()
+             << " Debian package records from the parsed-record cache.");
+        return parsed;
+    }
 
-    return parsed;
+    DebianParsedRecordLoadResult result =
+        load_debian_package_records_incremental(packages_path, config, verbose);
+    if (verbose) {
+        std::cout << "[DEBUG] Debian parse cache reuse: "
+                  << result.reused_records << " reused, "
+                  << result.reparsed_records << " reparsed."
+                  << std::endl;
+    }
+    return result.records;
 }
 
 std::string debian_installed_size_kib_to_bytes_string(const std::string& kib_text) {
@@ -1798,8 +2023,12 @@ DebianIncrementalImportResult load_debian_index_entries_from_records_incremental
                   << " (" << (full_rebuild ? "full rebuild" : "incremental reuse") << ")."
                   << std::endl;
         if (!have_previous_cache && !cache_problem.empty()) {
-            std::cout << "[DEBUG] Debian compiled record cache unavailable: "
-                      << cache_problem << std::endl;
+            std::cout << "[DEBUG] "
+                      << describe_debian_cache_rebuild_reason(
+                             "Debian compiled record cache",
+                             cache_problem
+                         )
+                      << std::endl;
         }
     }
 
@@ -1954,6 +2183,14 @@ std::string get_debian_packages_cache_path() {
     return REPO_CACHE_PATH + "debian/Packages";
 }
 
+std::string get_debian_parsed_record_cache_path() {
+    return REPO_CACHE_PATH + "debian/Packages.records.bin";
+}
+
+std::string get_debian_parsed_record_state_path() {
+    return REPO_CACHE_PATH + "debian/Packages.records.state";
+}
+
 std::string get_debian_search_preview_path() {
     return REPO_CACHE_PATH + "debian/Packages.preview.json";
 }
@@ -1980,6 +2217,471 @@ std::string get_debian_compiled_record_cache_path() {
 
 std::string get_debian_compiled_record_state_path() {
     return REPO_CACHE_PATH + "debian/Packages.compiled.state";
+}
+
+std::string strip_debian_index_compression_suffix(const std::string& path) {
+    static const char* kSuffixes[] = {".gz", ".xz", ".bz2", ".lzma", ".zst", ".zstd"};
+    for (const char* suffix : kSuffixes) {
+        size_t len = std::strlen(suffix);
+        if (path.size() >= len && path.compare(path.size() - len, len, suffix) == 0) {
+            return path.substr(0, path.size() - len);
+        }
+    }
+    return path;
+}
+
+std::string get_debian_packages_diff_index_url(const std::string& packages_url) {
+    return strip_debian_index_compression_suffix(packages_url) + ".diff/Index";
+}
+
+std::string path_or_url_dirname(const std::string& path) {
+    size_t pos = path.find_last_of('/');
+    if (pos == std::string::npos) return path;
+    if (pos == 0) return path.substr(0, 1);
+    return path.substr(0, pos);
+}
+
+std::string normalize_debian_diff_patch_name(const std::string& value) {
+    if (value.size() > 3 && value.compare(value.size() - 3, 3, ".gz") == 0) {
+        return value.substr(0, value.size() - 3);
+    }
+    return value;
+}
+
+bool fetch_text_url(
+    const std::string& url,
+    std::string& text_out,
+    bool verbose,
+    std::string* error_out = nullptr
+) {
+    if (error_out) error_out->clear();
+
+    HttpOptions opts;
+    opts.method = "GET";
+    opts.follow_location = true;
+    opts.allow_connection_reuse = true;
+    opts.show_progress = false;
+    opts.verbose = verbose;
+
+    std::stringstream response;
+    if (!HttpRequest(url, response, opts, error_out)) return false;
+    text_out = response.str();
+    return true;
+}
+
+bool parse_debian_diff_index_entry_line(
+    const std::string& line,
+    DebianDiffIndexEntry& entry,
+    bool normalize_name,
+    bool require_name = true
+) {
+    entry = {};
+    std::istringstream iss(line);
+    std::string hash;
+    std::string size_text;
+    std::string name;
+    if (!(iss >> hash >> size_text)) return false;
+    if (!(iss >> name)) {
+        if (require_name) return false;
+        name.clear();
+    }
+
+    errno = 0;
+    char* end = nullptr;
+    long parsed_size = std::strtol(size_text.c_str(), &end, 10);
+    if (errno != 0 || end == size_text.c_str() || (end && *end != '\0')) return false;
+
+    entry.hash = hash;
+    entry.size = parsed_size;
+    entry.remote_name = name;
+    entry.name = normalize_name ? normalize_debian_diff_patch_name(name) : name;
+    return !entry.hash.empty() && (!require_name || !entry.name.empty());
+}
+
+bool parse_debian_packages_diff_index(
+    const std::string& text,
+    DebianPackagesDiffIndex& index,
+    std::string* error_out = nullptr
+) {
+    if (error_out) error_out->clear();
+    index = {};
+
+    std::vector<std::map<std::string, std::string>> stanzas = parse_debian_control_stanzas(text);
+    if (stanzas.empty()) {
+        if (error_out) *error_out = "PDiff index is empty";
+        return false;
+    }
+
+    const auto& stanza = stanzas.front();
+    auto current_it = stanza.find("SHA256-Current");
+    auto history_it = stanza.find("SHA256-History");
+    auto patches_it = stanza.find("SHA256-Patches");
+    auto downloads_it = stanza.find("SHA256-Download");
+    if (current_it == stanza.end() ||
+        history_it == stanza.end() ||
+        patches_it == stanza.end() ||
+        downloads_it == stanza.end()) {
+        if (error_out) *error_out = "PDiff index is missing required SHA256 fields";
+        return false;
+    }
+
+    {
+        DebianDiffIndexEntry current_entry;
+        if (!parse_debian_diff_index_entry_line(current_it->second, current_entry, false, false)) {
+            if (error_out) *error_out = "failed to parse SHA256-Current";
+            return false;
+        }
+        index.current_hash = current_entry.hash;
+        index.current_size = current_entry.size;
+    }
+
+    auto append_named_entries = [](
+        const std::string& raw_value,
+        bool normalize_name,
+        std::map<std::string, DebianDiffIndexEntry>& out_map
+    ) {
+        std::istringstream lines(raw_value);
+        std::string line;
+        while (std::getline(lines, line)) {
+            line = trim(line);
+            if (line.empty()) continue;
+
+            DebianDiffIndexEntry entry;
+            if (!parse_debian_diff_index_entry_line(line, entry, normalize_name)) continue;
+            out_map[entry.name] = entry;
+        }
+    };
+
+    {
+        std::istringstream lines(history_it->second);
+        std::string line;
+        while (std::getline(lines, line)) {
+            line = trim(line);
+            if (line.empty()) continue;
+
+            DebianDiffIndexEntry entry;
+            if (!parse_debian_diff_index_entry_line(line, entry, true)) continue;
+            index.history_by_hash[entry.hash] = entry;
+        }
+    }
+
+    append_named_entries(patches_it->second, true, index.patches_by_name);
+    append_named_entries(downloads_it->second, true, index.downloads_by_name);
+
+    if (index.current_hash.empty() ||
+        index.history_by_hash.empty() ||
+        index.patches_by_name.empty() ||
+        index.downloads_by_name.empty()) {
+        if (error_out) *error_out = "PDiff index does not contain a usable patch chain";
+        return false;
+    }
+
+    return true;
+}
+
+struct DebianEdPatchCommand {
+    long start = 0;
+    long end = 0;
+    char op = '\0';
+    std::vector<std::string> payload;
+};
+
+bool parse_debian_ed_patch_commands(
+    const std::string& patch_text,
+    std::vector<DebianEdPatchCommand>& commands,
+    std::string* error_out = nullptr
+) {
+    if (error_out) error_out->clear();
+    commands.clear();
+
+    std::istringstream input(patch_text);
+    std::string line;
+    while (std::getline(input, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty()) continue;
+
+        size_t pos = 0;
+        while (pos < line.size() && std::isdigit(static_cast<unsigned char>(line[pos]))) ++pos;
+        if (pos == 0) {
+            if (error_out) *error_out = "invalid ed patch command";
+            return false;
+        }
+
+        DebianEdPatchCommand command;
+        command.start = std::strtol(line.substr(0, pos).c_str(), nullptr, 10);
+        command.end = command.start;
+
+        if (pos < line.size() && line[pos] == ',') {
+            size_t rhs_start = ++pos;
+            while (pos < line.size() && std::isdigit(static_cast<unsigned char>(line[pos]))) ++pos;
+            if (rhs_start == pos) {
+                if (error_out) *error_out = "invalid ed patch range";
+                return false;
+            }
+            command.end = std::strtol(line.substr(rhs_start, pos - rhs_start).c_str(), nullptr, 10);
+        }
+
+        if (pos >= line.size()) {
+            if (error_out) *error_out = "missing ed patch opcode";
+            return false;
+        }
+        command.op = line[pos++];
+        if (pos != line.size() || (command.op != 'a' && command.op != 'c' && command.op != 'd')) {
+            if (error_out) *error_out = "unsupported ed patch opcode";
+            return false;
+        }
+
+        if (command.op == 'a' || command.op == 'c') {
+            bool terminated = false;
+            while (std::getline(input, line)) {
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                if (line == ".") {
+                    terminated = true;
+                    break;
+                }
+                command.payload.push_back(line);
+            }
+            if (!terminated) {
+                if (error_out) *error_out = "unterminated ed patch payload";
+                return false;
+            }
+        }
+
+        commands.push_back(std::move(command));
+    }
+
+    return true;
+}
+
+bool apply_debian_ed_patch_to_file(
+    const std::string& target_path,
+    const std::string& patch_path,
+    std::string* error_out = nullptr
+) {
+    if (error_out) error_out->clear();
+
+    std::ifstream target(target_path);
+    if (!target) {
+        if (error_out) *error_out = "failed to open local Packages file";
+        return false;
+    }
+
+    std::vector<std::string> lines;
+    std::string line;
+    while (std::getline(target, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        lines.push_back(line);
+    }
+    if (target.bad()) {
+        if (error_out) *error_out = "failed to read local Packages file";
+        return false;
+    }
+
+    std::ifstream patch_in(patch_path);
+    if (!patch_in) {
+        if (error_out) *error_out = "failed to open downloaded PDiff patch";
+        return false;
+    }
+    std::string patch_text(
+        (std::istreambuf_iterator<char>(patch_in)),
+        std::istreambuf_iterator<char>()
+    );
+
+    std::vector<DebianEdPatchCommand> commands;
+    if (!parse_debian_ed_patch_commands(patch_text, commands, error_out)) return false;
+
+    long previous_start = std::numeric_limits<long>::max();
+    for (const auto& command : commands) {
+        if (command.start > previous_start) {
+            if (error_out) *error_out = "PDiff patch commands are not reverse sorted";
+            return false;
+        }
+        previous_start = command.start;
+
+        if (command.op == 'a') {
+            if (command.start < 0 || command.start > static_cast<long>(lines.size())) {
+                if (error_out) *error_out = "PDiff append command is out of range";
+                return false;
+            }
+            lines.insert(lines.begin() + command.start, command.payload.begin(), command.payload.end());
+            continue;
+        }
+
+        if (command.start < 1 ||
+            command.end < command.start ||
+            command.end > static_cast<long>(lines.size())) {
+            if (error_out) *error_out = "PDiff command range is out of bounds";
+            return false;
+        }
+
+        auto erase_begin = lines.begin() + (command.start - 1);
+        auto erase_end = lines.begin() + command.end;
+        size_t insert_index = static_cast<size_t>(command.start - 1);
+        if (command.op == 'd') {
+            lines.erase(erase_begin, erase_end);
+            continue;
+        }
+
+        lines.erase(erase_begin, erase_end);
+        lines.insert(lines.begin() + insert_index, command.payload.begin(), command.payload.end());
+    }
+
+    std::string temp_path = target_path + ".pdiff.tmp";
+    std::ofstream out(temp_path, std::ios::trunc);
+    if (!out) {
+        if (error_out) *error_out = "failed to open patched Packages file";
+        return false;
+    }
+    for (const auto& item : lines) {
+        out << item << "\n";
+    }
+    out.close();
+    if (!out) {
+        remove(temp_path.c_str());
+        if (error_out) *error_out = "failed to write patched Packages file";
+        return false;
+    }
+
+    if (rename(temp_path.c_str(), target_path.c_str()) != 0) {
+        remove(temp_path.c_str());
+        if (error_out) *error_out = strerror(errno);
+        return false;
+    }
+
+    return true;
+}
+
+bool try_update_debian_packages_with_pdiff(
+    const DebianBackendConfig& config,
+    const std::string& packages_path,
+    bool verbose,
+    bool& changed_out,
+    size_t& patches_applied_out,
+    std::string* error_out = nullptr
+) {
+    changed_out = false;
+    patches_applied_out = 0;
+    if (error_out) error_out->clear();
+
+    if (access(packages_path.c_str(), F_OK) != 0) {
+        if (error_out) *error_out = "local Debian Packages cache is unavailable";
+        return false;
+    }
+
+    std::string diff_index_url = get_debian_packages_diff_index_url(config.packages_url);
+    std::string diff_text;
+    if (!fetch_text_url(diff_index_url, diff_text, verbose, error_out)) return false;
+
+    DebianPackagesDiffIndex diff_index;
+    if (!parse_debian_packages_diff_index(diff_text, diff_index, error_out)) return false;
+
+    std::string current_hash = sha256_hex_file(packages_path);
+    if (current_hash.empty()) {
+        if (error_out) *error_out = "failed to hash local Debian Packages cache";
+        return false;
+    }
+
+    if (current_hash == diff_index.current_hash) {
+        return true;
+    }
+
+    const size_t kMaxPatchChain = 64;
+    std::set<std::string> seen_hashes;
+    seen_hashes.insert(current_hash);
+    std::string patch_base_url = path_or_url_dirname(diff_index_url);
+    std::string temp_dir = REPO_CACHE_PATH + "debian/pdiff/";
+    if (!mkdir_p(temp_dir)) {
+        if (error_out) *error_out = "failed to create Debian PDiff cache directory";
+        return false;
+    }
+
+    while (current_hash != diff_index.current_hash) {
+        if (patches_applied_out >= kMaxPatchChain) {
+            if (error_out) *error_out = "PDiff chain is too long";
+            return false;
+        }
+
+        auto history_it = diff_index.history_by_hash.find(current_hash);
+        if (history_it == diff_index.history_by_hash.end()) {
+            if (error_out) *error_out = "no usable PDiff patch chain for the local Packages cache";
+            return false;
+        }
+
+        const std::string& patch_name = history_it->second.name;
+        auto patch_it = diff_index.patches_by_name.find(patch_name);
+        auto download_it = diff_index.downloads_by_name.find(patch_name);
+        if (patch_it == diff_index.patches_by_name.end() ||
+            download_it == diff_index.downloads_by_name.end()) {
+            if (error_out) *error_out = "PDiff metadata is incomplete";
+            return false;
+        }
+
+        std::string patch_gz_path = temp_dir + safe_repo_filename_component(download_it->second.remote_name);
+        std::string patch_txt_path = patch_gz_path + ".txt";
+        std::string patch_url = join_url_path(patch_base_url, download_it->second.remote_name);
+
+        std::string download_error;
+        if (!DownloadFile(patch_url, patch_gz_path, verbose, &download_error, false)) {
+            if (error_out) *error_out = download_error.empty()
+                ? "failed to download Debian PDiff patch"
+                : download_error;
+            remove(patch_gz_path.c_str());
+            return false;
+        }
+
+        std::string downloaded_hash = sha256_hex_file(patch_gz_path);
+        if (downloaded_hash.empty() || downloaded_hash != download_it->second.hash) {
+            remove(patch_gz_path.c_str());
+            if (error_out) *error_out = "downloaded Debian PDiff patch failed SHA256 verification";
+            return false;
+        }
+
+        std::string unpack_error;
+        if (!GpkgArchive::decompress_gzip_file(patch_gz_path, patch_txt_path, &unpack_error)) {
+            remove(patch_gz_path.c_str());
+            remove(patch_txt_path.c_str());
+            if (error_out) *error_out = unpack_error.empty()
+                ? "failed to unpack Debian PDiff patch"
+                : unpack_error;
+            return false;
+        }
+
+        std::string patch_hash = sha256_hex_file(patch_txt_path);
+        if (patch_hash.empty() || patch_hash != patch_it->second.hash) {
+            remove(patch_gz_path.c_str());
+            remove(patch_txt_path.c_str());
+            if (error_out) *error_out = "unpacked Debian PDiff patch failed SHA256 verification";
+            return false;
+        }
+
+        std::string apply_error;
+        if (!apply_debian_ed_patch_to_file(packages_path, patch_txt_path, &apply_error)) {
+            remove(patch_gz_path.c_str());
+            remove(patch_txt_path.c_str());
+            if (error_out) *error_out = apply_error.empty()
+                ? "failed to apply Debian PDiff patch"
+                : apply_error;
+            return false;
+        }
+
+        remove(patch_gz_path.c_str());
+        remove(patch_txt_path.c_str());
+
+        current_hash = sha256_hex_file(packages_path);
+        if (current_hash.empty()) {
+            if (error_out) *error_out = "failed to hash the patched Debian Packages cache";
+            return false;
+        }
+        if (!seen_hashes.insert(current_hash).second) {
+            if (error_out) *error_out = "PDiff patch chain loop detected";
+            return false;
+        }
+
+        changed_out = true;
+        ++patches_applied_out;
+    }
+
+    return true;
 }
 
 bool should_prefer_debian_search_preview_candidate(
@@ -2427,27 +3129,22 @@ bool ensure_raw_debian_context_loaded(
         return false;
     }
 
-    bool parsed_any_records = false;
-    if (!for_each_debian_package_record(
-            context.packages_path,
-            context.config,
-            verbose,
-            [&](const DebianPackageRecord& record) {
-                parsed_any_records = true;
-                context.available_packages.insert(record.package);
-
-                auto existing = context.records_by_name.find(record.package);
-                if (existing == context.records_by_name.end() ||
-                    compare_versions(record.version, existing->second.version) > 0) {
-                    context.records_by_name[record.package] = record;
-                }
-                return true;
-            }
-        ) ||
-        !parsed_any_records) {
+    std::vector<DebianPackageRecord> parsed_records =
+        parse_debian_packages_file(context.packages_path, context.config, verbose);
+    if (parsed_records.empty()) {
         context.problem = "cached Debian metadata could not be parsed; run 'gpkg update'";
         if (error_out) *error_out = context.problem;
         return false;
+    }
+
+    for (const auto& record : parsed_records) {
+        context.available_packages.insert(record.package);
+
+        auto existing = context.records_by_name.find(record.package);
+        if (existing == context.records_by_name.end() ||
+            compare_versions(record.version, existing->second.version) > 0) {
+            context.records_by_name[record.package] = record;
+        }
     }
 
     std::vector<DebianPackageRecord> latest_records;
@@ -2911,12 +3608,466 @@ bool dependency_watch_symbols_intersect(
     return false;
 }
 
+std::string build_debian_parsed_record_cache_schema_fingerprint(const DebianBackendConfig& config) {
+    return "phase1|" +
+        debian_cache_fingerprint_component(DEBIAN_CONFIG_PATH) + "|" +
+        config.packages_url + "|" +
+        config.apt_arch;
+}
+
+std::string build_debian_parsed_record_packages_fingerprint(const std::string& packages_path) {
+    return "pkg1|" + debian_cache_fingerprint_component(packages_path);
+}
+
 std::string build_debian_compiled_record_cache_policy_fingerprint() {
     return "phase2|" +
         debian_cache_fingerprint_component(IMPORT_POLICY_PATH) + "|" +
         debian_cache_fingerprint_component(DEBIAN_CONFIG_PATH) + "|" +
         debian_cache_fingerprint_component(SYSTEM_PROVIDES_PATH) + "|" +
         debian_cache_fingerprint_component(UPGRADEABLE_SYSTEM_PATH);
+}
+
+std::string describe_debian_cache_rebuild_reason(
+    const std::string& cache_name,
+    const std::string& reason
+) {
+    if (reason.empty()) return "";
+
+    if (reason.find("is unavailable") != std::string::npos) {
+        return cache_name + " not present yet; building it for future updates.";
+    }
+
+    if (reason.find("does not match") != std::string::npos ||
+        reason.find("fingerprint does not match") != std::string::npos) {
+        return cache_name + " no longer matches the current inputs; rebuilding it.";
+    }
+
+    return cache_name + " could not be reused (" + reason + "); rebuilding it.";
+}
+
+bool load_debian_parsed_record_cache_state(
+    const std::string& path,
+    DebianParsedRecordCacheState& state
+) {
+    std::ifstream f(path);
+    if (!f) return false;
+
+    state = {};
+    std::string line;
+    while (std::getline(f, line)) {
+        line = trim(line);
+        if (line.empty() || line[0] == '#') continue;
+
+        size_t eq = line.find('=');
+        if (eq == std::string::npos) continue;
+
+        std::string key = trim(line.substr(0, eq));
+        std::string value = line.substr(eq + 1);
+        if (key == "SCHEMA_FINGERPRINT") state.schema_fingerprint = value;
+        else if (key == "PACKAGES_FINGERPRINT") state.packages_fingerprint = value;
+        else if (key == "RECORD_COUNT") state.record_count = static_cast<size_t>(std::strtoull(value.c_str(), nullptr, 10));
+    }
+
+    return !state.schema_fingerprint.empty();
+}
+
+bool save_debian_parsed_record_cache_state(
+    const std::string& path,
+    const DebianParsedRecordCacheState& state
+) {
+    if (!mkdir_parent(path)) return false;
+
+    std::string temp_path = path + ".tmp";
+    std::ofstream out(temp_path, std::ios::trunc);
+    if (!out) return false;
+
+    out << "SCHEMA_FINGERPRINT=" << state.schema_fingerprint << "\n";
+    out << "PACKAGES_FINGERPRINT=" << state.packages_fingerprint << "\n";
+    out << "RECORD_COUNT=" << state.record_count << "\n";
+    out.close();
+
+    if (!out) {
+        remove(temp_path.c_str());
+        return false;
+    }
+
+    if (rename(temp_path.c_str(), path.c_str()) != 0) {
+        remove(temp_path.c_str());
+        return false;
+    }
+
+    return true;
+}
+
+bool load_debian_parsed_record_cache_entries(
+    const std::string& schema_fingerprint,
+    std::map<std::string, DebianParsedRecordCacheEntry>& entries_by_fingerprint,
+    std::string* error_out = nullptr
+) {
+    if (error_out) error_out->clear();
+    entries_by_fingerprint.clear();
+
+    std::string cache_path = get_debian_parsed_record_cache_path();
+    std::string state_path = get_debian_parsed_record_state_path();
+    if (access(cache_path.c_str(), F_OK) != 0 || access(state_path.c_str(), F_OK) != 0) {
+        if (error_out) *error_out = "parsed record cache is unavailable";
+        return false;
+    }
+
+    DebianParsedRecordCacheState state;
+    if (!load_debian_parsed_record_cache_state(state_path, state)) {
+        if (error_out) *error_out = "parsed record cache state could not be read";
+        return false;
+    }
+    if (state.schema_fingerprint != schema_fingerprint) {
+        if (error_out) *error_out = "parsed record cache schema does not match";
+        return false;
+    }
+
+    std::string cache_error;
+    if (!foreach_debian_binary_cache_entry<DebianParsedRecordCacheEntry>(
+            cache_path,
+            DEBIAN_PARSED_RECORD_CACHE_MAGIC,
+            [](std::istream& in, DebianParsedRecordCacheEntry& entry) {
+                return read_debian_parsed_record_cache_entry_binary(in, entry);
+            },
+            [&](const DebianParsedRecordCacheEntry& entry) {
+                if (entry.stanza_fingerprint.empty()) return true;
+                entries_by_fingerprint[entry.stanza_fingerprint] = entry;
+                return true;
+            },
+            &cache_error
+        )) {
+        entries_by_fingerprint.clear();
+        if (error_out) *error_out = cache_error;
+        return false;
+    }
+
+    return !entries_by_fingerprint.empty();
+}
+
+bool load_current_debian_parsed_record_cache(
+    const std::string& packages_path,
+    const DebianBackendConfig& config,
+    std::vector<DebianPackageRecord>& records,
+    std::string* error_out
+) {
+    if (error_out) error_out->clear();
+    records.clear();
+
+    std::string cache_path = get_debian_parsed_record_cache_path();
+    std::string state_path = get_debian_parsed_record_state_path();
+    if (access(cache_path.c_str(), F_OK) != 0 || access(state_path.c_str(), F_OK) != 0) {
+        if (error_out) *error_out = "parsed record cache is unavailable";
+        return false;
+    }
+
+    DebianParsedRecordCacheState state;
+    if (!load_debian_parsed_record_cache_state(state_path, state)) {
+        if (error_out) *error_out = "parsed record cache state could not be read";
+        return false;
+    }
+
+    std::string schema_fingerprint = build_debian_parsed_record_cache_schema_fingerprint(config);
+    if (state.schema_fingerprint != schema_fingerprint) {
+        if (error_out) *error_out = "parsed record cache schema does not match";
+        return false;
+    }
+
+    std::string packages_fingerprint = build_debian_parsed_record_packages_fingerprint(packages_path);
+    if (state.packages_fingerprint != packages_fingerprint) {
+        if (error_out) *error_out = "parsed record cache does not match the current Packages file";
+        return false;
+    }
+
+    std::string cache_error;
+    if (!foreach_debian_binary_cache_entry<DebianParsedRecordCacheEntry>(
+            cache_path,
+            DEBIAN_PARSED_RECORD_CACHE_MAGIC,
+            [](std::istream& in, DebianParsedRecordCacheEntry& entry) {
+                return read_debian_parsed_record_cache_entry_binary(in, entry);
+            },
+            [&](const DebianParsedRecordCacheEntry& entry) {
+                records.push_back(entry.record);
+                return true;
+            },
+            &cache_error
+        )) {
+        records.clear();
+        if (error_out) *error_out = cache_error;
+        return false;
+    }
+
+    if (records.empty()) {
+        if (error_out) *error_out = "parsed record cache is empty";
+        return false;
+    }
+
+    return true;
+}
+
+bool write_debian_parsed_record_cache(
+    const std::vector<DebianParsedRecordCacheEntry>& entries,
+    const std::string& schema_fingerprint,
+    const std::string& packages_fingerprint,
+    std::string* error_out = nullptr
+) {
+    if (error_out) *error_out = "";
+
+    std::string cache_path = get_debian_parsed_record_cache_path();
+    if (!write_debian_binary_cache(
+            cache_path,
+            DEBIAN_PARSED_RECORD_CACHE_MAGIC,
+            entries,
+            [](std::ostream& out, const DebianParsedRecordCacheEntry& entry) {
+                return write_debian_parsed_record_cache_entry_binary(out, entry);
+            },
+            error_out
+        )) {
+        return false;
+    }
+
+    DebianParsedRecordCacheState state;
+    state.schema_fingerprint = schema_fingerprint;
+    state.packages_fingerprint = packages_fingerprint;
+    state.record_count = entries.size();
+    if (!save_debian_parsed_record_cache_state(get_debian_parsed_record_state_path(), state)) {
+        if (error_out) *error_out = "failed to persist parsed record cache state";
+        return false;
+    }
+
+    return true;
+}
+
+bool collect_debian_package_stanza_spans(
+    const std::string& packages_path,
+    std::vector<DebianStanzaSpan>& spans,
+    std::string* error_out
+) {
+    if (error_out) error_out->clear();
+    spans.clear();
+
+    std::ifstream in(packages_path, std::ios::binary);
+    if (!in) {
+        if (error_out) *error_out = "failed to open Debian Packages file";
+        return false;
+    }
+
+    bool in_stanza = false;
+    std::streamoff stanza_start = 0;
+    std::string raw_line;
+    while (true) {
+        std::streamoff line_start = in.tellg();
+        if (!std::getline(in, raw_line)) {
+            if (in.bad()) {
+                if (error_out) *error_out = "failed while scanning Debian Packages file";
+                return false;
+            }
+
+            std::streamoff file_end = in.tellg();
+            if (file_end < 0) {
+                in.clear();
+                in.seekg(0, std::ios::end);
+                file_end = in.tellg();
+            }
+
+            if (in_stanza && file_end >= stanza_start) {
+                spans.push_back({stanza_start, static_cast<size_t>(file_end - stanza_start)});
+            }
+            break;
+        }
+
+        std::streamoff next_pos = in.tellg();
+        if (next_pos < 0) {
+            in.clear();
+            in.seekg(0, std::ios::end);
+            next_pos = in.tellg();
+        }
+
+        if (!raw_line.empty() && raw_line.back() == '\r') raw_line.pop_back();
+        if (trim(raw_line).empty()) {
+            if (in_stanza && line_start >= stanza_start) {
+                spans.push_back({stanza_start, static_cast<size_t>(line_start - stanza_start)});
+                in_stanza = false;
+            }
+            stanza_start = next_pos;
+            continue;
+        }
+
+        if (!in_stanza) {
+            stanza_start = line_start;
+            in_stanza = true;
+        }
+    }
+
+    return true;
+}
+
+bool read_debian_stanza_text(
+    std::ifstream& in,
+    const DebianStanzaSpan& span,
+    std::string& text_out
+) {
+    text_out.clear();
+    in.clear();
+    in.seekg(span.offset);
+    if (!in) return false;
+    if (span.size == 0) return true;
+
+    text_out.resize(span.size);
+    in.read(&text_out[0], static_cast<std::streamsize>(span.size));
+    return in.good() || (in.eof() && static_cast<size_t>(in.gcount()) == span.size);
+}
+
+DebianParsedRecordLoadResult load_debian_package_records_incremental(
+    const std::string& packages_path,
+    const DebianBackendConfig& config,
+    bool verbose
+) {
+    DebianParsedRecordLoadResult result;
+
+    std::string schema_fingerprint = build_debian_parsed_record_cache_schema_fingerprint(config);
+    std::map<std::string, DebianParsedRecordCacheEntry> previous_entries_by_fingerprint;
+    std::string cache_problem;
+    bool have_previous_cache = load_debian_parsed_record_cache_entries(
+        schema_fingerprint,
+        previous_entries_by_fingerprint,
+        &cache_problem
+    );
+
+    std::vector<DebianStanzaSpan> spans;
+    std::string spans_error;
+    if (!collect_debian_package_stanza_spans(packages_path, spans, &spans_error)) {
+        if (verbose) {
+            std::cout << "[DEBUG] Failed to prepare Debian Packages stanzas for parsing: "
+                      << spans_error << std::endl;
+        }
+        return result;
+    }
+
+    if (spans.empty()) {
+        if (verbose) {
+            std::cout << "[DEBUG] Debian Packages file does not contain any package stanzas."
+                      << std::endl;
+        }
+        return result;
+    }
+
+    const size_t worker_count = recommended_parallel_worker_count(spans.size());
+    if (verbose) {
+        std::cout << "[DEBUG] Parsing Debian Packages with "
+                  << worker_count << " worker(s) across "
+                  << spans.size() << " stanza(s)." << std::endl;
+    }
+
+    struct ParsedStanzaResult {
+        bool has_record = false;
+        DebianParsedRecordCacheEntry cache_entry;
+    };
+
+    std::vector<ParsedStanzaResult> parsed_results(spans.size());
+    std::atomic<size_t> next_span{0};
+    std::atomic<bool> worker_failed{false};
+    std::mutex worker_error_mutex;
+    std::string worker_error;
+    std::vector<size_t> worker_reused(worker_count, 0);
+    std::vector<size_t> worker_reparsed(worker_count, 0);
+
+    auto worker = [&](size_t worker_index) {
+        std::ifstream in(packages_path, std::ios::binary);
+        if (!in) {
+            std::lock_guard<std::mutex> lock(worker_error_mutex);
+            if (worker_error.empty()) worker_error = "failed to open Debian Packages file";
+            worker_failed.store(true);
+            return;
+        }
+
+        std::string stanza_text;
+        while (true) {
+            if (worker_failed.load()) return;
+
+            size_t span_index = next_span.fetch_add(1);
+            if (span_index >= spans.size()) return;
+
+            if (!read_debian_stanza_text(in, spans[span_index], stanza_text)) {
+                std::lock_guard<std::mutex> lock(worker_error_mutex);
+                if (worker_error.empty()) {
+                    worker_error = "failed to read Debian Packages stanza " +
+                                   std::to_string(span_index + 1);
+                }
+                worker_failed.store(true);
+                return;
+            }
+
+            std::string stanza_fingerprint = sha256_hex_digest(stanza_text);
+            auto previous_it = previous_entries_by_fingerprint.find(stanza_fingerprint);
+            if (previous_it != previous_entries_by_fingerprint.end()) {
+                parsed_results[span_index].has_record = true;
+                parsed_results[span_index].cache_entry = previous_it->second;
+                ++worker_reused[worker_index];
+                continue;
+            }
+
+            DebianPackageRecord record;
+            if (parse_debian_package_record_from_stanza(stanza_text, config, verbose, record)) {
+                parsed_results[span_index].has_record = true;
+                parsed_results[span_index].cache_entry.stanza_fingerprint = stanza_fingerprint;
+                parsed_results[span_index].cache_entry.record = std::move(record);
+            }
+
+            ++worker_reparsed[worker_index];
+        }
+    };
+
+    std::vector<std::thread> workers;
+    workers.reserve(worker_count > 0 ? worker_count - 1 : 0);
+    for (size_t worker_index = 1; worker_index < worker_count; ++worker_index) {
+        workers.emplace_back(worker, worker_index);
+    }
+    worker(0);
+    for (auto& thread : workers) thread.join();
+
+    if (worker_failed.load()) {
+        if (verbose) {
+            std::cout << "[DEBUG] Failed while parsing Debian Packages stanzas: "
+                      << worker_error << std::endl;
+        }
+        return result;
+    }
+
+    for (size_t worker_index = 0; worker_index < worker_count; ++worker_index) {
+        result.reused_records += worker_reused[worker_index];
+        result.reparsed_records += worker_reparsed[worker_index];
+    }
+
+    result.cache_entries.reserve(spans.size());
+    result.records.reserve(spans.size());
+    for (const auto& parsed_result : parsed_results) {
+        if (!parsed_result.has_record) continue;
+        result.cache_entries.push_back(parsed_result.cache_entry);
+        result.records.push_back(parsed_result.cache_entry.record);
+    }
+
+    std::string write_error;
+    std::string packages_fingerprint = build_debian_parsed_record_packages_fingerprint(packages_path);
+    if (!write_debian_parsed_record_cache(
+            result.cache_entries,
+            schema_fingerprint,
+            packages_fingerprint,
+            &write_error
+        ) && verbose) {
+        std::cout << "[DEBUG] Failed to refresh Debian parsed-record cache: "
+                  << write_error << std::endl;
+    } else if (verbose && !have_previous_cache && !cache_problem.empty()) {
+        std::cout << "[DEBUG] "
+                  << describe_debian_cache_rebuild_reason(
+                         "Debian parsed-record cache",
+                         cache_problem
+                     )
+                  << std::endl;
+    }
+
+    return result;
 }
 
 bool load_debian_imported_index_cache_state(
@@ -3394,6 +4545,35 @@ bool update_debian_backend_index(
         VLOG(verbose, "Debian Packages index is unchanged on the server; reusing cached copy.");
     } else if (verbose && !have_remote_state && !probe_error.empty()) {
         VLOG(verbose, "Unable to probe Debian Packages metadata; falling back to full download: " << probe_error);
+    }
+
+    if (needs_download) {
+        bool pdiff_changed = false;
+        size_t pdiff_patches_applied = 0;
+        std::string pdiff_error;
+        if (have_packages_txt) {
+            if (try_update_debian_packages_with_pdiff(
+                    config,
+                    packages_txt,
+                    verbose,
+                    pdiff_changed,
+                    pdiff_patches_applied,
+                    &pdiff_error
+                )) {
+                needs_download = false;
+                if (pdiff_changed) {
+                    std::cout << Color::GREEN << "✓ Updated Debian Packages index via PDiff"
+                              << " (" << pdiff_patches_applied << " patch"
+                              << (pdiff_patches_applied == 1 ? "" : "es") << ")"
+                              << Color::RESET << std::endl;
+                } else {
+                    VLOG(verbose, "Debian PDiff metadata confirmed that the cached Packages file is already current.");
+                }
+            } else if (verbose && !pdiff_error.empty()) {
+                VLOG(verbose, "Unable to apply Debian PDiffs; falling back to full Packages download: "
+                             << pdiff_error);
+            }
+        }
     }
 
     if (needs_download) {
