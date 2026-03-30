@@ -1749,7 +1749,7 @@ int execute_removal_plan(
     const std::vector<std::string>& to_purge,
     bool verbose
 ) {
-    const bool mutated_runtime_state = !to_remove.empty() || !to_purge.empty();
+    bool mutated_runtime_state = false;
     if (to_remove.empty() && to_purge.empty()) {
         std::cout << "Nothing to do." << std::endl;
         return 0;
@@ -1789,6 +1789,7 @@ int execute_removal_plan(
             InstallCommandResult result = remove_package_by_name(pkg, verbose);
             if (!result.success) {
                 if (!verbose) finish_progress_line(&remove_progress_width);
+                if (mutated_runtime_state) queue_runtime_linker_state_refresh();
                 std::cerr << Color::RED << "E: Failed to remove " << pkg << Color::RESET << std::endl;
                 if (!verbose && !result.log_path.empty()) {
                     std::cerr << " See " << result.log_path << " for details.";
@@ -1796,6 +1797,7 @@ int execute_removal_plan(
                 std::cerr << std::endl;
                 return 1;
             }
+            mutated_runtime_state = true;
             check_triggers(removed_files);
             if (!verbose) render_package_progress("current", i + 1, to_remove.size(), pkg, &remove_progress_width);
         }
@@ -1814,6 +1816,7 @@ int execute_removal_plan(
             InstallCommandResult result = purge_package_by_name(pkg, verbose);
             if (!result.success) {
                 if (!verbose) finish_progress_line(&purge_progress_width);
+                if (mutated_runtime_state) queue_runtime_linker_state_refresh();
                 std::cerr << Color::RED << "E: Failed to purge " << pkg << Color::RESET << std::endl;
                 if (!verbose && !result.log_path.empty()) {
                     std::cerr << " See " << result.log_path << " for details.";
@@ -1821,8 +1824,10 @@ int execute_removal_plan(
                 std::cerr << std::endl;
                 return 1;
             }
+            mutated_runtime_state = true;
             if (!erase_package_auto_installed_state(pkg)) {
                 if (!verbose) finish_progress_line(&purge_progress_width);
+                if (mutated_runtime_state) queue_runtime_linker_state_refresh();
                 std::cerr << Color::RED << "E: Failed to update gpkg auto-install state for "
                           << pkg << Color::RESET << std::endl;
                 return 1;
@@ -2900,6 +2905,7 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
     size_t installed_count = 0;
     std::vector<std::string> failures;
     size_t install_progress_width = 0;
+    bool mutated_runtime_state = false;
     std::cout << Color::CYAN << "[*] Installing " << upgrade_queue.size()
               << " package(s)..." << Color::RESET << std::endl;
     for (size_t i = 0; i < upgrade_queue.size(); ++i) {
@@ -2922,6 +2928,7 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
             break;
         }
 
+        mutated_runtime_state = true;
         queue_triggers_for_package(upgrade_queue[i].name);
         if (!update_package_auto_install_state_after_install(
                 upgrade_queue[i].name,
@@ -2958,6 +2965,7 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
                     failures.push_back(retired_pkg);
                     break;
                 }
+                mutated_runtime_state = true;
             }
             if (!failures.empty()) break;
         }
@@ -2980,6 +2988,7 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
                   << download_report.reused_count << " reused from cache, "
                   << format_total_bytes(download_report.downloaded_bytes) << " transferred."
                   << Color::RESET << std::endl;
+        if (mutated_runtime_state) queue_runtime_linker_state_refresh();
         std::cerr << Color::RED << "E: Upgrade completed with failures: "
                   << join_strings(failures) << Color::RESET << std::endl;
         return 1;
@@ -2995,7 +3004,7 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
               << format_total_bytes(download_report.downloaded_bytes) << " transferred."
               << Color::RESET << std::endl;
 
-    queue_runtime_linker_state_refresh();
+    if (mutated_runtime_state) queue_runtime_linker_state_refresh();
     return 0;
 }
 
@@ -3341,6 +3350,7 @@ int handle_repair(bool verbose) {
     size_t repaired_count = 0;
     size_t install_progress_width = 0;
     std::vector<std::string> failures;
+    bool mutated_runtime_state = false;
     for (size_t i = 0; i < repair_queue.size(); ++i) {
         if (!verbose) render_package_progress("current", i, repair_queue.size(), repair_queue[i].name, &install_progress_width);
         InstallCommandResult result = install_package_v2(repair_queue[i], verbose);
@@ -3355,6 +3365,7 @@ int handle_repair(bool verbose) {
             failures.push_back(repair_queue[i].name);
             break;
         }
+        mutated_runtime_state = true;
         queue_triggers_for_package(repair_queue[i].name);
         if (!update_package_auto_install_state_after_install(
                 repair_queue[i].name,
@@ -3390,6 +3401,7 @@ int handle_repair(bool verbose) {
                     failures.push_back(retired_pkg);
                     break;
                 }
+                mutated_runtime_state = true;
             }
             if (!failures.empty()) break;
         }
@@ -3399,6 +3411,7 @@ int handle_repair(bool verbose) {
     if (!verbose) finish_progress_line(&install_progress_width);
 
     if (!failures.empty()) {
+        if (mutated_runtime_state) queue_runtime_linker_state_refresh();
         return 1;
     }
 
@@ -3408,10 +3421,12 @@ int handle_repair(bool verbose) {
     std::cout << "Rechecking package state..." << std::endl;
     RepairInspection after_repair = inspect_repair_state(false);
     if (after_repair.detected_issues.empty()) {
-        queue_runtime_linker_state_refresh();
+        if (mutated_runtime_state) queue_runtime_linker_state_refresh();
         std::cout << Color::GREEN << "✓ Repair completed successfully." << Color::RESET << std::endl;
         return 0;
     }
+
+    if (mutated_runtime_state) queue_runtime_linker_state_refresh();
 
     std::cerr << Color::YELLOW
               << "W: Repair completed, but some issues remain:"
@@ -3718,6 +3733,7 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
         }
     }
     if (!failed_downloads.empty()) {
+        if (mutated_runtime_state) queue_runtime_linker_state_refresh();
         std::cerr << Color::RED << "E: Aborting install because these packages could not be fetched safely: "
                   << join_strings(failed_downloads) << Color::RESET << std::endl;
         return 1;
@@ -3725,6 +3741,7 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
 
     std::vector<std::string> failed_preparation;
     if (!prepare_install_archives(install_queue, download_report, verbose, failed_preparation)) {
+        if (mutated_runtime_state) queue_runtime_linker_state_refresh();
         std::cerr << Color::RED << "E: Aborting install because these packages could not be prepared safely: "
                   << join_strings(failed_preparation) << Color::RESET << std::endl;
         return 1;
@@ -3739,6 +3756,7 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
         InstallCommandResult result = install_package_v2(install_queue[i], verbose);
         if (!result.success) {
             if (!verbose) finish_progress_line(&install_progress_width);
+            if (mutated_runtime_state) queue_runtime_linker_state_refresh();
             std::cerr << Color::RED << "E: Installation stopped at " << install_queue[i].name
                       << ". " << installed_count << " package(s) were installed before the failure."
                       << Color::RESET;
@@ -3748,12 +3766,14 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
             std::cerr << std::endl;
             return 1;
         }
+        mutated_runtime_state = true;
         queue_triggers_for_package(install_queue[i].name);
         if (!update_package_auto_install_state_after_install(
                 install_queue[i].name,
                 explicit_manual_targets.count(install_queue[i].name) != 0,
                 installed_cache)) {
             if (!verbose) finish_progress_line(&install_progress_width);
+            if (mutated_runtime_state) queue_runtime_linker_state_refresh();
             std::cerr << Color::RED << "E: Failed to update gpkg auto-install state for "
                       << install_queue[i].name << Color::RESET << std::endl;
             return 1;
@@ -3765,6 +3785,7 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
                 InstallCommandResult retire_result = retire_package_by_name(retired_pkg, verbose);
                 if (!retire_result.success) {
                     if (!verbose) finish_progress_line(&install_progress_width);
+                    if (mutated_runtime_state) queue_runtime_linker_state_refresh();
                     std::cerr << Color::RED << "E: Failed to retire replaced package " << retired_pkg
                               << Color::RESET;
                     if (!verbose && !retire_result.log_path.empty()) {
@@ -3776,13 +3797,14 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
                 check_triggers(retired_files);
                 if (!erase_package_auto_installed_state(retired_pkg)) {
                     if (!verbose) finish_progress_line(&install_progress_width);
+                    if (mutated_runtime_state) queue_runtime_linker_state_refresh();
                     std::cerr << Color::RED << "E: Failed to update gpkg auto-install state for "
                               << retired_pkg << Color::RESET << std::endl;
                     return 1;
                 }
+                mutated_runtime_state = true;
             }
         }
-        mutated_runtime_state = true;
         ++installed_count;
         if (!verbose) render_package_progress("current", i + 1, install_queue.size(), install_queue[i].name, &install_progress_width);
     }

@@ -50,6 +50,7 @@ struct InstalledManifestSnapshot {
     std::vector<std::string> installed_packages;
     std::map<std::string, std::vector<std::string>> file_lists_by_package;
     std::map<std::string, std::string> owner_by_path;
+    std::map<std::string, std::string> base_owner_by_path;
 };
 
 std::string g_tmp_extract_path;
@@ -137,7 +138,9 @@ bool backup_live_path_if_present(
     bool* had_existing
 );
 const InstalledManifestSnapshot& ensure_installed_manifest_snapshot();
+void invalidate_installed_manifest_snapshot();
 std::string find_cached_file_owner(const std::string& pkg_name, const std::string& file_path);
+std::string find_cached_base_file_owner(const std::string& file_path);
 
 // Logging
 bool g_verbose = false;
@@ -1677,6 +1680,215 @@ std::vector<std::string> get_installed_packages_from_disk(const std::string& ext
 
 InstalledManifestSnapshot g_installed_manifest_snapshot;
 
+std::string get_base_system_registry_path() {
+    return g_root_prefix + "/usr/share/gpkg/base-system.json";
+}
+
+unsigned int json_hex_digit_value(char c) {
+    if (c >= '0' && c <= '9') return static_cast<unsigned int>(c - '0');
+    if (c >= 'a' && c <= 'f') return static_cast<unsigned int>(10 + (c - 'a'));
+    if (c >= 'A' && c <= 'F') return static_cast<unsigned int>(10 + (c - 'A'));
+    return 0;
+}
+
+void append_json_utf8_codepoint(std::string& out, unsigned int codepoint) {
+    if (codepoint <= 0x7F) {
+        out += static_cast<char>(codepoint);
+    } else if (codepoint <= 0x7FF) {
+        out += static_cast<char>(0xC0 | ((codepoint >> 6) & 0x1F));
+        out += static_cast<char>(0x80 | (codepoint & 0x3F));
+    } else if (codepoint <= 0xFFFF) {
+        out += static_cast<char>(0xE0 | ((codepoint >> 12) & 0x0F));
+        out += static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F));
+        out += static_cast<char>(0x80 | (codepoint & 0x3F));
+    } else {
+        out += static_cast<char>(0xF0 | ((codepoint >> 18) & 0x07));
+        out += static_cast<char>(0x80 | ((codepoint >> 12) & 0x3F));
+        out += static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F));
+        out += static_cast<char>(0x80 | (codepoint & 0x3F));
+    }
+}
+
+std::string json_unescape_token(const std::string& input) {
+    std::string output;
+    output.reserve(input.size());
+
+    for (size_t i = 0; i < input.size(); ++i) {
+        char c = input[i];
+        if (c != '\\' || i + 1 >= input.size()) {
+            output += c;
+            continue;
+        }
+
+        char esc = input[++i];
+        switch (esc) {
+            case '"': output += '"'; break;
+            case '\\': output += '\\'; break;
+            case '/': output += '/'; break;
+            case 'b': output += '\b'; break;
+            case 'f': output += '\f'; break;
+            case 'n': output += '\n'; break;
+            case 'r': output += '\r'; break;
+            case 't': output += '\t'; break;
+            case 'u': {
+                if (i + 4 >= input.size()) {
+                    output += "\\u";
+                    break;
+                }
+
+                bool valid = true;
+                unsigned int codepoint = 0;
+                for (size_t j = 0; j < 4; ++j) {
+                    char hex = input[i + 1 + j];
+                    if (!std::isxdigit(static_cast<unsigned char>(hex))) {
+                        valid = false;
+                        break;
+                    }
+                    codepoint = (codepoint << 4) | json_hex_digit_value(hex);
+                }
+
+                if (!valid) {
+                    output += "\\u";
+                    break;
+                }
+
+                append_json_utf8_codepoint(output, codepoint);
+                i += 4;
+                break;
+            }
+            default:
+                output += esc;
+                break;
+        }
+    }
+
+    return output;
+}
+
+template <typename Func>
+void foreach_json_object_in_file(const std::string& filepath, Func callback) {
+    std::ifstream f(filepath);
+    if (!f) return;
+
+    std::string obj;
+    obj.reserve(8192);
+
+    bool in_string = false;
+    bool escape = false;
+    int depth = 0;
+    char ch = '\0';
+    while (f.get(ch)) {
+        if (depth == 0) {
+            if (ch != '{') continue;
+            obj.clear();
+            obj.push_back(ch);
+            depth = 1;
+            in_string = false;
+            escape = false;
+            continue;
+        }
+
+        obj.push_back(ch);
+
+        if (escape) {
+            escape = false;
+            continue;
+        }
+        if (ch == '\\' && in_string) {
+            escape = true;
+            continue;
+        }
+        if (ch == '"') {
+            in_string = !in_string;
+            continue;
+        }
+        if (in_string) continue;
+
+        if (ch == '{') {
+            ++depth;
+            continue;
+        }
+        if (ch == '}') {
+            --depth;
+            if (depth == 0) {
+                if (!callback(obj)) break;
+                obj.clear();
+            }
+        }
+    }
+}
+
+bool get_json_string_value_from_object(const std::string& obj, const std::string& key, std::string& out_val) {
+    size_t key_pos = obj.find("\"" + key + "\"");
+    if (key_pos == std::string::npos) return false;
+
+    size_t colon = obj.find(':', key_pos);
+    if (colon == std::string::npos) return false;
+
+    size_t value_start = obj.find('"', colon);
+    if (value_start == std::string::npos) return false;
+
+    size_t value_end = obj.find('"', value_start + 1);
+    while (value_end != std::string::npos && obj[value_end - 1] == '\\') {
+        value_end = obj.find('"', value_end + 1);
+    }
+    if (value_end == std::string::npos) return false;
+
+    out_val = json_unescape_token(obj.substr(value_start + 1, value_end - value_start - 1));
+    return true;
+}
+
+bool get_json_string_array_from_object(
+    const std::string& obj,
+    const std::string& key,
+    std::vector<std::string>& out_arr
+) {
+    out_arr.clear();
+
+    size_t key_pos = obj.find("\"" + key + "\"");
+    if (key_pos == std::string::npos) return false;
+
+    size_t colon = obj.find(':', key_pos);
+    size_t arr_start = obj.find('[', colon);
+    size_t arr_end = obj.find(']', arr_start);
+    if (arr_start == std::string::npos || arr_end == std::string::npos) return false;
+
+    size_t pos = arr_start + 1;
+    while (pos < arr_end) {
+        size_t value_start = obj.find('"', pos);
+        if (value_start == std::string::npos || value_start >= arr_end) break;
+
+        size_t value_end = obj.find('"', value_start + 1);
+        while (value_end != std::string::npos && obj[value_end - 1] == '\\') {
+            value_end = obj.find('"', value_end + 1);
+        }
+        if (value_end == std::string::npos || value_end > arr_end) break;
+
+        out_arr.push_back(
+            json_unescape_token(obj.substr(value_start + 1, value_end - value_start - 1))
+        );
+        pos = value_end + 1;
+    }
+
+    return true;
+}
+
+void populate_base_system_owner_map(std::map<std::string, std::string>& owner_by_path) {
+    foreach_json_object_in_file(get_base_system_registry_path(), [&](const std::string& obj) {
+        std::string package;
+        std::vector<std::string> files;
+        if (!get_json_string_value_from_object(obj, "package", package)) return true;
+        if (!get_json_string_array_from_object(obj, "files", files)) return true;
+
+        for (const auto& owned_path : files) {
+            std::string canonical_path = canonical_multiarch_logical_path(owned_path);
+            if (canonical_path.empty()) continue;
+            owner_by_path.emplace(canonical_path, package);
+        }
+        return true;
+    });
+}
+
 const InstalledManifestSnapshot& ensure_installed_manifest_snapshot() {
     if (g_installed_manifest_snapshot.loaded) return g_installed_manifest_snapshot;
 
@@ -1691,8 +1903,13 @@ const InstalledManifestSnapshot& ensure_installed_manifest_snapshot() {
             g_installed_manifest_snapshot.owner_by_path.emplace(canonical_path, pkg_name);
         }
     }
+    populate_base_system_owner_map(g_installed_manifest_snapshot.base_owner_by_path);
 
     return g_installed_manifest_snapshot;
+}
+
+void invalidate_installed_manifest_snapshot() {
+    g_installed_manifest_snapshot = InstalledManifestSnapshot{};
 }
 
 std::vector<std::string> read_installed_list_file_cached(const std::string& pkg_name) {
@@ -1707,6 +1924,14 @@ std::string find_cached_file_owner(const std::string& pkg_name, const std::strin
     std::string canonical_path = canonical_multiarch_logical_path(file_path);
     auto it = snapshot.owner_by_path.find(canonical_path);
     if (it == snapshot.owner_by_path.end() || it->second == pkg_name) return "";
+    return it->second;
+}
+
+std::string find_cached_base_file_owner(const std::string& file_path) {
+    const auto& snapshot = ensure_installed_manifest_snapshot();
+    std::string canonical_path = canonical_multiarch_logical_path(file_path);
+    auto it = snapshot.base_owner_by_path.find(canonical_path);
+    if (it == snapshot.base_owner_by_path.end()) return "";
     return it->second;
 }
 
@@ -3427,6 +3652,7 @@ bool action_remove_safe(const std::string& pkg_name) {
         return false;
     }
 
+    invalidate_installed_manifest_snapshot();
     discard_install_backups(removal_rollback_entries);
     status_guard.commit();
 
@@ -3489,6 +3715,7 @@ bool action_purge_safe(const std::string& pkg_name) {
         return false;
     }
 
+    invalidate_installed_manifest_snapshot();
     discard_install_backups(purge_rollback_entries);
     status_guard.commit();
 
@@ -3572,6 +3799,7 @@ bool action_retire_safe(const std::string& pkg_name) {
         return false;
     }
 
+    invalidate_installed_manifest_snapshot();
     discard_install_backups(rollback_entries);
     status_guard.commit();
 
@@ -3990,6 +4218,7 @@ bool check_collisions(const std::string& pkg_name, const std::vector<std::string
 
     std::vector<std::string> collisions;
     std::map<std::string, std::string> owner_by_collision;
+    std::map<std::string, std::string> base_owner_by_collision;
 
     for (const auto& file : new_files) {
         std::string canonical_file = canonical_multiarch_logical_path(file);
@@ -4005,6 +4234,7 @@ bool check_collisions(const std::string& pkg_name, const std::vector<std::string
 
              collisions.push_back(canonical_file);
              owner_by_collision.emplace(canonical_file, find_cached_file_owner(pkg_name, canonical_file));
+             base_owner_by_collision.emplace(canonical_file, find_cached_base_file_owner(canonical_file));
         }
     }
 
@@ -4012,11 +4242,20 @@ bool check_collisions(const std::string& pkg_name, const std::vector<std::string
 
     bool fatal = false;
     std::vector<std::string> replaced = get_staged_replaces();
+    bool import_like_adoption = owned_by_me.empty() &&
+        !new_files.empty() &&
+        collisions.size() * 2 >= new_files.size();
+    size_t same_package_base_takeovers = 0;
+    std::map<std::string, size_t> base_takeovers_by_owner;
+    size_t unmanaged_adoption_count = 0;
     
     for (const auto& col : collisions) {
         std::string owner;
         auto owner_it = owner_by_collision.find(col);
         if (owner_it != owner_by_collision.end()) owner = owner_it->second;
+        std::string base_owner;
+        auto base_owner_it = base_owner_by_collision.find(col);
+        if (base_owner_it != base_owner_by_collision.end()) base_owner = base_owner_it->second;
 
         if (!owner.empty()) {
             if (std::find(replaced.begin(), replaced.end(), owner) != replaced.end()) {
@@ -4029,7 +4268,42 @@ bool check_collisions(const std::string& pkg_name, const std::vector<std::string
             continue;
         }
 
+        if (!base_owner.empty()) {
+            if (base_owner == pkg_name) {
+                ++same_package_base_takeovers;
+            } else {
+                ++base_takeovers_by_owner[base_owner];
+            }
+            continue;
+        }
+
+        if (import_like_adoption) {
+            ++unmanaged_adoption_count;
+            continue;
+        }
+
         std::cerr << "W: Overwriting unowned file " << col << std::endl;
+    }
+
+    if (unmanaged_adoption_count > 0) {
+        std::cout << "W: Adopting " << unmanaged_adoption_count
+                  << " existing unmanaged path"
+                  << (unmanaged_adoption_count == 1 ? "" : "s")
+                  << " while importing " << pkg_name
+                  << " into gpkg ownership." << std::endl;
+    }
+    if (same_package_base_takeovers > 0) {
+        VLOG("Adopting " << same_package_base_takeovers
+             << " existing base-system path"
+             << (same_package_base_takeovers == 1 ? "" : "s")
+             << " for " << pkg_name << ".");
+    }
+    for (const auto& entry : base_takeovers_by_owner) {
+        VLOG("Adopting " << entry.second
+             << " base-system path"
+             << (entry.second == 1 ? "" : "s")
+             << " from " << entry.first
+             << " while installing " << pkg_name << ".");
     }
     
     return !fatal;
@@ -4790,6 +5064,7 @@ bool action_install(const std::string& pkg_file) {
         std::cerr << "E: Failed to finalize package status after installation." << std::endl;
         return false;
     }
+    invalidate_installed_manifest_snapshot();
     discard_install_backups(install_rollback_entries);
     status_guard.commit();
 

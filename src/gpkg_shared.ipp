@@ -774,8 +774,8 @@ struct TransactionGuard {
 
     ~TransactionGuard() {
         if (!active) return;
-        lock.release();
         run_triggers(verbose);
+        lock.release();
     }
 };
 

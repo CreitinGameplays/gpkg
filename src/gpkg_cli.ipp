@@ -8,13 +8,128 @@
 #define GPKG_CODENAME OS_CODENAME
 #endif
 
+struct GpkgCliVersionInfo {
+    std::string version_label = GPKG_VERSION;
+    std::string codename = GPKG_CODENAME;
+    std::string build_id;
+};
+
+std::string strip_matching_quotes(const std::string& value) {
+    if (value.size() >= 2) {
+        char first = value.front();
+        char last = value.back();
+        if ((first == '"' && last == '"') || (first == '\'' && last == '\'')) {
+            return value.substr(1, value.size() - 2);
+        }
+    }
+    return value;
+}
+
+bool read_first_line_from_paths(
+    const std::vector<std::string>& paths,
+    std::string* out_line
+) {
+    if (out_line) out_line->clear();
+    for (const auto& path : paths) {
+        std::ifstream in(path);
+        if (!in) continue;
+        std::string line;
+        if (!std::getline(in, line)) continue;
+        if (out_line) *out_line = trim(line);
+        return true;
+    }
+    return false;
+}
+
+std::map<std::string, std::string> load_gpkg_runtime_release_fields() {
+    std::map<std::string, std::string> fields;
+    const std::vector<std::string> release_paths = {
+        ROOT_PREFIX + "/etc/os-release",
+        ROOT_PREFIX + "/usr/lib/os-release",
+    };
+
+    for (const auto& path : release_paths) {
+        std::ifstream in(path);
+        if (!in) continue;
+
+        std::string line;
+        while (std::getline(in, line)) {
+            line = trim(line);
+            if (line.empty() || line[0] == '#') continue;
+            size_t eq = line.find('=');
+            if (eq == std::string::npos || eq == 0) continue;
+            std::string key = trim(line.substr(0, eq));
+            std::string value = strip_matching_quotes(trim(line.substr(eq + 1)));
+            if (!key.empty()) fields[key] = value;
+        }
+
+        if (!fields.empty()) return fields;
+    }
+
+    return fields;
+}
+
+const GpkgCliVersionInfo& get_gpkg_cli_version_info() {
+    static const GpkgCliVersionInfo info = []() {
+        GpkgCliVersionInfo loaded;
+        std::map<std::string, std::string> fields = load_gpkg_runtime_release_fields();
+        auto it = fields.find("VERSION");
+        if (it != fields.end() && !it->second.empty()) loaded.version_label = it->second;
+        it = fields.find("VERSION_CODENAME");
+        if (it != fields.end() && !it->second.empty()) loaded.codename = it->second;
+        it = fields.find("BUILD_ID");
+        if (it != fields.end() && !it->second.empty()) loaded.build_id = it->second;
+        if (loaded.build_id.empty()) {
+            it = fields.find("IMAGE_VERSION");
+            if (it != fields.end() && !it->second.empty()) loaded.build_id = it->second;
+        }
+
+        if (loaded.version_label == GPKG_VERSION) {
+            std::string geminios_version;
+            if (read_first_line_from_paths({ROOT_PREFIX + "/etc/geminios-version"}, &geminios_version) &&
+                !geminios_version.empty()) {
+                loaded.version_label = geminios_version;
+            }
+        }
+
+        if (loaded.build_id.empty()) {
+            std::string geminios_build_id;
+            if (read_first_line_from_paths({ROOT_PREFIX + "/etc/geminios-build-id"}, &geminios_build_id) &&
+                !geminios_build_id.empty()) {
+                loaded.build_id = geminios_build_id;
+            }
+        }
+
+        return loaded;
+    }();
+    return info;
+}
+
+std::string get_gpkg_version_banner() {
+    const GpkgCliVersionInfo& info = get_gpkg_cli_version_info();
+    std::ostringstream out;
+    out << "gpkg " << info.version_label;
+    if (!info.build_id.empty()) out << " [build " << info.build_id << "]";
+    out << " (" << info.codename << ")";
+    return out.str();
+}
+
+std::string get_gpkg_help_banner() {
+    const GpkgCliVersionInfo& info = get_gpkg_cli_version_info();
+    std::ostringstream out;
+    out << "GeminiOS Package Manager " << info.version_label;
+    if (!info.build_id.empty()) out << " [build " << info.build_id << "]";
+    out << " (" << info.codename << ")";
+    return out.str();
+}
+
 void print_version() {
-    std::cout << "gpkg " << GPKG_VERSION << " (" << GPKG_CODENAME << ")" << std::endl;
+    std::cout << get_gpkg_version_banner() << std::endl;
 }
 
 void print_help() {
     std::cout << "Usage: gpkg <command> [args] [options]\n"
-              << "GeminiOS Package Manager " << GPKG_VERSION << " (" << GPKG_CODENAME << ")\n\n"
+              << get_gpkg_help_banner() << "\n\n"
               << "Options:\n"
               << "  -h, --help      Show this help text\n"
               << "  -v, --verbose   Show detailed logging information\n"
