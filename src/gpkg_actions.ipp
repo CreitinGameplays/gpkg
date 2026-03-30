@@ -1670,6 +1670,10 @@ bool explicit_install_target_requires_queue(
     if (live_meta.version.empty()) return true;
 
     int version_cmp = compare_versions(result.meta.version, live_meta.version);
+    // Keep the package manager itself stable when the ISO/base image already ships
+    // the exact repository build. For other base-provided packages we still allow
+    // explicit same-version imports into gpkg ownership.
+    if (candidate_name == "gpkg" && version_cmp == 0) return false;
     if (version_cmp > 0) return true;
     if (version_cmp == 0) return true;
     return false;
