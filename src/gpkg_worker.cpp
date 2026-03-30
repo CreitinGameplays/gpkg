@@ -441,57 +441,71 @@ bool refresh_linker_cache_if_available() {
     std::string ldconfig_path = find_ldconfig_path();
     if (!run_ldconfig(ldconfig_path)) return false;
 
-    size_t repaired = 0;
-    size_t removed = 0;
     size_t failed = 0;
-    std::vector<std::pair<std::string, std::string>> broken_linker_repairs =
-        collect_broken_runtime_linker_symlink_repairs();
-    std::set<std::string> repaired_paths;
-    for (const auto& repair : broken_linker_repairs) {
-        if (repair.first.empty() || repair.second.empty()) continue;
-        if (!ensure_symlink_target_if_possible(repair.first, repair.second, true)) {
-            ++failed;
-            VLOG("Failed to repair broken runtime linker symlink " << repair.first
+    constexpr size_t kMaxRefreshPasses = 8;
+    bool converged = false;
+    for (size_t pass = 0; pass < kMaxRefreshPasses; ++pass) {
+        size_t repaired = 0;
+        size_t removed = 0;
+        std::vector<std::pair<std::string, std::string>> broken_linker_repairs =
+            collect_broken_runtime_linker_symlink_repairs();
+        std::set<std::string> repaired_paths;
+        for (const auto& repair : broken_linker_repairs) {
+            if (repair.first.empty() || repair.second.empty()) continue;
+            if (!ensure_symlink_target_if_possible(repair.first, repair.second, true)) {
+                ++failed;
+                VLOG("Failed to repair broken runtime linker symlink " << repair.first
+                     << " -> " << repair.second);
+                continue;
+            }
+
+            repaired_paths.insert(repair.first);
+            ++repaired;
+            VLOG("Repaired broken runtime linker symlink " << repair.first
                  << " -> " << repair.second);
-            continue;
         }
 
-        repaired_paths.insert(repair.first);
-        ++repaired;
-        VLOG("Repaired broken runtime linker symlink " << repair.first
-             << " -> " << repair.second);
-    }
+        std::vector<std::string> cleanup_paths = collect_shadowed_stale_runtime_provider_paths();
+        std::vector<std::string> broken_linker_symlinks =
+            collect_broken_unowned_runtime_linker_symlink_paths();
+        cleanup_paths.insert(
+            cleanup_paths.end(),
+            broken_linker_symlinks.begin(),
+            broken_linker_symlinks.end()
+        );
 
-    std::vector<std::string> cleanup_paths = collect_shadowed_stale_runtime_provider_paths();
-    std::vector<std::string> broken_linker_symlinks =
-        collect_broken_unowned_runtime_linker_symlink_paths();
-    cleanup_paths.insert(
-        cleanup_paths.end(),
-        broken_linker_symlinks.begin(),
-        broken_linker_symlinks.end()
-    );
-    if (cleanup_paths.empty()) return true;
+        std::set<std::string> seen_cleanup_paths;
+        for (const auto& full_path : cleanup_paths) {
+            if (!seen_cleanup_paths.insert(full_path).second) continue;
+            if (repaired_paths.count(full_path) != 0) continue;
+            if (!remove_live_path_exact(full_path)) {
+                ++failed;
+                VLOG("Failed to prune stale runtime path " << full_path);
+                continue;
+            }
 
-    std::set<std::string> seen_cleanup_paths;
-    for (const auto& full_path : cleanup_paths) {
-        if (!seen_cleanup_paths.insert(full_path).second) continue;
-        if (repaired_paths.count(full_path) != 0) continue;
-        if (!remove_live_path_exact(full_path)) {
-            ++failed;
-            VLOG("Failed to prune stale runtime path " << full_path);
-            continue;
+            ++removed;
+            VLOG("Pruned stale runtime path " << full_path);
         }
 
-        ++removed;
-        VLOG("Pruned stale runtime path " << full_path);
+        if (repaired == 0 && removed == 0) {
+            converged = true;
+            break;
+        }
+        if (!run_ldconfig(ldconfig_path)) return false;
     }
 
-    if ((repaired > 0 || removed > 0) && !run_ldconfig(ldconfig_path)) return false;
+    if (!converged) {
+        std::cerr << "W: Runtime linker refresh hit the convergence limit after "
+                  << kMaxRefreshPasses << " pass"
+                  << (kMaxRefreshPasses == 1 ? "" : "es")
+                  << "." << std::endl;
+    }
     if (failed > 0) {
-        std::cerr << "W: Failed to prune " << failed
-                  << " stale runtime path"
+        std::cerr << "W: Failed to apply " << failed
+                  << " runtime linker state fixup"
                   << (failed == 1 ? "" : "s")
-                  << " after linker refresh." << std::endl;
+                  << "." << std::endl;
     }
     return true;
 }
