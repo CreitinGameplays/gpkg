@@ -14,6 +14,11 @@ struct GpkgCliVersionInfo {
     std::string build_id;
 };
 
+struct GpkgHelpEntry {
+    std::string label;
+    std::string description;
+};
+
 std::string strip_matching_quotes(const std::string& value) {
     if (value.size() >= 2) {
         char first = value.front();
@@ -127,41 +132,90 @@ std::string get_gpkg_help_banner() {
     return out.str();
 }
 
+std::string repeat_char(char ch, size_t count) {
+    return std::string(count, ch);
+}
+
+size_t help_label_width(const std::vector<GpkgHelpEntry>& entries) {
+    size_t width = 0;
+    for (const auto& entry : entries) {
+        width = std::max(width, entry.label.size());
+    }
+    return width;
+}
+
+void print_help_section(
+    const std::string& title,
+    const std::vector<GpkgHelpEntry>& entries,
+    const std::string& accent_color = Color::CYAN
+) {
+    const size_t width = help_label_width(entries) + 2;
+    std::cout << accent_color << Color::BOLD << title << Color::RESET << "\n";
+    for (const auto& entry : entries) {
+        std::cout << "  "
+                  << Color::GREEN << std::left << std::setw(static_cast<int>(width)) << entry.label
+                  << Color::RESET
+                  << entry.description << "\n";
+    }
+    std::cout << "\n";
+}
+
 void print_version() {
     std::cout << get_gpkg_version_banner() << std::endl;
 }
 
 void print_help() {
-    std::cout << "Usage: gpkg <command> [args] [options]\n"
-              << get_gpkg_help_banner() << "\n\n"
-              << "Options:\n"
-              << "  -h, --help      Show this help text\n"
-              << "  -v, --verbose   Show detailed logging information\n"
-              << "  -y, --yes       Assume yes for confirmation prompts\n"
-              << "  -r, --repair    Repair broken dependencies and damaged installs\n"
-              << "  --reinstall     Reinstall requested packages even if the same version is already installed\n"
-              << "  --defer-services  Prevent maintainer scripts from starting/restarting services during the transaction\n"
-              << "  --unsafe-io    Skip safe file syncs during package writes for faster installs (less crash-safe)\n"
-              << "  --recommended-yes, -rec  Force installation of Debian Recommends for this transaction\n"
-              << "  --recommended-no, -nrec  Do not install Debian Recommends for this transaction\n"
-              << "  --suggested-yes, -sug  Force installation of Debian Suggests for this transaction\n"
-              << "  --suggested-no, -nsug  Do not install Debian Suggests for this transaction\n"
-              << "  --autoremove    Remove newly unneeded dependency packages during remove\n"
-              << "  --purge         Also purge package conffiles during remove/autoremove\n"
-              << "  -V, --version   Show version\n\n"
-              << "Commands:\n"
-              << "  install <pkg>   Download and install packages (up to 5 archives in parallel)\n"
-              << "  remove <pkg>    Remove an installed package (--purge to purge conffiles too)\n"
-              << "  autoremove      Remove automatically installed packages that are no longer needed\n"
-              << "  repair          Repair broken dependencies and reinstall damaged packages\n"
-              << "  doctor          Inspect gpkg, repository, and upgrade health\n"
-              << "  upgrade         Upgrade all installed packages\n"
-              << "  update          Update local package indices\n"
-              << "  search <query>  Search for packages\n"
-              << "  show <pkg>      Show package metadata and source repository\n"
-              << "  add-repo <url>  Add a third-party repository\n"
-              << "  list-repos      Show configured repositories\n"
-              << "  clean           Clear package cache\n";
+    const std::vector<GpkgHelpEntry> quick_start = {
+        {"gpkg update", "Refresh local package indices"},
+        {"gpkg search <query>", "Find packages by name or description"},
+        {"gpkg install <pkg>", "Download and install packages"},
+        {"gpkg upgrade", "Upgrade all installed packages"},
+        {"gpkg doctor", "Inspect repository and install health"},
+    };
+    const std::vector<GpkgHelpEntry> options = {
+        {"-h, --help", "Show this help text"},
+        {"-v, --verbose", "Show detailed logging information"},
+        {"-y, --yes", "Assume yes for confirmation prompts"},
+        {"-r, --repair", "Repair broken dependencies and damaged installs"},
+        {"--reinstall", "Reinstall requested packages even if the same version is already installed"},
+        {"--defer-services", "Prevent maintainer scripts from starting or restarting services during the transaction"},
+        {"--unsafe-io", "Skip safe file syncs during package writes for faster installs with less crash safety"},
+        {"--recommended-yes, -rec", "Force installation of Debian Recommends for this transaction"},
+        {"--recommended-no, -nrec", "Do not install Debian Recommends for this transaction"},
+        {"--suggested-yes, -sug", "Force installation of Debian Suggests for this transaction"},
+        {"--suggested-no, -nsug", "Do not install Debian Suggests for this transaction"},
+        {"--autoremove", "Remove newly unneeded dependency packages during remove"},
+        {"--purge", "Also purge package conffiles during remove or autoremove"},
+        {"-V, --version", "Show version information"},
+    };
+    const std::vector<GpkgHelpEntry> commands = {
+        {"install <pkg>", "Download and install packages (up to 5 archives in parallel)"},
+        {"remove <pkg>", "Remove an installed package (--purge to purge conffiles too)"},
+        {"autoremove", "Remove automatically installed packages that are no longer needed"},
+        {"repair", "Repair broken dependencies and reinstall damaged packages"},
+        {"doctor", "Inspect gpkg, repository, and upgrade health"},
+        {"upgrade", "Upgrade all installed packages"},
+        {"update", "Update local package indices"},
+        {"search <query>", "Search for packages"},
+        {"show <pkg>", "Show package metadata and source repository"},
+        {"add-repo <url>", "Add a third-party repository"},
+        {"list-repos", "Show configured repositories"},
+        {"clean", "Clear package cache"},
+    };
+
+    std::cout << Color::BOLD << Color::CYAN << "gpkg" << Color::RESET << "\n"
+              << Color::BOLD << get_gpkg_help_banner() << Color::RESET << "\n"
+              << Color::BLUE << repeat_char('=', 72) << Color::RESET << "\n"
+              << "Usage:\n"
+              << "  gpkg <command> [args] [options]\n\n";
+
+    print_help_section("Quick Start", quick_start, Color::MAGENTA);
+    print_help_section("Options", options, Color::CYAN);
+    print_help_section("Commands", commands, Color::BLUE);
+
+    std::cout << Color::YELLOW << Color::BOLD << "Tip" << Color::RESET
+              << ": use " << Color::GREEN << "gpkg show <pkg>" << Color::RESET
+              << " before installing to inspect repository, version, and dependency details.\n";
 }
 
 int main(int argc, char* argv[]) {
