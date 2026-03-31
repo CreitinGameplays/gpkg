@@ -19,6 +19,11 @@ struct GpkgHelpEntry {
     std::string description;
 };
 
+struct GpkgHelpTip {
+    std::string command;
+    std::string description;
+};
+
 std::string strip_matching_quotes(const std::string& value) {
     if (value.size() >= 2) {
         char first = value.front();
@@ -153,11 +158,24 @@ void print_help_section(
     std::cout << accent_color << Color::BOLD << title << Color::RESET << "\n";
     for (const auto& entry : entries) {
         std::cout << "  "
-                  << Color::GREEN << std::left << std::setw(static_cast<int>(width)) << entry.label
+                  << std::left << std::setw(static_cast<int>(width)) << entry.label
                   << Color::RESET
                   << entry.description << "\n";
     }
     std::cout << "\n";
+}
+
+const GpkgHelpTip& pick_help_tip(const std::vector<GpkgHelpTip>& tips) {
+    static const GpkgHelpTip fallback = {
+        "gpkg show <pkg>",
+        "Check repository, version, and dependency details before installing."
+    };
+    if (tips.empty()) return fallback;
+
+    const uint64_t seed =
+        static_cast<uint64_t>(std::chrono::high_resolution_clock::now().time_since_epoch().count()) ^
+        (static_cast<uint64_t>(getpid()) << 16);
+    return tips[seed % tips.size()];
 }
 
 void print_version() {
@@ -202,6 +220,15 @@ void print_help() {
         {"list-repos", "Show configured repositories"},
         {"clean", "Clear package cache"},
     };
+    const std::vector<GpkgHelpTip> tips = {
+        {"gpkg show <pkg>", "Inspect repository, version, and dependency details before installing."},
+        {"gpkg doctor", "Run a quick health check after changing repositories or recovering from a failed transaction."},
+        {"gpkg clean", "Clear cached package archives when you want disk space back after a large install session."},
+        {"gpkg list-repos", "Double-check active repositories before an update if package results look unexpected."},
+        {"gpkg repair", "Use this after an interrupted install or upgrade to reconcile broken dependencies."},
+        {"gpkg search <query>", "Great when you only remember part of a package name or want to browse alternatives."},
+    };
+    const GpkgHelpTip& tip = pick_help_tip(tips);
 
     std::cout << Color::BOLD << Color::CYAN << "gpkg" << Color::RESET << "\n"
               << Color::BOLD << get_gpkg_help_banner() << Color::RESET << "\n"
@@ -214,8 +241,8 @@ void print_help() {
     print_help_section("Commands", commands, Color::BLUE);
 
     std::cout << Color::YELLOW << Color::BOLD << "Tip" << Color::RESET
-              << ": use " << Color::GREEN << "gpkg show <pkg>" << Color::RESET
-              << " before installing to inspect repository, version, and dependency details.\n";
+              << ": " << Color::GREEN << tip.command << Color::RESET
+              << " - " << tip.description << "\n";
 }
 
 int main(int argc, char* argv[]) {
