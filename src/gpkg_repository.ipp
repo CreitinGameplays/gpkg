@@ -1607,7 +1607,7 @@ bool update_debian_backend_catalog(
 int handle_update(bool verbose) {
     auto urls = get_repo_urls();
     VLOG(verbose, "Found " << urls.size() << " repository URLs.");
-    std::cout << Color::BLUE << "Updating package indices..." << Color::RESET << std::endl;
+    std::cout << Color::BLUE << "Updating package indices (this may take a while)..." << Color::RESET << std::endl;
     run_command("mkdir -p " + REPO_CACHE_PATH, verbose);
 
     std::map<std::string, PackageMetadata> packages;

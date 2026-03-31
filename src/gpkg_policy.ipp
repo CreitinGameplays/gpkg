@@ -20,6 +20,7 @@ struct PackageOverridePolicy {
     std::vector<std::string> conflicts_add;
     std::vector<std::string> provides_add;
     std::vector<std::string> replaces_add;
+    std::vector<std::string> drop_scripts;
 };
 
 struct ImportPolicy {
@@ -395,6 +396,9 @@ ImportPolicy load_import_policy(bool verbose = false) {
             package_override.conflicts_add = json_string_array(json_object_get(entry.second, "conflicts_add"));
             package_override.provides_add = json_string_array(json_object_get(entry.second, "provides_add"));
             package_override.replaces_add = json_string_array(json_object_get(entry.second, "replaces_add"));
+            package_override.drop_scripts = normalize_policy_string_entries(
+                json_string_array(json_object_get(entry.second, "drop_scripts"))
+            );
             policy.package_overrides[entry.first] = package_override;
         }
     }

@@ -1907,6 +1907,61 @@ bool get_json_string_array_from_object(
     return true;
 }
 
+std::string maintscript_package_name_from_metadata_object(
+    const std::string& obj,
+    const std::string& fallback_pkg_name
+) {
+    std::string package_name;
+    if (get_json_string_value_from_object(obj, "debian_package", package_name)) {
+        package_name = trim(package_name);
+        if (!package_name.empty()) return package_name;
+    }
+    if (get_json_string_value_from_object(obj, "package", package_name)) {
+        package_name = trim(package_name);
+        if (!package_name.empty()) return package_name;
+    }
+    return fallback_pkg_name;
+}
+
+std::string read_maintscript_package_name_from_metadata_path(
+    const std::string& metadata_path,
+    const std::string& fallback_pkg_name
+) {
+    if (metadata_path.empty()) return fallback_pkg_name;
+
+    std::ifstream in(metadata_path);
+    if (!in) return fallback_pkg_name;
+
+    std::string content(
+        (std::istreambuf_iterator<char>(in)),
+        std::istreambuf_iterator<char>()
+    );
+    if (content.empty()) return fallback_pkg_name;
+    return maintscript_package_name_from_metadata_object(content, fallback_pkg_name);
+}
+
+int run_maintainer_script_with_args(
+    const std::string& script_path,
+    const std::string& script_name,
+    const std::string& fallback_pkg_name,
+    const std::string& metadata_path,
+    const std::vector<std::string>& args = {}
+) {
+    std::string maintscript_package =
+        read_maintscript_package_name_from_metadata_path(metadata_path, fallback_pkg_name);
+    if (maintscript_package.empty()) maintscript_package = fallback_pkg_name;
+
+    ScopedEnvOverrides env;
+    env.set("DPKG_MAINTSCRIPT_NAME", script_name);
+    if (!maintscript_package.empty()) {
+        env.set("DPKG_MAINTSCRIPT_PACKAGE", maintscript_package);
+    }
+    env.set("DPKG_MAINTSCRIPT_PACKAGE_REFCOUNT", "1");
+    if (!g_root_prefix.empty()) env.set("DPKG_ROOT", g_root_prefix);
+
+    return run_path_with_args(script_path, args);
+}
+
 void populate_base_system_owner_map(std::map<std::string, std::string>& owner_by_path) {
     foreach_json_object_in_file(get_base_system_registry_path(), [&](const std::string& obj) {
         std::string package;
@@ -3293,8 +3348,15 @@ bool run_registered_undo_commands_reverse(
 bool run_postinst_abort_remove(const std::string& pkg_name, bool best_effort = true) {
     std::string postinst = get_info_dir() + pkg_name + ".postinst";
     if (access(postinst.c_str(), X_OK) != 0) return true;
+    std::string metadata_path = get_info_dir() + pkg_name + ".json";
 
-    int rc = run_path_with_args(postinst, {"abort-remove"});
+    int rc = run_maintainer_script_with_args(
+        postinst,
+        "postinst",
+        pkg_name,
+        metadata_path,
+        {"abort-remove"}
+    );
     if (rc == 0) return true;
     if (best_effort) {
         std::cerr << "W: postinst abort-remove failed for " << pkg_name << "." << std::endl;
@@ -3558,7 +3620,13 @@ bool action_remove_safe(const std::string& pkg_name) {
 
     std::string prerm = get_info_dir() + pkg_name + ".prerm";
     if (access(prerm.c_str(), X_OK) == 0) {
-        if (run_path_with_args(prerm, {"remove"}) != 0) {
+        if (run_maintainer_script_with_args(
+                prerm,
+                "prerm",
+                pkg_name,
+                get_info_dir() + pkg_name + ".json",
+                {"remove"}
+            ) != 0) {
             run_postinst_abort_remove(pkg_name, true);
             std::cerr << "E: prerm script failed." << std::endl;
             return false;
@@ -3628,7 +3696,13 @@ bool action_remove_safe(const std::string& pkg_name) {
 
     std::string postrm = get_info_dir() + pkg_name + ".postrm";
     if (access(postrm.c_str(), X_OK) == 0) {
-        if (run_path_with_args(postrm, {"remove"}) != 0) {
+        if (run_maintainer_script_with_args(
+                postrm,
+                "postrm",
+                pkg_name,
+                get_info_dir() + pkg_name + ".json",
+                {"remove"}
+            ) != 0) {
             rollback_remove_transaction(pkg_name, removal_rollback_entries, runtime_sensitive);
             std::cerr << "E: postrm script failed." << std::endl;
             return false;
@@ -3722,7 +3796,13 @@ bool action_purge_safe(const std::string& pkg_name) {
 
     std::string postrm = get_info_dir() + pkg_name + ".postrm";
     if (access(postrm.c_str(), X_OK) == 0) {
-        if (run_path_with_args(postrm, {"purge"}) != 0) {
+        if (run_maintainer_script_with_args(
+                postrm,
+                "postrm",
+                pkg_name,
+                get_info_dir() + pkg_name + ".json",
+                {"purge"}
+            ) != 0) {
             rollback_install_changes(purge_rollback_entries);
             std::cerr << "E: postrm purge script failed." << std::endl;
             return false;
@@ -4745,7 +4825,13 @@ bool action_install(const std::string& pkg_file) {
     if (access(preinst.c_str(), X_OK) == 0) {
         std::vector<std::string> preinst_args = {is_upgrade ? "upgrade" : "install"};
         if (is_upgrade) preinst_args.push_back(old_version);
-        if (run_path_with_args(preinst, preinst_args) != 0) {
+        if (run_maintainer_script_with_args(
+                preinst,
+                "preinst",
+                pkg_name,
+                g_tmp_extract_path + "control.json",
+                preinst_args
+            ) != 0) {
              std::cerr << "E: preinst failed." << std::endl;
              return false;
         }
@@ -4995,7 +5081,13 @@ bool action_install(const std::string& pkg_file) {
     if (access(installed_postinst.c_str(), X_OK) == 0) {
          std::vector<std::string> postinst_args = {"configure"};
          if (is_upgrade) postinst_args.push_back(old_version);
-         if (run_path_with_args(installed_postinst, postinst_args) != 0) {
+         if (run_maintainer_script_with_args(
+                 installed_postinst,
+                 "postinst",
+                 pkg_name,
+                 g_tmp_extract_path + "control.json",
+                 postinst_args
+             ) != 0) {
              std::vector<std::string> undo_cmds = load_registered_undo_commands(pkg_name);
              if (!undo_cmds.empty()) {
                  run_registered_undo_commands_reverse(undo_cmds, "failed postinst rollback", true);

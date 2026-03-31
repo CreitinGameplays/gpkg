@@ -6582,7 +6582,7 @@ bool update_debian_backend_index(
 }
 
 std::string get_imported_gpkg_path(const PackageMetadata& meta) {
-    std::string base = REPO_CACHE_PATH + "imported/v6/"
+    std::string base = REPO_CACHE_PATH + "imported/v7/"
         + cache_safe_component(meta.source_kind) + "/"
         + cache_safe_component(meta.name);
     return base + "_" + safe_repo_filename_component(meta.version) + "_" + cache_safe_component(meta.arch) + EXTENSION;
@@ -6598,7 +6598,11 @@ std::string get_debian_package_url(const PackageMetadata& meta) {
     return join_url_path(meta.source_url, meta.filename);
 }
 
-bool locate_deb_data_archive(const std::string& directory, std::string& out_path) {
+bool locate_deb_member_archive(
+    const std::string& directory,
+    const std::string& member_prefix,
+    std::string& out_path
+) {
     out_path.clear();
     DIR* dir = opendir(directory.c_str());
     if (!dir) return false;
@@ -6606,7 +6610,7 @@ bool locate_deb_data_archive(const std::string& directory, std::string& out_path
     struct dirent* entry;
     while ((entry = readdir(dir)) != nullptr) {
         std::string name = entry->d_name;
-        if (name.rfind("data.tar", 0) != 0) continue;
+        if (name.rfind(member_prefix, 0) != 0) continue;
         out_path = directory + "/" + name;
         closedir(dir);
         return true;
@@ -6614,6 +6618,14 @@ bool locate_deb_data_archive(const std::string& directory, std::string& out_path
 
     closedir(dir);
     return false;
+}
+
+bool locate_deb_data_archive(const std::string& directory, std::string& out_path) {
+    return locate_deb_member_archive(directory, "data.tar", out_path);
+}
+
+bool locate_deb_control_archive(const std::string& directory, std::string& out_path) {
+    return locate_deb_member_archive(directory, "control.tar", out_path);
 }
 
 bool path_has_suffix(const std::string& path, const std::string& suffix) {
@@ -6846,18 +6858,16 @@ bool decompress_zstd_file(
     return true;
 }
 
-bool materialize_deb_payload_tar(
+bool materialize_deb_tar_archive(
     const std::string& archive_path,
-    const std::string& temp_root,
-    std::string& tar_path_out,
+    const std::string& output_path,
     std::string* error_out = nullptr
 ) {
     if (error_out) error_out->clear();
 
-    tar_path_out = temp_root + "/data.tar";
     if (path_has_suffix(archive_path, ".tar")) {
         std::ifstream input(archive_path, std::ios::binary);
-        std::ofstream output(tar_path_out, std::ios::binary);
+        std::ofstream output(output_path, std::ios::binary);
         if (!input || !output) {
             if (error_out) *error_out = "could not copy uncompressed payload tar";
             return false;
@@ -6878,17 +6888,37 @@ bool materialize_deb_payload_tar(
         return true;
     }
     if (path_has_suffix(archive_path, ".tar.gz") || path_has_suffix(archive_path, ".tgz")) {
-        return GpkgArchive::decompress_gzip_file(archive_path, tar_path_out, error_out);
+        return GpkgArchive::decompress_gzip_file(archive_path, output_path, error_out);
     }
     if (path_has_suffix(archive_path, ".tar.xz") || path_has_suffix(archive_path, ".tar.lzma")) {
-        return GpkgArchive::decompress_xz_file(archive_path, tar_path_out, error_out);
+        return GpkgArchive::decompress_xz_file(archive_path, output_path, error_out);
     }
     if (path_has_suffix(archive_path, ".tar.zst") || path_has_suffix(archive_path, ".tar.zstd")) {
-        return GpkgArchive::decompress_zstd_file(archive_path, tar_path_out, error_out);
+        return GpkgArchive::decompress_zstd_file(archive_path, output_path, error_out);
     }
 
     if (error_out) *error_out = "unsupported Debian payload compression";
     return false;
+}
+
+bool materialize_deb_payload_tar(
+    const std::string& archive_path,
+    const std::string& temp_root,
+    std::string& tar_path_out,
+    std::string* error_out = nullptr
+) {
+    tar_path_out = temp_root + "/data.tar";
+    return materialize_deb_tar_archive(archive_path, tar_path_out, error_out);
+}
+
+bool materialize_deb_control_tar(
+    const std::string& archive_path,
+    const std::string& temp_root,
+    std::string& tar_path_out,
+    std::string* error_out = nullptr
+) {
+    tar_path_out = temp_root + "/control.tar";
+    return materialize_deb_tar_archive(archive_path, tar_path_out, error_out);
 }
 
 bool write_imported_control_json(const PackageMetadata& meta, const std::string& control_path) {
@@ -6923,12 +6953,12 @@ std::string format_import_failure_hint(const std::string& log_path) {
 
 bool build_imported_gpkg_archive(
     const PackageMetadata& meta,
+    const ImportPolicy& policy,
     const std::string& payload_root,
+    const std::string& control_root,
     const std::string& output_path,
     bool verbose
 ) {
-    (void)verbose;
-
     if (access(output_path.c_str(), F_OK) == 0) return true;
     if (!mkdir_parent(output_path)) {
         std::cerr << Color::RED << "E: Failed to create converted package cache directory for "
@@ -6975,6 +7005,43 @@ bool build_imported_gpkg_archive(
         {"control.json", control_json, GpkgArchive::TarEntryType::Regular, 0644, ""},
         {"data.tar.zst", data_tar_zst, GpkgArchive::TarEntryType::Regular, 0644, ""},
     };
+    std::string policy_name = meta.debian_package.empty() ? meta.name : meta.debian_package;
+    auto override_it = policy.package_overrides.find(policy_name);
+    const PackageOverridePolicy* package_override =
+        override_it == policy.package_overrides.end() ? nullptr : &override_it->second;
+    const std::vector<std::string> maintainer_scripts = {"preinst", "postinst", "prerm", "postrm"};
+    for (const auto& script_name : maintainer_scripts) {
+        if (package_override &&
+            std::find(
+                package_override->drop_scripts.begin(),
+                package_override->drop_scripts.end(),
+                script_name
+            ) != package_override->drop_scripts.end()) {
+            VLOG(verbose, "Dropping imported Debian maintainer script "
+                 << policy_name << ":" << script_name << " due to import policy.");
+            continue;
+        }
+
+        std::string script_path = control_root + "/" + script_name;
+        struct stat st {};
+        if (stat(script_path.c_str(), &st) != 0) continue;
+        if (!S_ISREG(st.st_mode)) {
+            std::cerr << Color::YELLOW
+                      << "W: Ignoring non-regular Debian maintainer script "
+                      << policy_name << ":" << script_name << Color::RESET << std::endl;
+            continue;
+        }
+
+        top_level_sources.push_back({
+            "scripts/" + script_name,
+            script_path,
+            GpkgArchive::TarEntryType::Regular,
+            st.st_mode & 07777,
+            ""
+        });
+        VLOG(verbose, "Included Debian maintainer script "
+             << policy_name << ":" << script_name << " in converted package.");
+    }
     if (!GpkgArchive::tar_create_from_sources(top_level_sources, final_tar, &archive_error)) {
         std::cerr << Color::RED << "E: Failed to assemble the converted package for "
                   << meta.name;
@@ -6996,8 +7063,7 @@ bool build_imported_gpkg_archive(
 }
 
 bool convert_debian_archive_to_gpkg(const PackageMetadata& meta, bool verbose, std::string* out_path = nullptr) {
-    (void)verbose;
-
+    const ImportPolicy& policy = get_import_policy(verbose);
     std::string output_path = get_imported_gpkg_path(meta);
     if (out_path) *out_path = output_path;
     if (access(output_path.c_str(), F_OK) == 0) return true;
@@ -7029,9 +7095,20 @@ bool convert_debian_archive_to_gpkg(const PackageMetadata& meta, bool verbose, s
         remove_path_recursive(temp_root);
         return false;
     }
+    std::string control_archive;
+    if (!locate_deb_control_archive(temp_root, control_archive)) {
+        std::cerr << Color::RED << "E: Could not locate control.tar.* inside " << deb_path << Color::RESET << std::endl;
+        remove_path_recursive(temp_root);
+        return false;
+    }
 
     std::string payload_root = temp_root + "/root";
+    std::string control_root = temp_root + "/control";
     if (!mkdir_p(payload_root)) {
+        remove_path_recursive(temp_root);
+        return false;
+    }
+    if (!mkdir_p(control_root)) {
         remove_path_recursive(temp_root);
         return false;
     }
@@ -7040,6 +7117,14 @@ bool convert_debian_archive_to_gpkg(const PackageMetadata& meta, bool verbose, s
     std::string materialize_error;
     if (!materialize_deb_payload_tar(data_archive, temp_root, payload_tar, &materialize_error)) {
         std::cerr << Color::RED << "E: Failed to prepare Debian payload for " << meta.name;
+        if (!materialize_error.empty()) std::cerr << ": " << materialize_error;
+        std::cerr << Color::RESET << std::endl;
+        remove_path_recursive(temp_root);
+        return false;
+    }
+    std::string control_tar;
+    if (!materialize_deb_control_tar(control_archive, temp_root, control_tar, &materialize_error)) {
+        std::cerr << Color::RED << "E: Failed to prepare Debian control archive for " << meta.name;
         if (!materialize_error.empty()) std::cerr << ": " << materialize_error;
         std::cerr << Color::RESET << std::endl;
         remove_path_recursive(temp_root);
@@ -7054,13 +7139,21 @@ bool convert_debian_archive_to_gpkg(const PackageMetadata& meta, bool verbose, s
         remove_path_recursive(temp_root);
         return false;
     }
+    if (!GpkgArchive::tar_extract_to_directory(control_tar, control_root, {}, &archive_error)) {
+        std::cerr << Color::RED << "E: Failed to extract the prepared Debian control tar for "
+                  << meta.name;
+        if (!archive_error.empty()) std::cerr << ": " << archive_error;
+        std::cerr << Color::RESET << std::endl;
+        remove_path_recursive(temp_root);
+        return false;
+    }
 
     if (!normalize_imported_payload_layout(payload_root, verbose)) {
         remove_path_recursive(temp_root);
         return false;
     }
 
-    bool ok = build_imported_gpkg_archive(meta, payload_root, output_path, verbose);
+    bool ok = build_imported_gpkg_archive(meta, policy, payload_root, control_root, output_path, verbose);
     remove_path_recursive(temp_root);
     return ok;
 }
