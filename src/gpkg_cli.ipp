@@ -74,7 +74,11 @@ const GpkgCliVersionInfo& get_gpkg_cli_version_info() {
         GpkgCliVersionInfo loaded;
         std::map<std::string, std::string> fields = load_gpkg_runtime_release_fields();
         auto it = fields.find("VERSION");
-        if (it != fields.end() && !it->second.empty()) loaded.version_label = it->second;
+        if (loaded.version_label == OS_VERSION &&
+            it != fields.end() &&
+            !it->second.empty()) {
+            loaded.version_label = it->second;
+        }
         it = fields.find("VERSION_CODENAME");
         if (it != fields.end() && !it->second.empty()) loaded.codename = it->second;
         it = fields.find("BUILD_ID");
@@ -84,7 +88,7 @@ const GpkgCliVersionInfo& get_gpkg_cli_version_info() {
             if (it != fields.end() && !it->second.empty()) loaded.build_id = it->second;
         }
 
-        if (loaded.version_label == GPKG_VERSION) {
+        if (loaded.version_label == GPKG_VERSION && loaded.version_label == OS_VERSION) {
             std::string geminios_version;
             if (read_first_line_from_paths({ROOT_PREFIX + "/etc/geminios-version"}, &geminios_version) &&
                 !geminios_version.empty()) {

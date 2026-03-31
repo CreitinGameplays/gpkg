@@ -5,6 +5,7 @@ PROJECT_ROOT ?= $(abspath $(CURDIR)/..)
 GINIT_DIR = $(PROJECT_ROOT)/ginit
 GLOBAL_SRC_DIR = $(PROJECT_ROOT)/src
 SYS_INFO_HEADER ?= $(GLOBAL_SRC_DIR)/sys_info.h
+GPKG_VERSION_HELPER ?= $(PROJECT_ROOT)/tools/gpkg_version.py
 ROOTFS ?=
 TARGET_CXX_VERSION := $(shell find $(ROOTFS)/usr/include/c++ -maxdepth 1 -mindepth 1 -type d -printf '%f\n' 2>/dev/null | grep -E '^[0-9]+$$' | sort -V | tail -n1)
 GPKG_VERSION ?=
@@ -12,6 +13,11 @@ GPKG_CODENAME ?=
 LZMA_STATIC := $(firstword \
 	$(wildcard $(ROOTFS)/usr/lib/x86_64-linux-gnu/liblzma.a) \
 	$(wildcard $(PROJECT_ROOT)/rootfs/usr/lib/x86_64-linux-gnu/liblzma.a))
+ifeq ($(strip $(GPKG_VERSION)),)
+ifneq ($(wildcard $(GPKG_VERSION_HELPER)),)
+GPKG_VERSION := $(shell /usr/bin/python3 $(GPKG_VERSION_HELPER) --root-dir $(PROJECT_ROOT) --export-root $(PROJECT_ROOT)/export 2>/dev/null)
+endif
+endif
 ifeq ($(strip $(GPKG_VERSION)),)
 GPKG_VERSION := $(shell sed -n 's/^#define OS_VERSION "\(.*\)"/\1/p' $(SYS_INFO_HEADER) | head -n1)
 endif
