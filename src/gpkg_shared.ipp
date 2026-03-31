@@ -343,10 +343,12 @@ size_t get_terminal_width(size_t fallback = 80) {
 }
 
 std::string default_interactive_pager_command() {
-    if (is_executable_command_available("less")) {
-        return "LESS=FRXMK less -R";
+    if (is_executable_command_available("pager")) {
+        return "env LESS=\"${LESS:-FRSXMK}\" pager";
     }
-    if (is_executable_command_available("pager")) return "pager";
+    if (is_executable_command_available("less")) {
+        return "env LESS=\"${LESS:-FRSXMK}\" less -R";
+    }
     if (is_executable_command_available("more")) return "more";
     return "";
 }
@@ -377,32 +379,74 @@ bool write_text_via_pager(const std::string& text, bool verbose) {
 
     std::string pager_command = resolve_interactive_pager_command();
     if (pager_command.empty()) return false;
-
-    char tmpl[] = "/tmp/gpkg-pager-XXXXXX";
-    int fd = mkstemp(tmpl);
-    if (fd < 0) return false;
-
-    bool wrote_all = true;
-    ssize_t offset = 0;
-    while (offset < static_cast<ssize_t>(text.size())) {
-        ssize_t written = write(fd, text.data() + offset, static_cast<size_t>(text.size() - offset));
-        if (written < 0) {
-            if (errno == EINTR) continue;
-            wrote_all = false;
-            break;
-        }
-        offset += written;
+    if (verbose) {
+        std::cout << "[DEBUG] Streaming output via pager: "
+                  << pager_command << std::endl;
     }
-    close(fd);
 
-    if (!wrote_all) {
-        unlink(tmpl);
+    int pipe_fds[2] = {-1, -1};
+    if (pipe(pipe_fds) != 0) return false;
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipe_fds[0]);
+        close(pipe_fds[1]);
         return false;
     }
 
-    int rc = decode_command_exit_status(run_command(pager_command + " " + shell_quote(tmpl), verbose));
-    unlink(tmpl);
-    return rc == 0;
+    if (pid == 0) {
+        close(pipe_fds[1]);
+        if (dup2(pipe_fds[0], STDIN_FILENO) < 0) _exit(127);
+        close(pipe_fds[0]);
+        execl("/bin/sh", "sh", "-c", pager_command.c_str(), static_cast<char*>(nullptr));
+        _exit(127);
+    }
+
+    close(pipe_fds[0]);
+
+    struct sigaction ignore_pipe {};
+    struct sigaction previous_pipe {};
+    ignore_pipe.sa_handler = SIG_IGN;
+    sigemptyset(&ignore_pipe.sa_mask);
+    ignore_pipe.sa_flags = 0;
+    sigaction(SIGPIPE, &ignore_pipe, &previous_pipe);
+
+    bool write_failed = false;
+    bool pager_closed_early = false;
+    size_t offset = 0;
+    while (offset < text.size()) {
+        ssize_t written = write(
+            pipe_fds[1],
+            text.data() + offset,
+            text.size() - offset
+        );
+        if (written < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EPIPE) {
+                pager_closed_early = true;
+                break;
+            }
+            write_failed = true;
+            break;
+        }
+        offset += static_cast<size_t>(written);
+    }
+
+    close(pipe_fds[1]);
+    sigaction(SIGPIPE, &previous_pipe, nullptr);
+
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno == EINTR) continue;
+        return false;
+    }
+
+    if (write_failed) return false;
+
+    int rc = decode_command_exit_status(status);
+    if (rc == 0) return true;
+    if (pager_closed_early) return true;
+    return false;
 }
 
 std::string truncate_progress_label(const std::string& value, size_t max_len) {

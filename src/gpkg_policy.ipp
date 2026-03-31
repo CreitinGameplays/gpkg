@@ -218,6 +218,38 @@ bool pattern_has_glob(const std::string& pattern) {
     return pattern.find_first_of("*?[]") != std::string::npos;
 }
 
+struct CompactPackageAvailabilityIndex {
+    std::vector<std::string> available_packages;
+    std::vector<std::pair<std::string, std::vector<std::string>>> provider_map;
+};
+
+bool compact_available_packages_contains(
+    const std::vector<std::string>& available_packages,
+    const std::string& package_name
+) {
+    return std::binary_search(
+        available_packages.begin(),
+        available_packages.end(),
+        package_name
+    );
+}
+
+const std::vector<std::string>* compact_provider_map_find(
+    const std::vector<std::pair<std::string, std::vector<std::string>>>& provider_map,
+    const std::string& capability
+) {
+    auto it = std::lower_bound(
+        provider_map.begin(),
+        provider_map.end(),
+        capability,
+        [](const std::pair<std::string, std::vector<std::string>>& entry, const std::string& key) {
+            return entry.first < key;
+        }
+    );
+    if (it == provider_map.end() || it->first != capability) return nullptr;
+    return &it->second;
+}
+
 bool should_keep_upgradeable_pattern(
     const std::string& pattern,
     const std::set<std::string>& available_packages
@@ -226,9 +258,47 @@ bool should_keep_upgradeable_pattern(
     return !available_packages.count(pattern);
 }
 
+bool should_keep_upgradeable_pattern(
+    const std::string& pattern,
+    const std::vector<std::string>& available_packages
+) {
+    if (pattern_has_glob(pattern)) return true;
+    return !compact_available_packages_contains(available_packages, pattern);
+}
+
 std::vector<std::string> build_system_drop_patterns(
     const ImportPolicy& policy,
     const std::set<std::string>& available_packages
+) {
+    std::vector<std::string> base_patterns = policy.system_provides.empty()
+        ? load_pattern_entries_file(SYSTEM_PROVIDES_PATH)
+        : load_pattern_entries(policy.system_provides);
+    std::vector<std::string> upgradeable_patterns = policy.upgradeable_system.empty()
+        ? load_pattern_entries_file(UPGRADEABLE_SYSTEM_PATH)
+        : load_pattern_entries(policy.upgradeable_system);
+    std::vector<std::string> filtered;
+
+    for (const auto& pattern : base_patterns) {
+        if (matches_any_pattern(pattern, upgradeable_patterns) &&
+            !should_keep_upgradeable_pattern(pattern, available_packages)) {
+            continue;
+        }
+        filtered.push_back(pattern);
+    }
+
+    for (const auto& pattern : upgradeable_patterns) {
+        if (should_keep_upgradeable_pattern(pattern, available_packages) &&
+            std::find(filtered.begin(), filtered.end(), pattern) == filtered.end()) {
+            filtered.push_back(pattern);
+        }
+    }
+
+    return unique_string_list(filtered);
+}
+
+std::vector<std::string> build_system_drop_patterns(
+    const ImportPolicy& policy,
+    const std::vector<std::string>& available_packages
 ) {
     std::vector<std::string> base_patterns = policy.system_provides.empty()
         ? load_pattern_entries_file(SYSTEM_PROVIDES_PATH)
@@ -412,6 +482,29 @@ std::string resolve_provider_name(
     return "";
 }
 
+std::string resolve_provider_name(
+    const std::string& name,
+    const std::map<std::string, std::string>& explicit_choices,
+    const std::vector<std::pair<std::string, std::vector<std::string>>>& provider_map,
+    const std::vector<std::string>& available_packages
+) {
+    auto explicit_it = explicit_choices.find(name);
+    if (explicit_it != explicit_choices.end()) return explicit_it->second;
+
+    const std::vector<std::string>* providers = compact_provider_map_find(provider_map, name);
+    if (!providers) return "";
+
+    std::vector<std::string> candidates;
+    for (const auto& provider : *providers) {
+        if (provider == name) continue;
+        if (compact_available_packages_contains(available_packages, provider)) {
+            candidates.push_back(provider);
+        }
+    }
+    if (candidates.size() == 1) return candidates[0];
+    return "";
+}
+
 std::vector<std::string> normalize_relation_field_value(const std::string& value, const std::string& apt_arch) {
     std::vector<std::string> relations;
     for (const auto& group : split_top_level_text(value, ',')) {
@@ -516,6 +609,131 @@ std::vector<std::string> normalize_dependency_relation_value(
             if (!relation_exists) {
                 // Rewritten dependencies may be satisfied by GeminiOS base packages even when
                 // no raw Debian package remains importable under the rewritten name.
+                relation_exists =
+                    is_system_provided(parsed.name, parsed.op, parsed.version) ||
+                    is_system_provided(effective_name, parsed.op, parsed.version) ||
+                    (!provider_name.empty() &&
+                     is_system_provided(provider_name, parsed.op, parsed.version));
+            }
+            if (require_exists && !relation_exists) {
+                return std::string();
+            }
+
+            return effective_normalized;
+        };
+
+        if (explicit_choice_it != policy.dependency_choices.end()) {
+            selected = consider_relation(explicit_choice_it->second, false);
+        } else {
+            for (const auto& alternative : alternatives) {
+                selected = consider_relation(alternative, true);
+                if (!selected.empty()) break;
+            }
+        }
+
+        if (selected.empty() && dropped_as_system) continue;
+        if (selected.empty() && allow_unavailable_fallback) {
+            for (const auto& alternative : alternatives) {
+                selected = consider_relation(alternative, false);
+                if (!selected.empty()) break;
+            }
+        }
+        if (selected.empty() && dropped_as_system) continue;
+        if (selected.empty() && unresolved_groups_out) {
+            unresolved_groups_out->push_back(trim(group));
+        }
+        if (!selected.empty()) normalized.push_back(selected);
+    }
+
+    (void)allow_unavailable_fallback;
+    return unique_string_list(normalized);
+}
+
+std::vector<std::string> normalize_dependency_relation_value(
+    const std::string& value,
+    const std::string& package_name,
+    const std::string& apt_arch,
+    bool allow_unavailable_fallback,
+    const ImportPolicy& policy,
+    const std::vector<std::string>& available_packages,
+    const std::vector<std::pair<std::string, std::vector<std::string>>>& provider_map,
+    const std::vector<std::string>& system_drop_patterns,
+    std::vector<std::string>* unresolved_groups_out = nullptr
+) {
+    std::vector<std::string> normalized;
+    std::vector<std::string> dependency_skip_patterns = policy.skip_packages;
+    dependency_skip_patterns.insert(
+        dependency_skip_patterns.end(),
+        policy.skip_dependency_patterns.begin(),
+        policy.skip_dependency_patterns.end()
+    );
+
+    for (const auto& group : split_top_level_text(value, ',')) {
+        if (group.empty()) continue;
+
+        std::vector<std::string> alternatives = split_top_level_text(group, '|');
+        std::string override_key = package_name + "::" + group;
+        auto explicit_choice_it = policy.dependency_choices.find(override_key);
+        if (explicit_choice_it == policy.dependency_choices.end()) {
+            explicit_choice_it = policy.dependency_choices.find(group);
+        }
+
+        std::string selected;
+        bool dropped_as_system = false;
+
+        auto consider_relation = [&](const std::string& raw_choice, bool require_exists) {
+            RelationAtom parsed = normalize_relation_atom(raw_choice, apt_arch);
+            if (!parsed.valid) return std::string();
+
+            std::string original_name = parsed.name;
+            std::string rewritten_name = apply_dependency_rewrite_name(
+                parsed.name,
+                policy.dependency_rewrites,
+                &policy.package_aliases
+            );
+            if (rewritten_name.empty()) {
+                dropped_as_system = true;
+                return std::string();
+            }
+            parsed.name = rewritten_name;
+            if (parsed.name != original_name) {
+                parsed.op.clear();
+                parsed.version.clear();
+            }
+            parsed.normalized = parsed.op.empty()
+                ? parsed.name
+                : parsed.name + " (" + parsed.op + " " + parsed.version + ")";
+
+            std::string provider_name = resolve_provider_name(
+                parsed.name,
+                policy.provider_choices,
+                provider_map,
+                available_packages
+            );
+            bool keep_virtual_relation = !provider_name.empty() && !parsed.op.empty();
+            std::string effective_name = keep_virtual_relation
+                ? parsed.name
+                : (provider_name.empty() ? parsed.name : provider_name);
+            std::string effective_normalized = parsed.op.empty()
+                ? effective_name
+                : effective_name + " (" + parsed.op + " " + parsed.version + ")";
+            std::string policy_candidate_name = provider_name.empty()
+                ? effective_name
+                : provider_name;
+
+            if (matches_any_pattern(policy_candidate_name, system_drop_patterns)) {
+                dropped_as_system = true;
+                return std::string();
+            }
+
+            if (matches_any_pattern(policy_candidate_name, dependency_skip_patterns)) {
+                return std::string();
+            }
+
+            bool relation_exists = compact_available_packages_contains(available_packages, effective_name) ||
+                (!provider_name.empty() &&
+                 compact_available_packages_contains(available_packages, provider_name));
+            if (!relation_exists) {
                 relation_exists =
                     is_system_provided(parsed.name, parsed.op, parsed.version) ||
                     is_system_provided(effective_name, parsed.op, parsed.version) ||

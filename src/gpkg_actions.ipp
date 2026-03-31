@@ -3086,18 +3086,19 @@ int handle_doctor(bool verbose) {
     repo_section.ok.push_back("Debian backend config: " + load_debian_backend_config(false).packages_url);
     repo_section.ok.push_back("Additional repositories configured: " + std::to_string(repo_urls.size()));
 
-    const std::string merged_index = REPO_CACHE_PATH + "Packages.json";
+    const std::string merged_index = get_repo_catalog_path();
     struct stat index_st {};
     bool repo_index_present = lstat(merged_index.c_str(), &index_st) == 0;
     if (!repo_index_present) {
-        repo_section.errors.push_back("local merged package index is missing; run 'gpkg update'");
+        repo_section.errors.push_back("local binary package catalog is missing; run 'gpkg update'");
     } else {
-        repo_section.ok.push_back("local merged package index is present");
+        repo_section.ok.push_back("local binary package catalog is present");
         if (!ensure_repo_package_cache_loaded(verbose)) {
             repo_section.errors.push_back("local package index exists but could not be loaded");
         } else {
             repo_section.ok.push_back(
-                "loaded " + std::to_string(g_repo_package_cache.size()) + " package records from the local index"
+                "loaded " + std::to_string(g_repo_available_package_cache.size()) +
+                " package records from the local catalog index"
             );
         }
     }
