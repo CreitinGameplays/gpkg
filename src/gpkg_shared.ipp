@@ -498,6 +498,8 @@ bool g_pending_runtime_linker_refresh = false;
 bool g_pending_selinux_relabel = false;
 bool g_assume_yes = false;
 bool g_force_reinstall = false;
+bool g_defer_services = false;
+bool g_unsafe_io = false;
 OptionalDependencyPolicy g_optional_dependency_policy;
 
 bool is_optional_dependency_option(const std::string& arg) {
@@ -521,6 +523,8 @@ bool is_known_cli_option(const std::string& arg) {
            arg == "-r" ||
            arg == "--repair" ||
            arg == "--reinstall" ||
+           arg == "--defer-services" ||
+           arg == "--unsafe-io" ||
            arg == "-V" ||
            arg == "--version" ||
            arg == "--purge" ||
@@ -722,6 +726,268 @@ int run_selinux_relabel_trigger(bool verbose, const std::string& worker_command 
     return decode_command_exit_status(run_command_argv(argv, verbose));
 }
 
+struct ScopedEnvOverrides {
+    struct SavedEntry {
+        std::string name;
+        bool had_value = false;
+        std::string value;
+    };
+
+    std::vector<SavedEntry> saved;
+
+    void set(const std::string& name, const std::string& value) {
+        SavedEntry entry;
+        entry.name = name;
+        const char* current = getenv(name.c_str());
+        if (current) {
+            entry.had_value = true;
+            entry.value = current;
+        }
+        saved.push_back(entry);
+        setenv(name.c_str(), value.c_str(), 1);
+    }
+
+    ~ScopedEnvOverrides() {
+        for (auto it = saved.rbegin(); it != saved.rend(); ++it) {
+            if (it->had_value) setenv(it->name.c_str(), it->value.c_str(), 1);
+            else unsetenv(it->name.c_str());
+        }
+    }
+};
+
+bool write_executable_script(const std::string& path, const std::string& contents) {
+    std::ofstream out(path, std::ios::trunc);
+    if (!out) return false;
+    out << contents;
+    out.close();
+    if (!out) return false;
+    return chmod(path.c_str(), 0755) == 0;
+}
+
+std::string build_service_action_wrapper_script(
+    const std::vector<std::string>& real_candidates,
+    const std::string& parse_mode
+) {
+    std::ostringstream script;
+    script << "#!/bin/sh\n"
+           << "action=''\n"
+           << "find_real() {\n";
+    for (const auto& candidate : real_candidates) {
+        script << "  if [ -x " << shell_quote(candidate) << " ]; then\n"
+               << "    printf '%s\\n' " << shell_quote(candidate) << "\n"
+               << "    return 0\n"
+               << "  fi\n";
+    }
+    script << "  return 1\n"
+           << "}\n"
+           << "suppress_action() {\n"
+           << "  case \"$1\" in\n"
+           << "    start|restart|try-restart|reload|force-reload|reload-or-restart|reload-or-try-restart|condrestart)\n"
+           << "      return 0\n"
+           << "      ;;\n"
+           << "  esac\n"
+           << "  return 1\n"
+           << "}\n";
+
+    if (parse_mode == "two-arg-action") {
+        script << "seen=0\n"
+               << "for arg in \"$@\"; do\n"
+               << "  case \"$arg\" in\n"
+               << "    --*)\n"
+               << "      ;;\n"
+               << "    *)\n"
+               << "      if [ \"$seen\" -eq 0 ]; then\n"
+               << "        seen=1\n"
+               << "      else\n"
+               << "        action=\"$arg\"\n"
+               << "        break\n"
+               << "      fi\n"
+               << "      ;;\n"
+               << "  esac\n"
+               << "done\n";
+    } else {
+        script << "for arg in \"$@\"; do\n"
+               << "  case \"$arg\" in\n"
+               << "    --*)\n"
+               << "      ;;\n"
+               << "    *)\n"
+               << "      action=\"$arg\"\n"
+               << "      break\n"
+               << "      ;;\n"
+               << "  esac\n"
+               << "done\n";
+    }
+
+    script << "if suppress_action \"$action\"; then\n"
+           << "  exit 0\n"
+           << "fi\n"
+           << "real=\"$(find_real)\" || exit 0\n"
+           << "exec \"$real\" \"$@\"\n";
+    return script.str();
+}
+
+std::string build_policy_rc_d_script() {
+    std::ostringstream script;
+    script << "#!/bin/sh\n"
+           << "action=''\n"
+           << "seen=0\n"
+           << "for arg in \"$@\"; do\n"
+           << "  case \"$arg\" in\n"
+           << "    --*)\n"
+           << "      ;;\n"
+           << "    *)\n"
+           << "      if [ \"$seen\" -eq 0 ]; then\n"
+           << "        seen=1\n"
+           << "      else\n"
+           << "        action=\"$arg\"\n"
+           << "        break\n"
+           << "      fi\n"
+           << "      ;;\n"
+           << "  esac\n"
+           << "done\n"
+           << "case \"$action\" in\n"
+           << "  start|restart|try-restart|reload|force-reload|reload-or-restart|reload-or-try-restart|condrestart)\n"
+           << "    exit 101\n"
+           << "    ;;\n"
+           << "esac\n"
+           << "exit 0\n";
+    return script.str();
+}
+
+struct ScopedServiceSuppression {
+    bool verbose = false;
+    ScopedEnvOverrides env;
+    std::string wrapper_dir;
+    std::string policy_path;
+    std::string backup_policy_path;
+    bool installed_policy = false;
+    bool had_original_policy = false;
+
+    explicit ScopedServiceSuppression(bool active, bool v) : verbose(v) {
+        if (!active) return;
+
+        env.set("RUNLEVEL", "1");
+        env.set("SYSTEMD_OFFLINE", "1");
+        env.set("GPKG_DEFER_SERVICES", "1");
+
+        char wrapper_template[] = "/tmp/gpkg-service-suppress-XXXXXX";
+        char* wrapper_root = mkdtemp(wrapper_template);
+        if (wrapper_root) {
+            wrapper_dir = wrapper_root;
+
+            struct WrapperSpec {
+                const char* name;
+                const char* parse_mode;
+                std::vector<std::string> candidates;
+            };
+
+            const std::vector<WrapperSpec> wrappers = {
+                {"systemctl", "one-arg-action", {"/usr/bin/systemctl", "/bin/systemctl"}},
+                {"service", "two-arg-action", {"/usr/sbin/service", "/sbin/service", "/usr/bin/service", "/bin/service"}},
+                {"invoke-rc.d", "two-arg-action", {"/usr/sbin/invoke-rc.d", "/sbin/invoke-rc.d"}},
+                {"deb-systemd-invoke", "one-arg-action", {"/usr/bin/deb-systemd-invoke", "/bin/deb-systemd-invoke"}},
+                {"initctl", "one-arg-action", {"/sbin/initctl", "/usr/sbin/initctl", "/bin/initctl", "/usr/bin/initctl"}},
+            };
+
+            bool wrappers_ok = true;
+            for (const auto& spec : wrappers) {
+                std::string path = wrapper_dir + "/" + spec.name;
+                if (!write_executable_script(
+                        path,
+                        build_service_action_wrapper_script(spec.candidates, spec.parse_mode))) {
+                    wrappers_ok = false;
+                    break;
+                }
+            }
+
+            if (wrappers_ok) {
+                const char* current_path = getenv("PATH");
+                std::string updated_path = wrapper_dir;
+                if (current_path && *current_path) updated_path += ":" + std::string(current_path);
+                env.set("PATH", updated_path);
+                if (verbose) {
+                    std::cout << "[DEBUG] Service start/restart suppression wrappers active from "
+                              << wrapper_dir << std::endl;
+                }
+            } else {
+                if (verbose) {
+                    std::cout << "[DEBUG] Failed to create one or more service suppression wrappers in "
+                              << wrapper_dir << std::endl;
+                }
+                remove_path_recursive(wrapper_dir);
+                wrapper_dir.clear();
+            }
+        } else if (verbose) {
+            std::cout << "[DEBUG] Failed to allocate a service suppression wrapper directory in /tmp."
+                      << std::endl;
+        }
+
+        if (!ROOT_PREFIX.empty()) {
+            if (verbose) {
+                std::cout << "[DEBUG] Skipping policy-rc.d override because gpkg is using ROOT_PREFIX="
+                          << ROOT_PREFIX << "." << std::endl;
+            }
+            return;
+        }
+
+        policy_path = "/usr/sbin/policy-rc.d";
+        struct stat st {};
+        if (lstat(policy_path.c_str(), &st) == 0) {
+            had_original_policy = true;
+            backup_policy_path = policy_path + ".gpkg-backup-" + std::to_string(static_cast<long long>(getpid()));
+            if (rename(policy_path.c_str(), backup_policy_path.c_str()) != 0) {
+                if (verbose) {
+                    std::cout << "[DEBUG] Failed to back up existing policy-rc.d: "
+                              << strerror(errno) << std::endl;
+                }
+                had_original_policy = false;
+                backup_policy_path.clear();
+            }
+        } else if (errno != ENOENT && verbose) {
+            std::cout << "[DEBUG] Failed to inspect policy-rc.d: "
+                      << strerror(errno) << std::endl;
+        }
+
+        if (write_executable_script(policy_path, build_policy_rc_d_script())) {
+            installed_policy = true;
+            if (verbose) {
+                std::cout << "[DEBUG] Installed temporary policy-rc.d service suppression hook."
+                          << std::endl;
+            }
+        } else {
+            if (verbose) {
+                std::cout << "[DEBUG] Failed to install temporary policy-rc.d hook." << std::endl;
+            }
+            if (had_original_policy && !backup_policy_path.empty()) {
+                rename(backup_policy_path.c_str(), policy_path.c_str());
+                had_original_policy = false;
+                backup_policy_path.clear();
+            }
+        }
+    }
+
+    ~ScopedServiceSuppression() {
+        if (installed_policy) {
+            if (unlink(policy_path.c_str()) != 0 && errno != ENOENT && verbose) {
+                std::cout << "[DEBUG] Failed to remove temporary policy-rc.d hook: "
+                          << strerror(errno) << std::endl;
+            }
+        }
+
+        if (had_original_policy && !backup_policy_path.empty()) {
+            if (rename(backup_policy_path.c_str(), policy_path.c_str()) != 0 && verbose) {
+                std::cout << "[DEBUG] Failed to restore original policy-rc.d: "
+                          << strerror(errno) << std::endl;
+            }
+        }
+
+        if (!wrapper_dir.empty() && !remove_path_recursive(wrapper_dir) && verbose) {
+            std::cout << "[DEBUG] Failed to remove service suppression wrapper directory "
+                      << wrapper_dir << ": " << strerror(errno) << std::endl;
+        }
+    }
+};
+
 void run_triggers(bool verbose) {
     bool pending_runtime_refresh = g_pending_runtime_linker_refresh;
     bool pending_selinux_relabel = g_pending_selinux_relabel;
@@ -843,10 +1109,20 @@ struct ScopedLock {
 
 struct TransactionGuard {
     ScopedLock lock;
+    ScopedEnvOverrides env;
+    ScopedServiceSuppression service_suppression;
     bool active;
     bool verbose;
 
-    TransactionGuard(bool need_lock, bool v) : lock(need_lock, v), active(need_lock), verbose(v) {}
+    TransactionGuard(bool need_lock, bool v, bool suppress_services)
+        : lock(need_lock, v),
+          service_suppression(need_lock && suppress_services, v),
+          active(need_lock),
+          verbose(v) {
+        if (need_lock && g_unsafe_io) {
+            env.set("GPKG_UNSAFE_IO", "1");
+        }
+    }
 
     ~TransactionGuard() {
         if (!active) return;

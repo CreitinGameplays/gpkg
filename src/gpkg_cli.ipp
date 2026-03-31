@@ -140,6 +140,8 @@ void print_help() {
               << "  -y, --yes       Assume yes for confirmation prompts\n"
               << "  -r, --repair    Repair broken dependencies and damaged installs\n"
               << "  --reinstall     Reinstall requested packages even if the same version is already installed\n"
+              << "  --defer-services  Prevent maintainer scripts from starting/restarting services during the transaction\n"
+              << "  --unsafe-io    Skip safe file syncs during package writes for faster installs (less crash-safe)\n"
               << "  --recommended-yes, -rec  Force installation of Debian Recommends for this transaction\n"
               << "  --recommended-no, -nrec  Do not install Debian Recommends for this transaction\n"
               << "  --suggested-yes, -sug  Force installation of Debian Suggests for this transaction\n"
@@ -178,6 +180,8 @@ int main(int argc, char* argv[]) {
     bool autoremove = false;
     bool repair = false;
     bool reinstall = false;
+    bool defer_services = false;
+    bool unsafe_io = false;
     bool recommended_yes = false;
     bool recommended_no = false;
     bool suggested_yes = false;
@@ -190,6 +194,8 @@ int main(int argc, char* argv[]) {
         else if (arg == "--autoremove") autoremove = true;
         else if (arg == "-r" || arg == "--repair") repair = true;
         else if (arg == "--reinstall") reinstall = true;
+        else if (arg == "--defer-services") defer_services = true;
+        else if (arg == "--unsafe-io") unsafe_io = true;
         else if (arg == "--recommended-yes" || arg == "-rec") recommended_yes = true;
         else if (arg == "--recommended-no" || arg == "-nrec") recommended_no = true;
         else if (arg == "--suggested-yes" || arg == "-sug") suggested_yes = true;
@@ -280,8 +286,24 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    bool mutates_package_runtime = (
+        action == "install" ||
+        action == "remove" ||
+        action == "autoremove" ||
+        action == "repair" ||
+        action == "upgrade"
+    );
+    if ((defer_services || unsafe_io) && !mutates_package_runtime) {
+        std::cerr << Color::RED
+                  << "E: --defer-services and --unsafe-io are only valid with install, remove, autoremove, repair, or upgrade."
+                  << Color::RESET << std::endl;
+        return 1;
+    }
+
     g_assume_yes = assume_yes;
     g_force_reinstall = reinstall;
+    g_defer_services = defer_services;
+    g_unsafe_io = unsafe_io;
     g_optional_dependency_policy.recommends = recommended_yes ? OptionalDependencyMode::ForceYes
         : (recommended_no ? OptionalDependencyMode::ForceNo : OptionalDependencyMode::Auto);
     g_optional_dependency_policy.suggests = suggested_yes ? OptionalDependencyMode::ForceYes
@@ -307,7 +329,16 @@ int main(int argc, char* argv[]) {
         action == "add-repo" ||
         action == "clean"
     );
-    TransactionGuard guard(needs_trans, verbose);
+    if (unsafe_io && mutates_package_runtime) {
+        std::cout << Color::YELLOW
+                  << "W: Unsafe I/O enabled. Package writes will skip some safety syncs for speed."
+                  << Color::RESET << std::endl;
+    }
+    if (defer_services && mutates_package_runtime && verbose) {
+        std::cout << "[DEBUG] Service start/restart suppression is enabled for this transaction."
+                  << std::endl;
+    }
+    TransactionGuard guard(needs_trans, verbose, defer_services && mutates_package_runtime);
 
     std::set<std::string> installed_cache = get_exact_live_installed_package_set();
 

@@ -17,6 +17,7 @@
 #include <elf.h>
 #include <tuple>
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #include <thread>
 #include "gpkg_archive.ipp"
@@ -147,6 +148,7 @@ bool g_verbose = false;
 size_t g_parallel_jobs = 0;
 bool g_defer_runtime_linker_refresh = false;
 bool g_defer_selinux_relabel = false;
+bool g_unsafe_io = false;
 std::vector<PackageStatusRecord> g_status_records_cache;
 bool g_status_records_cache_loaded = false;
 #define VLOG(msg) do { if (g_verbose) std::cout << "[WORKER] " << msg << std::endl; } while(0)
@@ -157,6 +159,24 @@ std::string trim(const std::string& str) {
     if (std::string::npos == first) return str;
     size_t last = str.find_last_not_of(" \t\n\r");
     return str.substr(first, (last - first + 1));
+}
+
+bool env_var_is_truthy(const char* value) {
+    if (!value || !*value) return false;
+    std::string normalized = trim(value);
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return normalized == "1" ||
+           normalized == "true" ||
+           normalized == "yes" ||
+           normalized == "on";
+}
+
+std::string format_phase_seconds(double seconds) {
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(seconds >= 10.0 ? 1 : 2) << seconds << "s";
+    return out.str();
 }
 
 bool parse_parallel_jobs_value(const std::string& text, size_t* out) {
@@ -3089,7 +3109,7 @@ bool copy_regular_file_contents(const std::string& source_path, int dest_fd) {
         }
     }
 
-    if (fsync(dest_fd) != 0) {
+    if (!g_unsafe_io && fsync(dest_fd) != 0) {
         std::cerr << "E: Failed to flush staged file " << source_path << ": "
                   << strerror(errno) << std::endl;
         close(source_fd);
@@ -3168,7 +3188,7 @@ bool write_text_file_atomic(const std::string& target_path, const std::string& c
     }
 
     if (ok && fchmod(temp_fd, mode) != 0) ok = false;
-    if (ok && fsync(temp_fd) != 0) ok = false;
+    if (ok && !g_unsafe_io && fsync(temp_fd) != 0) ok = false;
     close(temp_fd);
 
     if (!ok) {
@@ -3193,7 +3213,7 @@ bool copy_file_atomic(const std::string& source_path, const std::string& target_
 
     bool ok = copy_regular_file_contents(source_path, temp_fd);
     if (ok && fchmod(temp_fd, st.st_mode & 07777) != 0) ok = false;
-    if (ok && fsync(temp_fd) != 0) ok = false;
+    if (ok && !g_unsafe_io && fsync(temp_fd) != 0) ok = false;
     close(temp_fd);
 
     if (!ok) {
@@ -4602,6 +4622,25 @@ bool schedule_selinux_autorelabel(
 }
 
 bool action_install(const std::string& pkg_file) {
+    using InstallClock = std::chrono::steady_clock;
+    auto total_start = InstallClock::now();
+    auto phase_start = total_start;
+    double unpack_seconds = 0.0;
+    double preinst_seconds = 0.0;
+    double apply_seconds = 0.0;
+    double metadata_seconds = 0.0;
+    double postinst_seconds = 0.0;
+    double cleanup_seconds = 0.0;
+    auto finish_phase = [&](double& bucket) {
+        auto now = InstallClock::now();
+        bucket = std::chrono::duration<double>(now - phase_start).count();
+        phase_start = now;
+    };
+
+    if (g_unsafe_io && g_verbose) {
+        VLOG("Unsafe I/O enabled: fsync calls will be skipped for faster package writes.");
+    }
+
     // 1. Unpack to temp
     ScopedExtractWorkspace workspace;
     if (!create_extract_workspace()) {
@@ -4671,6 +4710,7 @@ bool action_install(const std::string& pkg_file) {
         std::cerr << "E: Could not determine package name." << std::endl;
         return false;
     }
+    finish_phase(unpack_seconds);
 
     PackageStatusRollbackGuard status_guard;
     status_guard.begin(pkg_name);
@@ -4710,6 +4750,7 @@ bool action_install(const std::string& pkg_file) {
              return false;
         }
     }
+    finish_phase(preinst_seconds);
 
     std::vector<PreservedConfigFile> preserved_configs =
         collect_preserved_config_files(pkg_name, new_files);
@@ -4815,6 +4856,7 @@ bool action_install(const std::string& pkg_file) {
         std::cerr << "E: " << selinux_error << std::endl;
         return false;
     }
+    finish_phase(apply_seconds);
 
     std::vector<std::string> installed_files = normalize_owned_manifest_paths(new_files);
     apply_preserved_config_metadata(installed_files, preserved_configs);
@@ -4949,6 +4991,7 @@ bool action_install(const std::string& pkg_file) {
          std::cerr << "E: Failed to record half-configured package state." << std::endl;
          return false;
     }
+    finish_phase(metadata_seconds);
     if (access(installed_postinst.c_str(), X_OK) == 0) {
          std::vector<std::string> postinst_args = {"configure"};
          if (is_upgrade) postinst_args.push_back(old_version);
@@ -4998,6 +5041,7 @@ bool action_install(const std::string& pkg_file) {
             return false;
         }
     }
+    finish_phase(postinst_seconds);
 
     // 8. Cleanup Orphans (Upgrade only)
     if (is_upgrade) {
@@ -5078,9 +5122,22 @@ bool action_install(const std::string& pkg_file) {
         std::cerr << "E: Failed to finalize package status after installation." << std::endl;
         return false;
     }
+    finish_phase(cleanup_seconds);
     invalidate_installed_manifest_snapshot();
     discard_install_backups(install_rollback_entries);
     status_guard.commit();
+
+    if (g_verbose) {
+        double total_seconds = std::chrono::duration<double>(InstallClock::now() - total_start).count();
+        VLOG("Install timing for " << pkg_name
+             << ": unpack=" << format_phase_seconds(unpack_seconds)
+             << ", preinst=" << format_phase_seconds(preinst_seconds)
+             << ", apply=" << format_phase_seconds(apply_seconds)
+             << ", metadata=" << format_phase_seconds(metadata_seconds)
+             << ", postinst=" << format_phase_seconds(postinst_seconds)
+             << ", cleanup=" << format_phase_seconds(cleanup_seconds)
+             << ", total=" << format_phase_seconds(total_seconds));
+    }
 
     std::cout << "✓ Installed " << pkg_name << " (" << new_version << ")" << std::endl;
     return true;
@@ -5175,13 +5232,14 @@ int main(int argc, char* argv[]) {
 
     if (argc < 2) {
 
-        std::cout << "Usage: gpkg-worker [options]\nOptions:\n  --install <file>\n  --remove <pkg>\n  --purge <pkg>\n  --retire <pkg>\n  --verify <pkg>\n  --refresh-runtime-linker-state\n  --refresh-selinux-label-state\n  --register-file <path> --pkg <name>\n  --register-undo <cmd> --pkg <name>\n  --jobs <n>\n  --defer-runtime-linker-refresh\n  --defer-selinux-relabel\n";
+        std::cout << "Usage: gpkg-worker [options]\nOptions:\n  --install <file>\n  --remove <pkg>\n  --purge <pkg>\n  --retire <pkg>\n  --verify <pkg>\n  --refresh-runtime-linker-state\n  --refresh-selinux-label-state\n  --register-file <path> --pkg <name>\n  --register-undo <cmd> --pkg <name>\n  --jobs <n>\n  --defer-runtime-linker-refresh\n  --defer-selinux-relabel\n  --unsafe-io\n";
 
         return 1;
 
     }
 
     std::string mode, target, pkg_name;
+    g_unsafe_io = env_var_is_truthy(getenv("GPKG_UNSAFE_IO"));
 
     for (int i = 1; i < argc; ++i) {
 
@@ -5221,6 +5279,8 @@ int main(int argc, char* argv[]) {
         else if (arg == "--defer-runtime-linker-refresh") g_defer_runtime_linker_refresh = true;
 
         else if (arg == "--defer-selinux-relabel") g_defer_selinux_relabel = true;
+
+        else if (arg == "--unsafe-io") g_unsafe_io = true;
 
         else if (arg == "-v" || arg == "--verbose") g_verbose = true;
 
