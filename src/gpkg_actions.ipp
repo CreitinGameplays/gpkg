@@ -5,6 +5,13 @@ struct InstallCommandResult {
     std::string log_path;
 };
 
+bool prepare_install_archives(
+    const std::vector<PackageMetadata>& packages,
+    const DownloadBatchReport& download_report,
+    bool verbose,
+    std::vector<std::string>& failures
+);
+
 enum class PlannedPackageKind {
     NewInstall,
     Upgrade,
@@ -797,6 +804,187 @@ InstallCommandResult install_package_from_file(const std::string& pkg_file, bool
     );
     if (result.exit_code == 0) queue_selinux_label_state_refresh();
     return {result.exit_code == 0, result.log_path};
+}
+
+InstallCommandResult hydrate_control_metadata_by_name(const std::string& pkg_name, bool verbose) {
+    CommandCaptureResult result = run_command_captured_argv(
+        build_worker_command_argv("--hydrate-control-metadata", pkg_name, verbose),
+        verbose,
+        "gpkg-hydrate-control-metadata"
+    );
+    return {result.exit_code == 0, result.log_path};
+}
+
+std::string get_control_sidecar_manifest_path(const std::string& pkg_name) {
+    return INFO_DIR + pkg_name + ".debctl.list";
+}
+
+bool installed_package_control_metadata_manifest_present(const std::string& pkg_name) {
+    return access(get_control_sidecar_manifest_path(pkg_name).c_str(), F_OK) == 0;
+}
+
+bool resolve_installed_control_metadata_candidate(
+    const std::string& pkg_name,
+    PackageMetadata& out_meta,
+    bool verbose
+) {
+    if (get_installed_package_metadata(pkg_name, out_meta)) {
+        return package_is_debian_source(out_meta);
+    }
+
+    std::string installed_version;
+    if (!package_has_exact_live_install_state(pkg_name, &installed_version)) return false;
+    if (installed_version.empty()) return false;
+
+    PackageMetadata repo_meta;
+    if (!get_repo_package_info(pkg_name, repo_meta)) return false;
+    if (!package_is_debian_source(repo_meta)) return false;
+    if (repo_meta.version.empty() || compare_versions(repo_meta.version, installed_version) != 0) {
+        VLOG(verbose, "Skipping control-metadata hydration for " << pkg_name
+             << " because the installed version " << installed_version
+             << " no longer matches the current repository candidate "
+             << (repo_meta.version.empty() ? "<unknown>" : repo_meta.version) << ".");
+        return false;
+    }
+
+    out_meta = repo_meta;
+    out_meta.version = installed_version;
+    return true;
+}
+
+void collect_installed_control_metadata_candidates_recursive(
+    const PackageMetadata& meta,
+    const std::set<std::string>& installed_cache,
+    const std::set<std::string>& planned_names,
+    std::set<std::string>& visited_names,
+    std::set<std::string>& selected_names,
+    std::set<std::string>& unresolved_names,
+    std::vector<PackageMetadata>& out_candidates,
+    std::vector<std::string>& unresolved_candidates,
+    bool verbose
+) {
+    for (const auto& dep_str : collect_required_transaction_dependency_edges(meta)) {
+        Dependency dep = parse_dependency(dep_str);
+        if (dep.name.empty()) continue;
+
+        std::string provider_name;
+        if (!find_installed_dependency_provider(dep, installed_cache, &provider_name, nullptr, verbose)) {
+            continue;
+        }
+        if (provider_name.empty()) continue;
+        if (planned_names.count(provider_name) != 0) continue;
+        if (!visited_names.insert(provider_name).second) continue;
+
+        bool metadata_present = installed_package_control_metadata_manifest_present(provider_name);
+        PackageMetadata provider_meta;
+        if (!resolve_installed_control_metadata_candidate(provider_name, provider_meta, verbose)) {
+            if (!metadata_present && unresolved_names.insert(provider_name).second) {
+                unresolved_candidates.push_back(provider_name);
+            }
+            continue;
+        }
+
+        if (!metadata_present && selected_names.insert(provider_name).second) {
+            out_candidates.push_back(provider_meta);
+        }
+
+        collect_installed_control_metadata_candidates_recursive(
+            provider_meta,
+            installed_cache,
+            planned_names,
+            visited_names,
+            selected_names,
+            unresolved_names,
+            out_candidates,
+            unresolved_candidates,
+            verbose
+        );
+    }
+}
+
+struct ControlMetadataHydrationPlan {
+    std::vector<PackageMetadata> candidates;
+    std::vector<std::string> unresolved;
+};
+
+ControlMetadataHydrationPlan collect_installed_control_metadata_candidates(
+    const std::vector<PackageMetadata>& transaction_queue,
+    const std::set<std::string>& installed_cache,
+    bool verbose
+) {
+    ControlMetadataHydrationPlan plan;
+    std::set<std::string> planned_names;
+    std::set<std::string> visited_names;
+    std::set<std::string> selected_names;
+    std::set<std::string> unresolved_names;
+    for (const auto& meta : transaction_queue) planned_names.insert(meta.name);
+
+    for (const auto& meta : transaction_queue) {
+        if (!package_is_debian_source(meta)) continue;
+        collect_installed_control_metadata_candidates_recursive(
+            meta,
+            installed_cache,
+            planned_names,
+            visited_names,
+            selected_names,
+            unresolved_names,
+            plan.candidates,
+            plan.unresolved,
+            verbose
+        );
+    }
+    return plan;
+}
+
+bool ensure_transaction_control_metadata_ready(
+    const std::vector<PackageMetadata>& transaction_queue,
+    const std::set<std::string>& installed_cache,
+    bool verbose,
+    std::vector<std::string>& failures
+) {
+    failures.clear();
+    ControlMetadataHydrationPlan plan =
+        collect_installed_control_metadata_candidates(transaction_queue, installed_cache, verbose);
+    if (!plan.unresolved.empty()) {
+        failures = plan.unresolved;
+        return false;
+    }
+    std::vector<PackageMetadata>& candidates = plan.candidates;
+    if (candidates.empty()) return true;
+
+    std::cout << Color::CYAN << "[*] Hydrating installed Debian control metadata for "
+              << candidates.size() << " package(s)..." << Color::RESET << std::endl;
+
+    DownloadBatchReport download_report = download_package_archives(
+        candidates,
+        verbose,
+        MAX_PARALLEL_PACKAGE_DOWNLOADS
+    );
+    std::cout << Color::CYAN << "[*] Metadata download summary: "
+              << download_report.downloaded_count << " downloaded, "
+              << download_report.reused_count << " reused from cache, "
+              << format_total_bytes(download_report.downloaded_bytes) << " transferred."
+              << Color::RESET << std::endl;
+
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        if (!download_report.results[i].success) failures.push_back(candidates[i].name);
+    }
+    if (!failures.empty()) return false;
+
+    std::vector<std::string> failed_preparation;
+    if (!prepare_install_archives(candidates, download_report, verbose, failed_preparation)) {
+        failures = failed_preparation;
+        return false;
+    }
+
+    for (const auto& candidate : candidates) {
+        InstallCommandResult result = hydrate_control_metadata_by_name(candidate.name, verbose);
+        if (!result.success) {
+            failures.push_back(candidate.name);
+        }
+    }
+
+    return failures.empty();
 }
 
 InstallCommandResult retire_package_by_name(const std::string& pkg_name, bool verbose) {
@@ -2943,6 +3131,20 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
         return 1;
     }
 
+    std::vector<std::string> failed_metadata_hydration;
+    if (!ensure_transaction_control_metadata_ready(
+            upgrade_queue,
+            installed_cache,
+            verbose,
+            failed_metadata_hydration
+        )) {
+        std::cerr << Color::RED
+                  << "E: Aborting upgrade because installed Debian control metadata could not be hydrated safely for: "
+                  << join_strings(failed_metadata_hydration)
+                  << Color::RESET << std::endl;
+        return 1;
+    }
+
     size_t installed_count = 0;
     std::vector<std::string> failures;
     size_t install_progress_width = 0;
@@ -3388,6 +3590,20 @@ int handle_repair(bool verbose) {
         return 1;
     }
 
+    std::vector<std::string> failed_metadata_hydration;
+    if (!ensure_transaction_control_metadata_ready(
+            repair_queue,
+            installed_set,
+            verbose,
+            failed_metadata_hydration
+        )) {
+        std::cerr << Color::RED
+                  << "E: Aborting repair because installed Debian control metadata could not be hydrated safely for: "
+                  << join_strings(failed_metadata_hydration)
+                  << Color::RESET << std::endl;
+        return 1;
+    }
+
     std::cout << Color::CYAN << "[*] Applying repair plan..." << Color::RESET << std::endl;
     size_t repaired_count = 0;
     size_t install_progress_width = 0;
@@ -3786,6 +4002,21 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
         if (mutated_runtime_state) queue_runtime_linker_state_refresh();
         std::cerr << Color::RED << "E: Aborting install because these packages could not be prepared safely: "
                   << join_strings(failed_preparation) << Color::RESET << std::endl;
+        return 1;
+    }
+
+    std::vector<std::string> failed_metadata_hydration;
+    if (!ensure_transaction_control_metadata_ready(
+            install_queue,
+            installed_cache,
+            verbose,
+            failed_metadata_hydration
+        )) {
+        if (mutated_runtime_state) queue_runtime_linker_state_refresh();
+        std::cerr << Color::RED
+                  << "E: Aborting install because installed Debian control metadata could not be hydrated safely for: "
+                  << join_strings(failed_metadata_hydration)
+                  << Color::RESET << std::endl;
         return 1;
     }
 

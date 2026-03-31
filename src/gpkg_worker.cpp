@@ -34,6 +34,53 @@ std::string get_status_file_path() {
     return g_root_prefix + "/var/lib/gpkg/status";
 }
 
+std::string get_repo_cache_path() {
+    return g_root_prefix + "/var/repo/";
+}
+
+std::string get_debian_pool_cache_dir() {
+    return get_repo_cache_path() + "debian/pool/";
+}
+
+std::string get_imported_cache_dir() {
+    return get_repo_cache_path() + "imported/";
+}
+
+std::string safe_repo_filename_component_local(const std::string& value) {
+    std::string safe;
+    safe.reserve(value.size());
+    for (char ch : value) {
+        if (ch == '/' || ch == ' ') safe += '_';
+        else safe += ch;
+    }
+    return safe;
+}
+
+std::string cache_safe_component_local(const std::string& value) {
+    std::string safe;
+    safe.reserve(value.size());
+    for (char ch : value) {
+        if (std::isalnum(static_cast<unsigned char>(ch)) || ch == '.' || ch == '_' || ch == '-') {
+            safe += ch;
+        } else {
+            safe += '_';
+        }
+    }
+    return safe.empty() ? "unknown" : safe;
+}
+
+std::string native_package_architecture() {
+#if defined(__x86_64__)
+    return "x86_64";
+#elif defined(__aarch64__)
+    return "aarch64";
+#elif defined(__arm__)
+    return "armv7l";
+#else
+    return "";
+#endif
+}
+
 std::string get_conffile_manifest_path(const std::string& pkg_name) {
     return get_info_dir() + pkg_name + ".conffiles";
 }
@@ -2060,11 +2107,38 @@ std::string current_worker_executable_path() {
     return std::string(buffer.data(), static_cast<size_t>(len));
 }
 
+bool maintscript_dialog_frontend_available() {
+    if (!g_root_prefix.empty()) return false;
+    const char* candidates[] = {
+        "/usr/bin/dialog",
+        "/bin/dialog",
+        "/usr/bin/whiptail",
+        "/bin/whiptail",
+    };
+    for (const char* candidate : candidates) {
+        if (access(candidate, X_OK) == 0) return true;
+    }
+    return false;
+}
+
+std::string default_maintscript_debian_frontend() {
+    const char* explicit_frontend = getenv("DEBIAN_FRONTEND");
+    if (explicit_frontend && *explicit_frontend) return "";
+
+    if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) return "noninteractive";
+    if (!maintscript_dialog_frontend_available()) return "readline";
+    return "";
+}
+
 struct ScopedMaintainerScriptCompat {
     ScopedEnvOverrides env;
     std::string wrapper_dir;
 
-    explicit ScopedMaintainerScriptCompat(const std::string& worker_path) {
+    ScopedMaintainerScriptCompat(
+        const std::string& worker_path,
+        const std::string& root_prefix,
+        bool verbose
+    ) {
         if (worker_path.empty()) return;
 
         char wrapper_template[] = "/tmp/gpkg-maintscript-compat-XXXXXX";
@@ -2075,10 +2149,10 @@ struct ScopedMaintainerScriptCompat {
         std::ostringstream script;
         script << "#!/bin/sh\n"
                << "worker=" << shell_quote(worker_path) << "\n"
-               << "if [ -n \"$GPKG_COMPAT_ROOT\" ]; then\n"
-               << "  exec \"$worker\" --root \"$GPKG_COMPAT_ROOT\" --compat-dpkg-query \"$@\"\n"
-               << "fi\n"
-               << "exec \"$worker\" --compat-dpkg-query \"$@\"\n";
+               << "exec \"$worker\"";
+        if (!root_prefix.empty()) script << " --root " << shell_quote(root_prefix);
+        if (verbose) script << " --verbose";
+        script << " --compat-dpkg-query \"$@\"\n";
 
         std::string wrapper_path = wrapper_dir + "/dpkg-query";
         if (!write_executable_script_local(wrapper_path, script.str())) {
@@ -2111,7 +2185,7 @@ int run_maintainer_script_with_args(
     std::string maintscript_arch = read_maintscript_package_arch_from_metadata_path(metadata_path);
 
     ScopedEnvOverrides env;
-    ScopedMaintainerScriptCompat compat(current_worker_executable_path());
+    ScopedMaintainerScriptCompat compat(current_worker_executable_path(), g_root_prefix, g_verbose);
     env.set("DPKG_MAINTSCRIPT_NAME", script_name);
     if (!maintscript_package.empty()) {
         env.set("DPKG_MAINTSCRIPT_PACKAGE", maintscript_package);
@@ -2119,7 +2193,8 @@ int run_maintainer_script_with_args(
     if (!maintscript_arch.empty()) env.set("DPKG_MAINTSCRIPT_ARCH", maintscript_arch);
     env.set("DPKG_MAINTSCRIPT_PACKAGE_REFCOUNT", "1");
     if (!g_root_prefix.empty()) env.set("DPKG_ROOT", g_root_prefix);
-    env.set("GPKG_COMPAT_ROOT", g_root_prefix);
+    std::string debconf_frontend = default_maintscript_debian_frontend();
+    if (!debconf_frontend.empty()) env.set("DEBIAN_FRONTEND", debconf_frontend);
 
     return run_path_with_args(script_path, args);
 }
@@ -2159,11 +2234,23 @@ struct CompatDpkgPackageInfo {
     std::string debian_name;
     std::string version;
     std::string arch;
+    std::string package_arch;
     std::string description;
     std::string want = "install";
     std::string flag = "ok";
     std::string status = "installed";
+    std::string metadata_path;
+    std::string source_kind;
+    std::string installed_from;
+    std::string filename;
+    bool is_base_system = false;
+    std::vector<std::string> file_list;
 };
+
+bool ensure_compat_package_control_metadata(
+    const CompatDpkgPackageInfo& info,
+    const std::string& requested_control_name
+);
 
 bool load_compat_dpkg_package_by_gpkg_name(
     const std::string& gpkg_name,
@@ -2181,14 +2268,17 @@ bool load_compat_dpkg_package_by_gpkg_name(
 
     out_info = {};
     out_info.gpkg_name = gpkg_name;
+    out_info.metadata_path = metadata_path;
     get_json_string_value_from_object(content, "debian_package", out_info.debian_name);
     if (out_info.debian_name.empty()) get_json_string_value_from_object(content, "package", out_info.debian_name);
     if (out_info.debian_name.empty()) out_info.debian_name = gpkg_name;
     get_json_string_value_from_object(content, "version", out_info.version);
     get_json_string_value_from_object(content, "description", out_info.description);
-    out_info.arch = compat_debian_architecture_for_package_arch(
-        read_json_string_from_metadata_path(metadata_path, "architecture")
-    );
+    out_info.package_arch = read_json_string_from_metadata_path(metadata_path, "architecture");
+    out_info.arch = compat_debian_architecture_for_package_arch(out_info.package_arch);
+    get_json_string_value_from_object(content, "source_kind", out_info.source_kind);
+    get_json_string_value_from_object(content, "installed_from", out_info.installed_from);
+    get_json_string_value_from_object(content, "filename", out_info.filename);
 
     PackageStatusRecord record;
     if (get_package_status_record(gpkg_name, &record)) {
@@ -2201,6 +2291,42 @@ bool load_compat_dpkg_package_by_gpkg_name(
     return true;
 }
 
+bool load_compat_dpkg_package_from_base_system_object(
+    const std::string& obj,
+    CompatDpkgPackageInfo& out_info
+) {
+    std::string package;
+    if (!get_json_string_value_from_object(obj, "package", package) || package.empty()) return false;
+
+    out_info = {};
+    out_info.gpkg_name = package;
+    out_info.debian_name = package;
+    get_json_string_value_from_object(obj, "version", out_info.version);
+    get_json_string_value_from_object(obj, "source_kind", out_info.source_kind);
+    get_json_string_value_from_object(obj, "installed_from", out_info.installed_from);
+    out_info.package_arch = native_package_architecture();
+    out_info.arch = compat_debian_architecture_for_package_arch(out_info.package_arch);
+    out_info.is_base_system = true;
+    get_json_string_array_from_object(obj, "files", out_info.file_list);
+    return true;
+}
+
+bool load_compat_dpkg_package_from_base_system(
+    const std::string& pkg_name,
+    CompatDpkgPackageInfo& out_info
+) {
+    bool found = false;
+    foreach_json_object_in_file(get_base_system_registry_path(), [&](const std::string& obj) {
+        CompatDpkgPackageInfo candidate;
+        if (!load_compat_dpkg_package_from_base_system_object(obj, candidate)) return true;
+        if (candidate.gpkg_name != pkg_name) return true;
+        out_info = std::move(candidate);
+        found = true;
+        return false;
+    });
+    return found;
+}
+
 std::vector<CompatDpkgPackageInfo> collect_all_compat_dpkg_packages() {
     std::vector<CompatDpkgPackageInfo> packages;
     std::set<std::string> seen;
@@ -2210,6 +2336,14 @@ std::vector<CompatDpkgPackageInfo> collect_all_compat_dpkg_packages() {
         if (!load_compat_dpkg_package_by_gpkg_name(gpkg_name, info)) continue;
         packages.push_back(std::move(info));
     }
+    foreach_json_object_in_file(get_base_system_registry_path(), [&](const std::string& obj) {
+        CompatDpkgPackageInfo info;
+        if (!load_compat_dpkg_package_from_base_system_object(obj, info)) return true;
+        std::string package = info.gpkg_name;
+        if (!seen.insert(package).second) return true;
+        packages.push_back(std::move(info));
+        return true;
+    });
     return packages;
 }
 
@@ -2225,6 +2359,10 @@ bool resolve_compat_dpkg_package(
             out_info.query_name = query_name;
             return true;
         }
+    }
+    if (load_compat_dpkg_package_from_base_system(normalized, out_info)) {
+        out_info.query_name = query_name;
+        return true;
     }
 
     for (const auto& info : collect_all_compat_dpkg_packages()) {
@@ -2266,6 +2404,11 @@ std::vector<CompatDpkgPackageInfo> match_compat_dpkg_packages(const std::string&
         matches.push_back(info);
     }
     return matches;
+}
+
+std::vector<std::string> load_compat_package_file_list(const CompatDpkgPackageInfo& info) {
+    if (!info.file_list.empty() || info.is_base_system) return info.file_list;
+    return read_list_file_from_disk(info.gpkg_name);
 }
 
 std::vector<std::string> load_compat_package_conffiles(const CompatDpkgPackageInfo& info) {
@@ -2334,6 +2477,10 @@ std::string compat_package_binary_name(const CompatDpkgPackageInfo& info) {
 
 std::string compat_package_conffiles_field(const CompatDpkgPackageInfo& info) {
     std::vector<std::string> conffiles = load_compat_package_conffiles(info);
+    if (conffiles.empty()) {
+        ensure_compat_package_control_metadata(info, "conffiles");
+        conffiles = load_compat_package_conffiles(info);
+    }
     if (conffiles.empty()) return "";
 
     std::map<std::string, std::string> md5sums = load_compat_package_md5sums(info);
@@ -2417,7 +2564,7 @@ std::string render_compat_showformat(
     return rendered;
 }
 
-std::string compat_package_control_path(
+std::string compat_existing_package_control_path(
     const CompatDpkgPackageInfo& info,
     const std::string& control_name
 ) {
@@ -2433,11 +2580,454 @@ std::string compat_package_control_path(
     return "";
 }
 
+void compat_append_existing_regular_file(
+    const std::string& path,
+    std::vector<std::string>& out,
+    std::set<std::string>& seen
+) {
+    struct stat st {};
+    if (stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) return;
+    if (seen.insert(path).second) out.push_back(path);
+}
+
+std::vector<std::string> compat_candidate_package_names(const CompatDpkgPackageInfo& info) {
+    std::vector<std::string> names;
+    std::set<std::string> seen;
+    const std::string candidates[] = {info.gpkg_name, info.debian_name};
+    for (const auto& candidate : candidates) {
+        std::string trimmed = trim(candidate);
+        if (trimmed.empty()) continue;
+        if (seen.insert(trimmed).second) names.push_back(trimmed);
+    }
+    return names;
+}
+
+bool compat_filename_matches_debian_archive(
+    const std::string& filename,
+    const CompatDpkgPackageInfo& info
+) {
+    if (!GpkgArchive::path_has_suffix(filename, ".deb")) return false;
+    std::vector<std::string> names = compat_candidate_package_names(info);
+    if (names.empty()) return false;
+
+    bool name_match = false;
+    for (const auto& name : names) {
+        if (filename.rfind(name + "_", 0) == 0) {
+            name_match = true;
+            break;
+        }
+    }
+    if (!name_match) return false;
+
+    if (!info.version.empty()) {
+        std::string version_token = "_" + safe_repo_filename_component_local(info.version) + "_";
+        if (filename.find(version_token) == std::string::npos &&
+            filename.find("_" + info.version + "_") == std::string::npos) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool compat_filename_matches_imported_archive(
+    const std::string& filename,
+    const CompatDpkgPackageInfo& info
+) {
+    const std::string extension = ".gpkg";
+    if (!GpkgArchive::path_has_suffix(filename, extension)) return false;
+    std::vector<std::string> names = compat_candidate_package_names(info);
+    if (names.empty()) return false;
+
+    std::string stem = filename.substr(0, filename.size() - extension.size());
+    bool name_match = false;
+    for (const auto& name : names) {
+        std::string safe_name = cache_safe_component_local(name);
+        if (stem.rfind(safe_name + "_", 0) == 0) {
+            name_match = true;
+            break;
+        }
+    }
+    if (!name_match) return false;
+
+    if (!info.version.empty()) {
+        std::string safe_version = safe_repo_filename_component_local(info.version);
+        if (stem.find("_" + safe_version + "_") == std::string::npos &&
+            stem.find("_" + info.version + "_") == std::string::npos) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::vector<std::string> compat_find_cached_debian_archive_paths(const CompatDpkgPackageInfo& info) {
+    std::vector<std::string> candidates;
+    std::set<std::string> seen;
+    std::vector<std::string> package_names = compat_candidate_package_names(info);
+    std::string basename = path_basename(info.filename);
+
+    if (!basename.empty()) {
+        for (const auto& name : package_names) {
+            compat_append_existing_regular_file(
+                get_debian_pool_cache_dir() + cache_safe_component_local(name) + "/" + basename,
+                candidates,
+                seen
+            );
+        }
+    }
+
+    DIR* pool = opendir(get_debian_pool_cache_dir().c_str());
+    if (!pool) return candidates;
+    while (true) {
+        errno = 0;
+        dirent* dir_entry = readdir(pool);
+        if (!dir_entry) break;
+
+        std::string dir_name = dir_entry->d_name;
+        if (dir_name == "." || dir_name == "..") continue;
+        std::string dir_path = get_debian_pool_cache_dir() + dir_name;
+        struct stat dir_st {};
+        if (stat(dir_path.c_str(), &dir_st) != 0 || !S_ISDIR(dir_st.st_mode)) continue;
+
+        DIR* pkg_dir = opendir(dir_path.c_str());
+        if (!pkg_dir) continue;
+        while (true) {
+            errno = 0;
+            dirent* file_entry = readdir(pkg_dir);
+            if (!file_entry) break;
+
+            std::string filename = file_entry->d_name;
+            if (filename == "." || filename == "..") continue;
+            if (!basename.empty() && filename == basename) {
+                compat_append_existing_regular_file(dir_path + "/" + filename, candidates, seen);
+                continue;
+            }
+            if (!compat_filename_matches_debian_archive(filename, info)) continue;
+            compat_append_existing_regular_file(dir_path + "/" + filename, candidates, seen);
+        }
+        closedir(pkg_dir);
+    }
+    closedir(pool);
+    return candidates;
+}
+
+std::vector<std::string> compat_find_cached_imported_gpkg_paths(const CompatDpkgPackageInfo& info) {
+    std::vector<std::string> candidates;
+    std::set<std::string> seen;
+    DIR* imported_root = opendir(get_imported_cache_dir().c_str());
+    if (!imported_root) return candidates;
+
+    while (true) {
+        errno = 0;
+        dirent* version_entry = readdir(imported_root);
+        if (!version_entry) break;
+
+        std::string version_dir_name = version_entry->d_name;
+        if (version_dir_name == "." || version_dir_name == "..") continue;
+        std::string version_dir = get_imported_cache_dir() + version_dir_name;
+        struct stat version_st {};
+        if (stat(version_dir.c_str(), &version_st) != 0 || !S_ISDIR(version_st.st_mode)) continue;
+
+        DIR* source_root = opendir(version_dir.c_str());
+        if (!source_root) continue;
+        while (true) {
+            errno = 0;
+            dirent* source_entry = readdir(source_root);
+            if (!source_entry) break;
+
+            std::string source_dir_name = source_entry->d_name;
+            if (source_dir_name == "." || source_dir_name == "..") continue;
+            if (!info.source_kind.empty() &&
+                source_dir_name != info.source_kind &&
+                !(info.source_kind == "base_image" && source_dir_name == "debian")) {
+                continue;
+            }
+
+            std::string source_dir = version_dir + "/" + source_dir_name;
+            struct stat source_st {};
+            if (stat(source_dir.c_str(), &source_st) != 0 || !S_ISDIR(source_st.st_mode)) continue;
+
+            DIR* package_dir = opendir(source_dir.c_str());
+            if (!package_dir) continue;
+            while (true) {
+                errno = 0;
+                dirent* file_entry = readdir(package_dir);
+                if (!file_entry) break;
+
+                std::string filename = file_entry->d_name;
+                if (filename == "." || filename == "..") continue;
+                if (!compat_filename_matches_imported_archive(filename, info)) continue;
+                compat_append_existing_regular_file(source_dir + "/" + filename, candidates, seen);
+            }
+            closedir(package_dir);
+        }
+        closedir(source_root);
+    }
+    closedir(imported_root);
+    return candidates;
+}
+
+bool compat_locate_deb_member_archive(
+    const std::string& directory,
+    const std::string& prefix,
+    std::string& out_path
+) {
+    out_path.clear();
+    DIR* dir = opendir(directory.c_str());
+    if (!dir) return false;
+    while (true) {
+        errno = 0;
+        dirent* entry = readdir(dir);
+        if (!entry) break;
+        std::string name = entry->d_name;
+        if (name.rfind(prefix, 0) != 0) continue;
+        out_path = directory + "/" + name;
+        closedir(dir);
+        return true;
+    }
+    closedir(dir);
+    return false;
+}
+
+bool compat_materialize_deb_control_tar(
+    const std::string& archive_path,
+    const std::string& output_path,
+    std::string* error_out = nullptr
+) {
+    if (error_out) error_out->clear();
+    if (GpkgArchive::path_has_suffix(archive_path, ".tar")) {
+        if (!copy_file_atomic(archive_path, output_path)) {
+            if (error_out) *error_out = "failed to copy control.tar";
+            return false;
+        }
+        return true;
+    }
+    if (GpkgArchive::path_has_suffix(archive_path, ".tar.gz") || GpkgArchive::path_has_suffix(archive_path, ".tgz")) {
+        return GpkgArchive::decompress_gzip_file(archive_path, output_path, error_out);
+    }
+    if (GpkgArchive::path_has_suffix(archive_path, ".tar.xz") || GpkgArchive::path_has_suffix(archive_path, ".tar.lzma")) {
+        return GpkgArchive::decompress_xz_file(archive_path, output_path, error_out);
+    }
+    if (GpkgArchive::path_has_suffix(archive_path, ".tar.zst") || GpkgArchive::path_has_suffix(archive_path, ".tar.zstd")) {
+        return GpkgArchive::decompress_zstd_file(archive_path, output_path, error_out);
+    }
+    if (error_out) *error_out = "unsupported control archive compression";
+    return false;
+}
+
+bool compat_backfill_conffile_manifest(
+    const CompatDpkgPackageInfo& info,
+    const std::string& control_root
+) {
+    std::string conffile_manifest = get_conffile_manifest_path(info.gpkg_name);
+    if (access(conffile_manifest.c_str(), F_OK) == 0) return true;
+
+    std::string source_path = control_root + "/conffiles";
+    struct stat st {};
+    if (stat(source_path.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) return true;
+
+    std::vector<std::string> conffiles = read_trimmed_line_file(source_path);
+    std::ostringstream out;
+    for (const auto& entry : conffiles) {
+        if (!entry.empty()) out << entry << "\n";
+    }
+    return write_text_file_atomic(conffile_manifest, out.str(), 0644);
+}
+
+bool compat_install_control_metadata_from_dirs(
+    const CompatDpkgPackageInfo& info,
+    const std::string& control_root,
+    const std::string& scripts_root,
+    std::string* error_out = nullptr
+) {
+    if (error_out) error_out->clear();
+    if (!mkdir_p(get_info_dir())) {
+        if (error_out) *error_out = "failed to create gpkg info dir";
+        return false;
+    }
+
+    const std::vector<std::string> maintscript_names = {"preinst", "postinst", "prerm", "postrm"};
+    std::set<std::string> maintscript_set(maintscript_names.begin(), maintscript_names.end());
+    std::vector<std::string> extracted_names = collect_extracted_debian_control_sidecar_names(control_root);
+    std::vector<std::string> sidecar_names;
+    for (const auto& name : extracted_names) {
+        if (maintscript_set.count(name) != 0) continue;
+        sidecar_names.push_back(name);
+    }
+
+    bool changed = false;
+    for (const auto& sidecar_name : sidecar_names) {
+        std::string source_path = control_root + "/" + sidecar_name;
+        std::string target_path = get_debian_control_sidecar_path(info.gpkg_name, sidecar_name);
+        if (!copy_file_atomic(source_path, target_path)) {
+            if (error_out) *error_out = "failed to install control sidecar " + sidecar_name;
+            return false;
+        }
+        changed = true;
+    }
+
+    std::ostringstream manifest;
+    for (const auto& sidecar_name : sidecar_names) manifest << sidecar_name << "\n";
+    if (!sidecar_names.empty() &&
+        !write_text_file_atomic(get_debian_control_sidecar_manifest_path(info.gpkg_name), manifest.str(), 0644)) {
+        if (error_out) *error_out = "failed to write control sidecar manifest";
+        return false;
+    }
+
+    for (const auto& script_name : maintscript_names) {
+        std::string source_path = scripts_root + "/" + script_name;
+        struct stat st {};
+        if (stat(source_path.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) {
+            source_path = control_root + "/" + script_name;
+            if (stat(source_path.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) continue;
+        }
+
+        std::string target_path = get_info_dir() + info.gpkg_name + "." + script_name;
+        if (access(target_path.c_str(), F_OK) == 0) continue;
+        if (!copy_file_atomic(source_path, target_path)) {
+            if (error_out) *error_out = "failed to backfill maintainer script " + script_name;
+            return false;
+        }
+        changed = true;
+    }
+
+    if (!compat_backfill_conffile_manifest(info, control_root)) {
+        if (error_out) *error_out = "failed to backfill conffile manifest";
+        return false;
+    }
+
+    return changed || !sidecar_names.empty();
+}
+
+bool compat_backfill_control_metadata_from_cached_deb(
+    const CompatDpkgPackageInfo& info,
+    std::string* error_out = nullptr
+) {
+    if (error_out) error_out->clear();
+    for (const auto& deb_path : compat_find_cached_debian_archive_paths(info)) {
+        char temp_template[] = "/tmp/gpkg-compat-deb-XXXXXX";
+        char* temp_dir = mkdtemp(temp_template);
+        if (!temp_dir) continue;
+
+        std::string temp_root = temp_dir;
+        std::string ar_error;
+        bool ok = GpkgArchive::extract_ar_archive_to_directory(deb_path, temp_root, &ar_error);
+        if (!ok) {
+            remove_tree_no_follow(temp_root);
+            continue;
+        }
+
+        std::string control_archive;
+        if (!compat_locate_deb_member_archive(temp_root, "control.tar", control_archive)) {
+            remove_tree_no_follow(temp_root);
+            continue;
+        }
+
+        std::string control_tar = temp_root + "/control.tar";
+        std::string materialize_error;
+        if (!compat_materialize_deb_control_tar(control_archive, control_tar, &materialize_error)) {
+            remove_tree_no_follow(temp_root);
+            continue;
+        }
+
+        std::string control_root = temp_root + "/control";
+        if (!mkdir_p(control_root)) {
+            remove_tree_no_follow(temp_root);
+            continue;
+        }
+
+        std::string archive_error;
+        if (!GpkgArchive::tar_extract_to_directory(control_tar, control_root, {}, &archive_error)) {
+            remove_tree_no_follow(temp_root);
+            continue;
+        }
+
+        std::string install_error;
+        bool installed = compat_install_control_metadata_from_dirs(
+            info,
+            control_root,
+            control_root,
+            &install_error
+        );
+        remove_tree_no_follow(temp_root);
+        if (installed) return true;
+        if (error_out && !install_error.empty()) *error_out = install_error;
+    }
+    return false;
+}
+
+bool compat_backfill_control_metadata_from_imported_gpkg(
+    const CompatDpkgPackageInfo& info,
+    std::string* error_out = nullptr
+) {
+    if (error_out) error_out->clear();
+    for (const auto& gpkg_path : compat_find_cached_imported_gpkg_paths(info)) {
+        char temp_template[] = "/tmp/gpkg-compat-import-XXXXXX";
+        char* temp_dir = mkdtemp(temp_template);
+        if (!temp_dir) continue;
+
+        std::string temp_root = temp_dir;
+        std::string package_tar = temp_root + "/package.tar";
+        std::string archive_error;
+        if (!GpkgArchive::decompress_zstd_file(gpkg_path, package_tar, &archive_error) ||
+            !GpkgArchive::tar_extract_to_directory(package_tar, temp_root, {}, &archive_error)) {
+            remove_tree_no_follow(temp_root);
+            continue;
+        }
+
+        std::string install_error;
+        bool installed = compat_install_control_metadata_from_dirs(
+            info,
+            temp_root + "/control",
+            temp_root + "/scripts",
+            &install_error
+        );
+        remove_tree_no_follow(temp_root);
+        if (installed) return true;
+        if (error_out && !install_error.empty()) *error_out = install_error;
+    }
+    return false;
+}
+
+bool ensure_compat_package_control_metadata(
+    const CompatDpkgPackageInfo& info,
+    const std::string& requested_control_name = ""
+) {
+    if (!requested_control_name.empty() &&
+        !compat_existing_package_control_path(info, requested_control_name).empty()) {
+        return true;
+    }
+
+    std::string error_detail;
+    if (compat_backfill_control_metadata_from_cached_deb(info, &error_detail)) {
+        VLOG("Backfilled Debian control metadata for " << info.gpkg_name << " from cached .deb.");
+        return true;
+    }
+    if (compat_backfill_control_metadata_from_imported_gpkg(info, &error_detail)) {
+        VLOG("Backfilled Debian control metadata for " << info.gpkg_name << " from cached imported package.");
+        return true;
+    }
+    if (g_verbose && !error_detail.empty()) {
+        VLOG("Unable to backfill Debian control metadata for " << info.gpkg_name << ": " << error_detail);
+    }
+    return false;
+}
+
+std::string compat_package_control_path(
+    const CompatDpkgPackageInfo& info,
+    const std::string& control_name
+) {
+    std::string existing_path = compat_existing_package_control_path(info, control_name);
+    if (!existing_path.empty()) return existing_path;
+    if (!ensure_compat_package_control_metadata(info, control_name)) return "";
+    return compat_existing_package_control_path(info, control_name);
+}
+
 std::vector<std::string> compat_package_control_names(const CompatDpkgPackageInfo& info) {
+    ensure_compat_package_control_metadata(info);
     std::vector<std::string> names = load_debian_control_sidecar_names(info.gpkg_name);
     const std::vector<std::string> maintscript_names = {"preinst", "postinst", "prerm", "postrm"};
     for (const auto& control_name : maintscript_names) {
-        if (!compat_package_control_path(info, control_name).empty()) names.push_back(control_name);
+        if (!compat_existing_package_control_path(info, control_name).empty()) names.push_back(control_name);
     }
     std::sort(names.begin(), names.end());
     names.erase(std::unique(names.begin(), names.end()), names.end());
@@ -2475,7 +3065,7 @@ bool compat_find_owned_paths(
     bool has_glob = compat_pattern_has_glob(pattern);
     bool matched = false;
     for (const auto& info : collect_all_compat_dpkg_packages()) {
-        for (const auto& path : read_list_file_from_disk(info.gpkg_name)) {
+        for (const auto& path : load_compat_package_file_list(info)) {
             if ((has_glob && compat_wildcard_match(path, pattern)) || (!has_glob && path == pattern)) {
                 matches_out.push_back({info.debian_name.empty() ? info.gpkg_name : info.debian_name, path});
                 matched = true;
@@ -2528,7 +3118,13 @@ int action_compat_dpkg_query(const std::vector<std::string>& raw_args) {
         }
         std::string control_name = operands.size() > 1 ? operands[1] : "control";
         std::string path = compat_package_control_path(info, control_name);
-        if (path.empty()) return run_real_dpkg_query_with_args(raw_args);
+        if (path.empty()) {
+            std::cerr << "dpkg-query: error: control file '" << control_name
+                      << "' is not available for package '"
+                      << (info.debian_name.empty() ? info.gpkg_name : info.debian_name)
+                      << "'" << std::endl;
+            return 1;
+        }
         std::cout << path << std::endl;
         return 0;
     }
@@ -2552,7 +3148,13 @@ int action_compat_dpkg_query(const std::vector<std::string>& raw_args) {
             return run_real_dpkg_query_with_args(raw_args);
         }
         std::string path = compat_package_control_path(info, operands[1]);
-        if (path.empty()) return run_real_dpkg_query_with_args(raw_args);
+        if (path.empty()) {
+            std::cerr << "dpkg-query: error: control file '" << operands[1]
+                      << "' is not available for package '"
+                      << (info.debian_name.empty() ? info.gpkg_name : info.debian_name)
+                      << "'" << std::endl;
+            return 1;
+        }
         std::ifstream in(path, std::ios::binary);
         if (!in) return 1;
         std::cout << in.rdbuf();
@@ -2568,7 +3170,7 @@ int action_compat_dpkg_query(const std::vector<std::string>& raw_args) {
                 real_operands.push_back(operand);
                 continue;
             }
-            for (const auto& path : read_list_file_from_disk(info.gpkg_name)) {
+            for (const auto& path : load_compat_package_file_list(info)) {
                 std::cout << path << std::endl;
             }
             printed = true;
@@ -6123,6 +6725,28 @@ bool action_refresh_runtime_linker_state() {
     return refresh_linker_cache_if_available();
 }
 
+bool action_hydrate_control_metadata(const std::string& pkg_name) {
+    if (pkg_name.empty()) {
+        std::cerr << "E: Missing package name for control metadata hydration." << std::endl;
+        return false;
+    }
+
+    CompatDpkgPackageInfo info;
+    if (!resolve_compat_dpkg_package(pkg_name, info)) {
+        std::cerr << "E: Package " << pkg_name
+                  << " is not installed, so gpkg cannot hydrate its Debian control metadata."
+                  << std::endl;
+        return false;
+    }
+
+    if (!ensure_compat_package_control_metadata(info)) {
+        std::cerr << "E: Unable to hydrate Debian control metadata for " << pkg_name << "." << std::endl;
+        return false;
+    }
+
+    return true;
+}
+
 int main(int argc, char* argv[]) {
 
     for (int i = 1; i < argc; ++i) {
@@ -6140,7 +6764,7 @@ int main(int argc, char* argv[]) {
 
     if (argc < 2) {
 
-        std::cout << "Usage: gpkg-worker [options]\nOptions:\n  --install <file>\n  --remove <pkg>\n  --purge <pkg>\n  --retire <pkg>\n  --verify <pkg>\n  --compat-dpkg-query [dpkg-query args...]\n  --refresh-runtime-linker-state\n  --refresh-selinux-label-state\n  --register-file <path> --pkg <name>\n  --register-undo <cmd> --pkg <name>\n  --jobs <n>\n  --defer-runtime-linker-refresh\n  --defer-selinux-relabel\n  --unsafe-io\n";
+        std::cout << "Usage: gpkg-worker [options]\nOptions:\n  --install <file>\n  --remove <pkg>\n  --purge <pkg>\n  --retire <pkg>\n  --verify <pkg>\n  --hydrate-control-metadata <pkg>\n  --compat-dpkg-query [dpkg-query args...]\n  --refresh-runtime-linker-state\n  --refresh-selinux-label-state\n  --register-file <path> --pkg <name>\n  --register-undo <cmd> --pkg <name>\n  --jobs <n>\n  --defer-runtime-linker-refresh\n  --defer-selinux-relabel\n  --unsafe-io\n";
 
         return 1;
 
@@ -6162,6 +6786,8 @@ int main(int argc, char* argv[]) {
         else if (arg == "--retire") mode = "retire", target = argv[++i];
 
         else if (arg == "--verify") mode = "verify", target = argv[++i];
+
+        else if (arg == "--hydrate-control-metadata") mode = "hydrate-control-metadata", target = argv[++i];
 
         else if (arg == "--refresh-runtime-linker-state") mode = "refresh-runtime-linker-state";
 
@@ -6203,6 +6829,10 @@ int main(int argc, char* argv[]) {
     if (mode == "install" && !target.empty()) return action_install(target) ? 0 : 1;
 
     if (mode == "verify" && !target.empty()) return action_verify(target) ? 0 : 1;
+
+    if (mode == "hydrate-control-metadata" && !target.empty()) {
+        return action_hydrate_control_metadata(target) ? 0 : 1;
+    }
 
     if (mode == "refresh-runtime-linker-state") return action_refresh_runtime_linker_state() ? 0 : 1;
 
