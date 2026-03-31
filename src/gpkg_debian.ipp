@@ -6582,7 +6582,7 @@ bool update_debian_backend_index(
 }
 
 std::string get_imported_gpkg_path(const PackageMetadata& meta) {
-    std::string base = REPO_CACHE_PATH + "imported/v7/"
+    std::string base = REPO_CACHE_PATH + "imported/v8/"
         + cache_safe_component(meta.source_kind) + "/"
         + cache_safe_component(meta.name);
     return base + "_" + safe_repo_filename_component(meta.version) + "_" + cache_safe_component(meta.arch) + EXTENSION;
@@ -7010,6 +7010,10 @@ bool build_imported_gpkg_archive(
     const PackageOverridePolicy* package_override =
         override_it == policy.package_overrides.end() ? nullptr : &override_it->second;
     const std::vector<std::string> maintainer_scripts = {"preinst", "postinst", "prerm", "postrm"};
+    std::set<std::string> maintainer_script_names(
+        maintainer_scripts.begin(),
+        maintainer_scripts.end()
+    );
     for (const auto& script_name : maintainer_scripts) {
         if (package_override &&
             std::find(
@@ -7042,6 +7046,58 @@ bool build_imported_gpkg_archive(
         VLOG(verbose, "Included Debian maintainer script "
              << policy_name << ":" << script_name << " in converted package.");
     }
+
+    DIR* control_dir = opendir(control_root.c_str());
+    if (!control_dir) {
+        std::cerr << Color::RED << "E: Failed to inspect converted Debian control data for "
+                  << meta.name << Color::RESET << std::endl;
+        remove_path_recursive(temp_root);
+        return false;
+    }
+    while (true) {
+        errno = 0;
+        dirent* entry = readdir(control_dir);
+        if (!entry) break;
+
+        std::string name = entry->d_name;
+        if (name == "." || name == "..") continue;
+        if (maintainer_script_names.count(name) != 0) continue;
+
+        std::string full_path = control_root + "/" + name;
+        struct stat st {};
+        if (stat(full_path.c_str(), &st) != 0) {
+            closedir(control_dir);
+            std::cerr << Color::RED
+                      << "E: Failed to inspect Debian control sidecar "
+                      << policy_name << ":" << name << Color::RESET << std::endl;
+            remove_path_recursive(temp_root);
+            return false;
+        }
+        if (!S_ISREG(st.st_mode)) {
+            VLOG(verbose, "Skipping non-regular Debian control sidecar "
+                 << policy_name << ":" << name);
+            continue;
+        }
+
+        top_level_sources.push_back({
+            "control/" + name,
+            full_path,
+            GpkgArchive::TarEntryType::Regular,
+            st.st_mode & 07777,
+            ""
+        });
+        VLOG(verbose, "Included Debian control sidecar "
+             << policy_name << ":" << name << " in converted package.");
+    }
+    int control_errno = errno;
+    closedir(control_dir);
+    if (control_errno != 0) {
+        std::cerr << Color::RED << "E: Failed while reading converted Debian control data for "
+                  << meta.name << Color::RESET << std::endl;
+        remove_path_recursive(temp_root);
+        return false;
+    }
+
     if (!GpkgArchive::tar_create_from_sources(top_level_sources, final_tar, &archive_error)) {
         std::cerr << Color::RED << "E: Failed to assemble the converted package for "
                   << meta.name;
