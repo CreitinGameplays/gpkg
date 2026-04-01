@@ -2629,7 +2629,7 @@ DebianIncrementalImportResult load_debian_index_entries_from_records_incremental
                 cache_entry.record_fingerprint = fingerprint_it->second;
                 cache_entry.provided_symbols = provided_it->second;
 
-                    if (!record.filename.empty() && !record.sha256.empty()) {
+                if (!record.filename.empty() && !record.sha256.empty()) {
                     if (matches_any_pattern(record.package, policy.skip_packages)) {
                         cache_entry.skip_reason = "blocked by policy";
                     } else {
