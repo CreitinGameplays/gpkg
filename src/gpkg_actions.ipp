@@ -8,6 +8,13 @@ struct InstallCommandResult {
     std::string last_processed_package;
 };
 
+struct CachedArchivePayloadInfo {
+    bool available = false;
+    bool approximate = true;
+    uint64_t target_bytes = 0;
+    std::vector<std::string> installed_paths;
+};
+
 bool prepare_install_archives(
     const std::vector<PackageMetadata>& packages,
     const DownloadBatchReport& download_report,
@@ -18,9 +25,16 @@ std::vector<std::string> build_dpkg_command_argv(const std::vector<std::string>&
 std::string debian_backend_package_name(const PackageMetadata& meta);
 bool package_uses_native_dpkg_backend(const PackageMetadata& meta);
 bool ensure_native_dpkg_backend_ready(bool verbose, std::string* error_out = nullptr);
+bool inspect_debian_archive_payload_for_disk_estimate(
+    const std::string& archive_path,
+    CachedArchivePayloadInfo* out_info
+);
 InstallCommandResult install_native_debian_batch(
     const std::vector<PackageMetadata>& batch,
-    bool verbose
+    bool verbose,
+    size_t progress_base = 0,
+    size_t progress_total = 0,
+    size_t* progress_width = nullptr
 );
 
 bool update_package_auto_install_state_after_install(
@@ -405,6 +419,231 @@ bool ensure_native_dpkg_admin_layout(std::string* error_out) {
     return true;
 }
 
+bool dpkg_version_starts_with_digit(const std::string& version) {
+    return !version.empty() &&
+           std::isdigit(static_cast<unsigned char>(version.front())) != 0;
+}
+
+std::string normalize_dpkg_compatible_version(
+    const std::string& pkg_name,
+    const std::string& raw_version,
+    const ImportPolicy& policy
+) {
+    std::string version = trim(raw_version);
+    if (version.empty()) {
+        version = native_dpkg_seed_prefers_high_compat_version(pkg_name, policy) ? "9999" : "0";
+    }
+
+    if (native_dpkg_seed_prefers_high_compat_version(pkg_name, policy) && version == "0") {
+        version = "9999";
+    }
+
+    if (dpkg_version_starts_with_digit(version)) return version;
+    return "0~" + version;
+}
+
+bool repair_native_dpkg_status_database(bool verbose, std::string* error_out) {
+    if (error_out) error_out->clear();
+    if (!ensure_native_dpkg_admin_layout(error_out)) return false;
+
+    std::ifstream in(DPKG_STATUS_FILE);
+    if (!in) {
+        if (error_out) *error_out = "failed to open " + DPKG_STATUS_FILE + ": " + std::strerror(errno);
+        return false;
+    }
+
+    const ImportPolicy& policy = get_import_policy(verbose);
+    std::vector<std::vector<std::string>> paragraphs;
+    std::vector<std::string> current;
+    std::string line;
+    while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty()) {
+            if (!current.empty()) {
+                paragraphs.push_back(current);
+                current.clear();
+            }
+            continue;
+        }
+        current.push_back(line);
+    }
+    if (!current.empty()) paragraphs.push_back(current);
+
+    bool changed = false;
+    std::ostringstream rebuilt;
+    for (auto paragraph : paragraphs) {
+        std::string pkg_name;
+        std::string version;
+        ssize_t version_index = -1;
+        for (size_t i = 0; i < paragraph.size(); ++i) {
+            const std::string& raw = paragraph[i];
+            size_t colon = raw.find(':');
+            if (colon == std::string::npos) continue;
+            std::string key = trim(raw.substr(0, colon));
+            std::string value = trim(raw.substr(colon + 1));
+            if (key == "Package") {
+                pkg_name = value;
+            } else if (key == "Version") {
+                version = value;
+                version_index = static_cast<ssize_t>(i);
+            }
+        }
+
+        if (!pkg_name.empty()) {
+            std::string normalized_version =
+                normalize_dpkg_compatible_version(pkg_name, version, policy);
+            if (version_index >= 0) {
+                if (trim(version) != normalized_version) {
+                    paragraph[static_cast<size_t>(version_index)] = "Version: " + normalized_version;
+                    changed = true;
+                }
+            } else {
+                paragraph.push_back("Version: " + normalized_version);
+                changed = true;
+            }
+        }
+
+        for (const auto& entry_line : paragraph) {
+            rebuilt << entry_line << "\n";
+        }
+        rebuilt << "\n";
+    }
+
+    std::string rebuilt_content = rebuilt.str();
+    if (changed && !write_text_file_atomically(DPKG_STATUS_FILE, rebuilt_content)) {
+        if (error_out) *error_out = "failed to repair " + DPKG_STATUS_FILE + ": " + std::strerror(errno);
+        return false;
+    }
+
+    if (changed || access((DPKG_ADMIN_DIR + "/status-old").c_str(), F_OK) != 0) {
+        if (!write_text_file_atomically(DPKG_ADMIN_DIR + "/status-old", rebuilt_content)) {
+            if (verbose) {
+                std::cout << "[DEBUG] Failed to refresh " << DPKG_ADMIN_DIR + "/status-old"
+                          << " during native dpkg repair." << std::endl;
+            }
+        }
+    }
+
+    std::map<std::string, std::vector<std::string>> base_files_by_package;
+    for (const auto& entry : load_base_system_registry_entries()) {
+        if (entry.package.empty() || entry.files.empty()) continue;
+        if (base_files_by_package.count(entry.package) != 0) continue;
+        base_files_by_package[entry.package] = entry.files;
+    }
+
+    for (const auto& record : load_dpkg_package_status_records()) {
+        if (record.package.empty() || !package_status_is_installed_like(record.status)) continue;
+
+        std::string list_path = DPKG_INFO_DIR + "/" + record.package + ".list";
+        if (access(list_path.c_str(), F_OK) == 0) continue;
+
+        std::vector<std::string> files = read_installed_file_list(record.package);
+        if (files.empty()) {
+            auto base_it = base_files_by_package.find(record.package);
+            if (base_it != base_files_by_package.end()) files = base_it->second;
+        }
+
+        std::set<std::string> normalized_files;
+        for (const auto& file : files) {
+            std::string normalized = trim(file);
+            if (normalized.empty()) continue;
+            if (normalized.front() != '/') normalized = "/" + normalized;
+            normalized_files.insert(normalized);
+        }
+
+        std::ostringstream list_stream;
+        for (const auto& file : normalized_files) {
+            list_stream << file << "\n";
+        }
+        if (!write_text_file_atomically(list_path, list_stream.str())) {
+            if (error_out) *error_out = "failed to write " + list_path + ": " + std::strerror(errno);
+            return false;
+        }
+
+        VLOG(verbose, "Reconstructed missing native dpkg file manifest for " << record.package
+                     << " with " << normalized_files.size() << " path(s).");
+    }
+
+    return true;
+}
+
+bool native_dpkg_package_looks_synthetic(const std::string& pkg_name) {
+    if (pkg_name.empty()) return false;
+    if (package_is_base_system_provided(pkg_name)) return true;
+
+    PackageMetadata meta;
+    if (get_installed_package_metadata(pkg_name, meta)) return true;
+    return false;
+}
+
+bool prune_synthetic_dpkg_file_ownership_for_package(
+    const PackageMetadata& meta,
+    bool verbose,
+    std::string* error_out
+) {
+    if (error_out) error_out->clear();
+
+    CachedArchivePayloadInfo payload_info;
+    if (!inspect_debian_archive_payload_for_disk_estimate(
+            get_cached_debian_archive_path(meta),
+            &payload_info) ||
+        !payload_info.available ||
+        payload_info.installed_paths.empty()) {
+        return true;
+    }
+
+    std::string incoming_name = debian_backend_package_name(meta);
+    if (incoming_name.empty()) incoming_name = meta.name;
+
+    std::set<std::string> incoming_paths;
+    for (const auto& path : payload_info.installed_paths) {
+        std::string normalized = trim(path);
+        if (normalized.empty()) continue;
+        if (normalized.front() != '/') normalized = "/" + normalized;
+        incoming_paths.insert(normalized);
+    }
+    if (incoming_paths.empty()) return true;
+
+    for (const auto& record : load_dpkg_package_status_records()) {
+        if (record.package.empty() || record.package == incoming_name) continue;
+        if (!package_status_is_installed_like(record.status)) continue;
+        if (!native_dpkg_package_looks_synthetic(record.package)) continue;
+
+        std::string list_path = DPKG_INFO_DIR + "/" + record.package + ".list";
+        std::vector<std::string> owned_paths = load_dependency_entries(list_path);
+        if (owned_paths.empty()) continue;
+
+        std::vector<std::string> filtered_paths;
+        filtered_paths.reserve(owned_paths.size());
+        size_t removed_count = 0;
+        for (const auto& path : owned_paths) {
+            std::string normalized = trim(path);
+            if (normalized.empty()) continue;
+            if (normalized.front() != '/') normalized = "/" + normalized;
+            if (incoming_paths.count(normalized) != 0) {
+                ++removed_count;
+                continue;
+            }
+            filtered_paths.push_back(normalized);
+        }
+        if (removed_count == 0) continue;
+
+        std::ostringstream list_stream;
+        for (const auto& path : filtered_paths) {
+            list_stream << path << "\n";
+        }
+        if (!write_text_file_atomically(list_path, list_stream.str())) {
+            if (error_out) *error_out = "failed to update " + list_path + ": " + std::strerror(errno);
+            return false;
+        }
+
+        VLOG(verbose, "Dropped " << removed_count << " overlapping path(s) from synthetic native dpkg owner "
+                     << record.package << " before installing " << incoming_name << ".");
+    }
+
+    return true;
+}
+
 bool bootstrap_native_dpkg_status_database(bool verbose, std::string* error_out) {
     if (error_out) error_out->clear();
 
@@ -520,9 +759,7 @@ bool bootstrap_native_dpkg_status_database(bool verbose, std::string* error_out)
         std::string version = !entry.status.version.empty()
             ? entry.status.version
             : (!entry.meta.version.empty() ? entry.meta.version : entry.meta.debian_version);
-        if (version.empty()) {
-            version = native_dpkg_seed_prefers_high_compat_version(package_name, policy) ? "9999" : "0";
-        }
+        version = normalize_dpkg_compatible_version(package_name, version, policy);
 
         std::string priority = trim(entry.meta.priority);
         if (priority.empty()) {
@@ -628,7 +865,7 @@ bool ensure_native_dpkg_backend_ready(bool verbose, std::string* error_out) {
 
     struct stat status_st {};
     if (stat(DPKG_STATUS_FILE.c_str(), &status_st) == 0 && status_st.st_size > 0) {
-        return true;
+        return repair_native_dpkg_status_database(verbose, error_out);
     }
 
     return bootstrap_native_dpkg_status_database(verbose, error_out);
@@ -1524,7 +1761,10 @@ bool package_uses_native_dpkg_backend(const PackageMetadata& meta) {
 
 InstallCommandResult install_native_debian_batch(
     const std::vector<PackageMetadata>& batch,
-    bool verbose
+    bool verbose,
+    size_t progress_base,
+    size_t progress_total,
+    size_t* progress_width
 ) {
     if (batch.empty()) return {true, "", "", 0, ""};
     std::string dpkg_bootstrap_error;
@@ -1610,6 +1850,17 @@ InstallCommandResult install_native_debian_batch(
     InstallCommandResult batch_result;
     for (size_t index : order) {
         const PackageMetadata& meta = batch[index];
+        std::string overlap_repair_error;
+        if (!prune_synthetic_dpkg_file_ownership_for_package(meta, verbose, &overlap_repair_error)) {
+            batch_result.success = false;
+            batch_result.failed_package = debian_backend_package_name(meta);
+            if (batch_result.failed_package.empty()) batch_result.failed_package = meta.name;
+            if (!overlap_repair_error.empty()) {
+                std::cerr << "E: " << overlap_repair_error << std::endl;
+            }
+            return batch_result;
+        }
+
         CommandCaptureResult result = run_command_captured_argv(
             build_dpkg_command_argv({"--install", get_cached_debian_archive_path(meta)}),
             verbose,
@@ -1619,6 +1870,15 @@ InstallCommandResult install_native_debian_batch(
         if (batch_result.last_processed_package.empty()) batch_result.last_processed_package = meta.name;
         if (result.exit_code == 0) {
             ++batch_result.completed_count;
+            if (!verbose && progress_width && progress_total > 0) {
+                render_package_progress(
+                    "current",
+                    progress_base + batch_result.completed_count,
+                    progress_total,
+                    batch_result.last_processed_package,
+                    progress_width
+                );
+            }
             continue;
         }
         batch_result.success = false;
@@ -1945,13 +2205,6 @@ uint64_t estimate_current_installed_payload_bytes(
     if (approximate_out) *approximate_out = true;
     return 0;
 }
-
-struct CachedArchivePayloadInfo {
-    bool available = false;
-    bool approximate = true;
-    uint64_t target_bytes = 0;
-    std::vector<std::string> installed_paths;
-};
 
 CachedArchivePayloadInfo inspect_payload_tar_for_disk_estimate(const std::string& tar_path) {
     CachedArchivePayloadInfo info;
@@ -3775,14 +4028,14 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
                 ++batch_end;
             }
 
-            InstallCommandResult result = install_native_debian_batch(batch, verbose);
+            InstallCommandResult result = install_native_debian_batch(
+                batch,
+                verbose,
+                i,
+                upgrade_queue.size(),
+                &install_progress_width
+            );
             installed_count += result.completed_count;
-            if (!verbose && result.completed_count > 0) {
-                std::string progress_label = result.last_processed_package.empty()
-                    ? batch[result.completed_count - 1].name
-                    : result.last_processed_package;
-                render_package_progress("current", i + result.completed_count, upgrade_queue.size(), progress_label, &install_progress_width);
-            }
             if (!result.success) {
                 if (!verbose) finish_progress_line(&install_progress_width);
                 std::string failed_name = result.failed_package.empty() ? batch.front().name : result.failed_package;
@@ -4252,14 +4505,14 @@ int handle_repair(bool verbose) {
                 ++batch_end;
             }
 
-            InstallCommandResult result = install_native_debian_batch(batch, verbose);
+            InstallCommandResult result = install_native_debian_batch(
+                batch,
+                verbose,
+                i,
+                repair_queue.size(),
+                &install_progress_width
+            );
             repaired_count += result.completed_count;
-            if (!verbose && result.completed_count > 0) {
-                std::string progress_label = result.last_processed_package.empty()
-                    ? batch[result.completed_count - 1].name
-                    : result.last_processed_package;
-                render_package_progress("current", i + result.completed_count, repair_queue.size(), progress_label, &install_progress_width);
-            }
             if (!result.success) {
                 if (!verbose) finish_progress_line(&install_progress_width);
                 std::string failed_name = result.failed_package.empty() ? batch.front().name : result.failed_package;
@@ -4693,14 +4946,14 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
                 ++batch_end;
             }
 
-            InstallCommandResult result = install_native_debian_batch(batch, verbose);
+            InstallCommandResult result = install_native_debian_batch(
+                batch,
+                verbose,
+                i,
+                install_queue.size(),
+                &install_progress_width
+            );
             installed_count += result.completed_count;
-            if (!verbose && result.completed_count > 0) {
-                std::string progress_label = result.last_processed_package.empty()
-                    ? batch[result.completed_count - 1].name
-                    : result.last_processed_package;
-                render_package_progress("current", i + result.completed_count, install_queue.size(), progress_label, &install_progress_width);
-            }
             if (!result.success) {
                 if (!verbose) finish_progress_line(&install_progress_width);
                 std::string failed_name = result.failed_package.empty() ? batch.front().name : result.failed_package;
