@@ -30,6 +30,7 @@ bool inspect_debian_archive_payload_for_disk_estimate(
     CachedArchivePayloadInfo* out_info
 );
 bool native_dpkg_package_looks_synthetic(const std::string& pkg_name);
+bool debian_archive_mutates_runtime_linker_state(const PackageMetadata& meta);
 InstallCommandResult install_native_debian_batch(
     const std::vector<PackageMetadata>& batch,
     bool verbose,
@@ -864,6 +865,26 @@ bool prune_synthetic_dpkg_file_ownership_for_package(
     }
 
     return true;
+}
+
+bool debian_archive_mutates_runtime_linker_state(const PackageMetadata& meta) {
+    if (!package_is_debian_source(meta)) return false;
+
+    CachedArchivePayloadInfo payload_info;
+    if (!inspect_debian_archive_payload_for_disk_estimate(
+            get_cached_debian_archive_path(meta),
+            &payload_info) ||
+        !payload_info.available) {
+        return false;
+    }
+
+    for (const auto& path : payload_info.installed_paths) {
+        if (path.find("/lib64/") != std::string::npos ||
+            path.find("/lib/") != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool bootstrap_native_dpkg_status_database(bool verbose, std::string* error_out) {
@@ -2089,6 +2110,7 @@ InstallCommandResult install_native_debian_batch(
     InstallCommandResult batch_result;
     for (size_t index : order) {
         const PackageMetadata& meta = batch[index];
+        bool runtime_sensitive = debian_archive_mutates_runtime_linker_state(meta);
         std::string overlap_repair_error;
         if (!prune_synthetic_dpkg_file_ownership_for_package(meta, verbose, &overlap_repair_error)) {
             batch_result.success = false;
@@ -2109,6 +2131,17 @@ InstallCommandResult install_native_debian_batch(
         if (batch_result.last_processed_package.empty()) batch_result.last_processed_package = meta.name;
         if (result.exit_code == 0) {
             ++batch_result.completed_count;
+            if (runtime_sensitive) {
+                int refresh_rc = run_ldconfig_trigger(verbose);
+                if (refresh_rc != 0) {
+                    batch_result.success = false;
+                    batch_result.failed_package = debian_backend_package_name(meta);
+                    if (batch_result.failed_package.empty()) batch_result.failed_package = meta.name;
+                    std::cerr << "E: Runtime linker refresh failed after installing "
+                              << batch_result.failed_package << std::endl;
+                    return batch_result;
+                }
+            }
             if (!verbose && progress_width && progress_total > 0) {
                 render_package_progress(
                     "current",
