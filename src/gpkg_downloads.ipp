@@ -156,9 +156,7 @@ size_t get_partial_package_bytes(const PackageMetadata& meta) {
 
 size_t get_cached_package_bytes(const PackageMetadata& meta) {
     if (package_is_debian_source(meta)) {
-        size_t deb_bytes = file_size_if_exists(get_cached_debian_archive_path(meta));
-        if (deb_bytes > 0) return deb_bytes;
-        return file_size_if_exists(get_imported_gpkg_path(meta));
+        return file_size_if_exists(get_cached_debian_archive_path(meta));
     }
 
     return file_size_if_exists(get_cached_package_path(meta));
@@ -200,9 +198,9 @@ bool fetch_package_archive(
     };
 
     if (package_is_debian_source(meta) &&
-        access(get_imported_gpkg_path(meta).c_str(), F_OK) == 0) {
+        access(get_cached_debian_archive_path(meta).c_str(), F_OK) == 0) {
         if (!quiet) {
-            std::cout << "Using converted cache (" << index << "/" << total << ") "
+            std::cout << "Using cached Debian archive (" << index << "/" << total << ") "
                       << meta.name << "..." << std::endl;
         }
         if (reused_out) *reused_out = true;

@@ -1,13 +1,14 @@
 # GPKG: GeminiOS Package Manager
 
 `gpkg` is GeminiOS's package manager. It handles repository metadata, dependency
-resolution, package downloads, local installation/removal, and package worker
-operations.
+resolution, package downloads, and package operations across two backends:
+Debian packages are installed natively through `dpkg`, while GeminiOS-native
+`.gpkg` packages still use `gpkg-worker`.
 
 ## Layout
 
-- `src/gpkg.cpp`: main CLI, repository handling, dependency resolution, and installs
-- `src/gpkg_worker.cpp`: privileged worker for file extraction, registration, and removal
+- `src/gpkg.cpp`: main CLI, repository handling, dependency resolution, and backend dispatch
+- `src/gpkg_worker.cpp`: privileged worker for GeminiOS-native `.gpkg` extraction, registration, and removal
 - `Makefile`: standalone build/install entrypoint for the module
 
 ## Build
