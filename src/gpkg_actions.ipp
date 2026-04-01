@@ -545,6 +545,18 @@ bool bootstrap_native_dpkg_status_database(bool verbose, std::string* error_out)
             description = "Synthetic native dpkg bootstrap record managed by gpkg";
         }
 
+        std::string installed_size_field;
+        if (!entry.meta.installed_size_bytes.empty()) {
+            char* end = nullptr;
+            errno = 0;
+            long long installed_size_bytes = std::strtoll(entry.meta.installed_size_bytes.c_str(), &end, 10);
+            if (errno == 0 && end != entry.meta.installed_size_bytes.c_str()) {
+                long long installed_size_kib =
+                    installed_size_bytes <= 0 ? 0 : (installed_size_bytes + 1023) / 1024;
+                installed_size_field = std::to_string(installed_size_kib);
+            }
+        }
+
         status_stream << "Package: " << package_name << "\n";
         status_stream << "Status: "
                       << (entry.status.want.empty() ? "install" : entry.status.want) << " "
@@ -555,8 +567,8 @@ bool bootstrap_native_dpkg_status_database(bool verbose, std::string* error_out)
         status_stream << "Maintainer: " << maintainer << "\n";
         status_stream << "Architecture: " << architecture << "\n";
         status_stream << "Version: " << version << "\n";
-        if (!entry.meta.installed_size_bytes.empty()) {
-            status_stream << "Installed-Size: " << entry.meta.installed_size_bytes << "\n";
+        if (!installed_size_field.empty()) {
+            status_stream << "Installed-Size: " << installed_size_field << "\n";
         }
         if (!entry.meta.depends.empty()) {
             status_stream << "Depends: " << join_strings(entry.meta.depends) << "\n";
