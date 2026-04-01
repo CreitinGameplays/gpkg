@@ -103,7 +103,21 @@ bool package_name_is_runtime_bootstrap_first(const std::string& pkg_name, bool v
         "zlib1g",
         "libzstd1",
     };
-    return bootstrap_first.count(canonicalize_package_name(pkg_name, verbose)) != 0;
+
+    std::set<std::string> family_names;
+    std::string canonical = canonicalize_package_name(pkg_name, verbose);
+    family_names.insert(canonical);
+    std::string legacy = derive_debian_t64_legacy_alias(canonical);
+    if (!legacy.empty()) {
+        family_names.insert(legacy);
+    } else if (canonical.rfind("lib", 0) == 0) {
+        family_names.insert(canonical + "t64");
+    }
+
+    for (const auto& family_name : family_names) {
+        if (bootstrap_first.count(family_name) != 0) return true;
+    }
+    return false;
 }
 
 bool package_name_is_shell_runtime_next(const std::string& pkg_name, bool verbose) {
@@ -114,7 +128,21 @@ bool package_name_is_shell_runtime_next(const std::string& pkg_name, bool verbos
         "bash",
         "dash",
     };
-    return shell_runtime_next.count(canonicalize_package_name(pkg_name, verbose)) != 0;
+
+    std::set<std::string> family_names;
+    std::string canonical = canonicalize_package_name(pkg_name, verbose);
+    family_names.insert(canonical);
+    std::string legacy = derive_debian_t64_legacy_alias(canonical);
+    if (!legacy.empty()) {
+        family_names.insert(legacy);
+    } else if (canonical.rfind("lib", 0) == 0) {
+        family_names.insert(canonical + "t64");
+    }
+
+    for (const auto& family_name : family_names) {
+        if (shell_runtime_next.count(family_name) != 0) return true;
+    }
+    return false;
 }
 
 int package_runtime_bootstrap_rank(const std::string& pkg_name, bool verbose) {
