@@ -1194,7 +1194,10 @@ bool write_native_dpkg_status_entries(
 
     for (const auto& pair : entries) {
         const NativeDpkgStatusEntry& entry = pair.second;
-        if (entry.record.package.empty() || entry.file_list.empty()) continue;
+        if (entry.record.package.empty()) continue;
+
+        bool installed_like = package_status_is_installed_like(entry.record.status);
+        if (!installed_like && entry.file_list.empty()) continue;
 
         std::ostringstream file_buffer;
         for (const auto& line : entry.file_list) {
@@ -1303,9 +1306,11 @@ bool sync_native_dpkg_backend_state(
         get_repo_package_info("base-files", meta);
         meta.name = "base-files";
         meta.debian_package = "base-files";
-        if (meta.version.empty()) meta.version = "0";
+        if (meta.version.empty()) meta.version = "9999";
         if (meta.maintainer.empty()) meta.maintainer = "GeminiOS Debian Backend";
         if (meta.description.empty()) meta.description = "Synthetic compatibility package for Debian maintainer scripts";
+        if (meta.priority.empty()) meta.priority = "required";
+        if (meta.section.empty()) meta.section = "admin";
 
         NativeDpkgStatusEntry& stub = entries["base-files"];
         stub.record.package = "base-files";
@@ -1314,6 +1319,7 @@ bool sync_native_dpkg_backend_state(
         stub.record.status = "installed";
         stub.record.version = meta.version;
         stub.meta = meta;
+        stub.file_list.clear();
     }
 
     if (verbose) {
