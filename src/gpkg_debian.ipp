@@ -1994,17 +1994,47 @@ void prune_imported_packages_with_missing_required_dependencies(
 ) {
     while (true) {
         auto dependency_index = build_imported_dependency_index(selected);
-        std::vector<std::pair<std::string, std::vector<std::string>>> removals;
+        std::vector<const std::pair<const std::string, PackageMetadata>*> entries;
+        entries.reserve(selected.size());
+        for (const auto& entry : selected) entries.push_back(&entry);
 
-        for (const auto& entry : selected) {
-            std::vector<std::string> missing = find_missing_imported_required_dependencies(
-                entry.second,
-                selected,
-                dependency_index
-            );
-            if (!missing.empty()) {
-                removals.push_back({entry.first, missing});
+        const size_t worker_count = recommended_parallel_worker_count(entries.size());
+        std::atomic<size_t> next_entry{0};
+        std::vector<std::vector<std::pair<std::string, std::vector<std::string>>>> worker_removals(
+            worker_count
+        );
+
+        auto worker = [&](size_t worker_index) {
+            auto& removals = worker_removals[worker_index];
+            while (true) {
+                size_t entry_index = next_entry.fetch_add(1);
+                if (entry_index >= entries.size()) return;
+
+                const auto& entry = *entries[entry_index];
+                std::vector<std::string> missing = find_missing_imported_required_dependencies(
+                    entry.second,
+                    selected,
+                    dependency_index
+                );
+                if (!missing.empty()) removals.push_back({entry.first, std::move(missing)});
             }
+        };
+
+        std::vector<std::thread> workers;
+        workers.reserve(worker_count > 0 ? worker_count - 1 : 0);
+        for (size_t worker_index = 1; worker_index < worker_count; ++worker_index) {
+            workers.emplace_back(worker, worker_index);
+        }
+        worker(0);
+        for (auto& thread : workers) thread.join();
+
+        std::vector<std::pair<std::string, std::vector<std::string>>> removals;
+        for (auto& worker_entries : worker_removals) {
+            removals.insert(
+                removals.end(),
+                std::make_move_iterator(worker_entries.begin()),
+                std::make_move_iterator(worker_entries.end())
+            );
         }
 
         if (removals.empty()) break;
@@ -2025,6 +2055,12 @@ void prune_imported_optional_dependencies(
     std::map<std::string, PackageMetadata>& selected
 ) {
     auto dependency_index = build_imported_dependency_index(selected);
+    std::vector<std::pair<std::string, std::pair<std::vector<std::string>, std::vector<std::string>>>>
+        entries;
+    entries.reserve(selected.size());
+    for (const auto& entry : selected) {
+        entries.push_back({entry.first, {entry.second.recommends, entry.second.suggests}});
+    }
 
     auto filter_relations = [&](std::vector<std::string>& relations) {
         std::vector<std::string> filtered;
@@ -2036,9 +2072,30 @@ void prune_imported_optional_dependencies(
         relations.swap(filtered);
     };
 
-    for (auto& entry : selected) {
-        filter_relations(entry.second.recommends);
-        filter_relations(entry.second.suggests);
+    const size_t worker_count = recommended_parallel_worker_count(entries.size());
+    std::atomic<size_t> next_entry{0};
+    auto worker = [&]() {
+        while (true) {
+            size_t entry_index = next_entry.fetch_add(1);
+            if (entry_index >= entries.size()) return;
+            filter_relations(entries[entry_index].second.first);
+            filter_relations(entries[entry_index].second.second);
+        }
+    };
+
+    std::vector<std::thread> workers;
+    workers.reserve(worker_count > 0 ? worker_count - 1 : 0);
+    for (size_t worker_index = 1; worker_index < worker_count; ++worker_index) {
+        workers.emplace_back(worker);
+    }
+    worker();
+    for (auto& thread : workers) thread.join();
+
+    for (auto& filtered_entry : entries) {
+        auto selected_it = selected.find(filtered_entry.first);
+        if (selected_it == selected.end()) continue;
+        selected_it->second.recommends = std::move(filtered_entry.second.first);
+        selected_it->second.suggests = std::move(filtered_entry.second.second);
     }
 }
 
@@ -2048,16 +2105,48 @@ void prune_imported_packages_with_missing_required_dependencies(
 ) {
     while (true) {
         auto dependency_index = build_imported_dependency_index(selected);
-        std::vector<std::pair<std::string, std::vector<std::string>>> removals;
+        std::vector<const std::pair<const std::string, ImportedPackageDependencyState>*> entries;
+        entries.reserve(selected.size());
+        for (const auto& entry : selected) entries.push_back(&entry);
 
-        for (const auto& entry : selected) {
-            std::vector<std::string> missing;
-            for (const auto& dep_str : entry.second.depends) {
-                if (!imported_dependency_relation_is_available(dep_str, selected, dependency_index)) {
-                    missing.push_back(dep_str);
+        const size_t worker_count = recommended_parallel_worker_count(entries.size());
+        std::atomic<size_t> next_entry{0};
+        std::vector<std::vector<std::pair<std::string, std::vector<std::string>>>> worker_removals(
+            worker_count
+        );
+
+        auto worker = [&](size_t worker_index) {
+            auto& removals = worker_removals[worker_index];
+            while (true) {
+                size_t entry_index = next_entry.fetch_add(1);
+                if (entry_index >= entries.size()) return;
+
+                const auto& entry = *entries[entry_index];
+                std::vector<std::string> missing;
+                for (const auto& dep_str : entry.second.depends) {
+                    if (!imported_dependency_relation_is_available(dep_str, selected, dependency_index)) {
+                        missing.push_back(dep_str);
+                    }
                 }
+                if (!missing.empty()) removals.push_back({entry.first, std::move(missing)});
             }
-            if (!missing.empty()) removals.push_back({entry.first, missing});
+        };
+
+        std::vector<std::thread> workers;
+        workers.reserve(worker_count > 0 ? worker_count - 1 : 0);
+        for (size_t worker_index = 1; worker_index < worker_count; ++worker_index) {
+            workers.emplace_back(worker, worker_index);
+        }
+        worker(0);
+        for (auto& thread : workers) thread.join();
+
+        std::vector<std::pair<std::string, std::vector<std::string>>> removals;
+        for (auto& worker_entries : worker_removals) {
+            removals.insert(
+                removals.end(),
+                std::make_move_iterator(worker_entries.begin()),
+                std::make_move_iterator(worker_entries.end())
+            );
         }
 
         if (removals.empty()) break;
@@ -2078,6 +2167,12 @@ void prune_imported_optional_dependencies(
     std::map<std::string, ImportedPackageDependencyState>& selected
 ) {
     auto dependency_index = build_imported_dependency_index(selected);
+    std::vector<std::pair<std::string, std::pair<std::vector<std::string>, std::vector<std::string>>>>
+        entries;
+    entries.reserve(selected.size());
+    for (const auto& entry : selected) {
+        entries.push_back({entry.first, {entry.second.recommends, entry.second.suggests}});
+    }
 
     auto filter_relations = [&](std::vector<std::string>& relations) {
         std::vector<std::string> filtered;
@@ -2089,9 +2184,30 @@ void prune_imported_optional_dependencies(
         relations.swap(filtered);
     };
 
-    for (auto& entry : selected) {
-        filter_relations(entry.second.recommends);
-        filter_relations(entry.second.suggests);
+    const size_t worker_count = recommended_parallel_worker_count(entries.size());
+    std::atomic<size_t> next_entry{0};
+    auto worker = [&]() {
+        while (true) {
+            size_t entry_index = next_entry.fetch_add(1);
+            if (entry_index >= entries.size()) return;
+            filter_relations(entries[entry_index].second.first);
+            filter_relations(entries[entry_index].second.second);
+        }
+    };
+
+    std::vector<std::thread> workers;
+    workers.reserve(worker_count > 0 ? worker_count - 1 : 0);
+    for (size_t worker_index = 1; worker_index < worker_count; ++worker_index) {
+        workers.emplace_back(worker);
+    }
+    worker();
+    for (auto& thread : workers) thread.join();
+
+    for (auto& filtered_entry : entries) {
+        auto selected_it = selected.find(filtered_entry.first);
+        if (selected_it == selected.end()) continue;
+        selected_it->second.recommends = std::move(filtered_entry.second.first);
+        selected_it->second.suggests = std::move(filtered_entry.second.second);
     }
 }
 
