@@ -4,6 +4,8 @@ struct InstallCommandResult {
     bool success = false;
     std::string log_path;
     std::string failed_package;
+    size_t completed_count = 0;
+    std::string last_processed_package;
 };
 
 bool prepare_install_archives(
@@ -842,7 +844,7 @@ InstallCommandResult install_package_from_file(
         "gpkg-install"
     );
     if (result.exit_code == 0 && root_override.empty()) queue_selinux_label_state_refresh();
-    return {result.exit_code == 0, result.log_path, ""};
+    return {result.exit_code == 0, result.log_path, "", 0, ""};
 }
 
 InstallCommandResult retire_package_by_name(
@@ -865,7 +867,7 @@ InstallCommandResult retire_package_by_name(
         "gpkg-retire"
     );
     if (result.exit_code == 0 && root_override.empty()) queue_selinux_label_state_refresh();
-    return {result.exit_code == 0, result.log_path, ""};
+    return {result.exit_code == 0, result.log_path, "", 0, ""};
 }
 
 InstallCommandResult remove_package_by_name(const std::string& pkg_name, bool verbose) {
@@ -878,7 +880,7 @@ InstallCommandResult remove_package_by_name(const std::string& pkg_name, bool ve
             std::cerr << "E: Failed to prepare native dpkg backend state";
             if (!sync_error.empty()) std::cerr << ": " << sync_error;
             std::cerr << std::endl;
-            return {false, "", pkg_name};
+            return {false, "", pkg_name, 0, ""};
         }
 
         ScopedMaintscriptShellOverride maintscript_shell(true, verbose);
@@ -887,7 +889,7 @@ InstallCommandResult remove_package_by_name(const std::string& pkg_name, bool ve
             verbose,
             "dpkg-remove"
         );
-        return {result.exit_code == 0, result.log_path, pkg_name};
+        return {result.exit_code == 0, result.log_path, pkg_name, 0, ""};
     }
 
     CommandCaptureResult result = run_command_captured_argv(
@@ -896,7 +898,7 @@ InstallCommandResult remove_package_by_name(const std::string& pkg_name, bool ve
         "gpkg-remove"
     );
     if (result.exit_code == 0) queue_selinux_label_state_refresh();
-    return {result.exit_code == 0, result.log_path, ""};
+    return {result.exit_code == 0, result.log_path, "", 0, ""};
 }
 
 InstallCommandResult purge_package_by_name(const std::string& pkg_name, bool verbose) {
@@ -909,7 +911,7 @@ InstallCommandResult purge_package_by_name(const std::string& pkg_name, bool ver
             std::cerr << "E: Failed to prepare native dpkg backend state";
             if (!sync_error.empty()) std::cerr << ": " << sync_error;
             std::cerr << std::endl;
-            return {false, "", pkg_name};
+            return {false, "", pkg_name, 0, ""};
         }
 
         ScopedMaintscriptShellOverride maintscript_shell(true, verbose);
@@ -918,7 +920,7 @@ InstallCommandResult purge_package_by_name(const std::string& pkg_name, bool ver
             verbose,
             "dpkg-purge"
         );
-        return {result.exit_code == 0, result.log_path, pkg_name};
+        return {result.exit_code == 0, result.log_path, pkg_name, 0, ""};
     }
 
     CommandCaptureResult result = run_command_captured_argv(
@@ -927,7 +929,7 @@ InstallCommandResult purge_package_by_name(const std::string& pkg_name, bool ver
         "gpkg-purge"
     );
     if (result.exit_code == 0) queue_selinux_label_state_refresh();
-    return {result.exit_code == 0, result.log_path, ""};
+    return {result.exit_code == 0, result.log_path, "", 0, ""};
 }
 
 bool package_is_config_files_only(const std::string& pkg_name, std::string* out_version = nullptr);
@@ -1041,8 +1043,8 @@ InstallCommandResult install_package_v2(
     const std::string& root_override = ""
 ) {
     if (package_is_debian_source(meta)) {
-        if (!root_override.empty()) return {false, "", meta.name};
-        if (defer_configure) return {false, "", meta.name};
+        if (!root_override.empty()) return {false, "", meta.name, 0, ""};
+        if (defer_configure) return {false, "", meta.name, 0, ""};
         return install_native_debian_batch({meta}, verbose);
     }
 
@@ -1186,6 +1188,10 @@ bool write_native_dpkg_status_entries(
         buffer << "Maintainer: " << maintainer << "\n";
         buffer << "Architecture: " << architecture << "\n";
         if (!version.empty()) buffer << "Version: " << version << "\n";
+        if (!entry.meta.depends.empty()) buffer << "Depends: " << join_strings(entry.meta.depends) << "\n";
+        if (!entry.meta.provides.empty()) buffer << "Provides: " << join_strings(entry.meta.provides) << "\n";
+        if (!entry.meta.conflicts.empty()) buffer << "Conflicts: " << join_strings(entry.meta.conflicts) << "\n";
+        if (!entry.meta.replaces.empty()) buffer << "Replaces: " << join_strings(entry.meta.replaces) << "\n";
         buffer << "Description: " << description << "\n\n";
     }
 
@@ -1223,6 +1229,38 @@ bool sync_native_dpkg_backend_state(
     if (error_out) error_out->clear();
     if (!ensure_native_dpkg_admin_layout(error_out)) return false;
 
+    std::vector<Dependency> external_required_deps;
+    std::set<std::string> seen_external_required_deps;
+    auto batch_package_satisfies_dependency = [&](const PackageMetadata& provider, const Dependency& dep) {
+        std::string provider_dpkg_name = debian_backend_package_name(provider);
+        if (!provider_dpkg_name.empty() &&
+            package_metadata_satisfies_dependency(provider_dpkg_name, provider, dep)) {
+            return true;
+        }
+        return !provider.name.empty() &&
+               provider.name != provider_dpkg_name &&
+               package_metadata_satisfies_dependency(provider.name, provider, dep);
+    };
+    for (const auto& meta : batch) {
+        for (const auto& dep_str : collect_required_transaction_dependency_edges(meta)) {
+            Dependency dep = parse_dependency(dep_str);
+            if (dep.name.empty()) continue;
+
+            bool satisfied_by_batch = false;
+            for (const auto& provider : batch) {
+                if (batch_package_satisfies_dependency(provider, dep)) {
+                    satisfied_by_batch = true;
+                    break;
+                }
+            }
+            if (satisfied_by_batch) continue;
+
+            std::string dep_key = dep.name + "\n" + dep.op + "\n" + dep.version;
+            if (!seen_external_required_deps.insert(dep_key).second) continue;
+            external_required_deps.push_back(dep);
+        }
+    }
+
     std::map<std::string, NativeDpkgStatusEntry> entries;
     auto existing_records = load_dpkg_package_status_records();
     for (const auto& record : existing_records) {
@@ -1248,7 +1286,28 @@ bool sync_native_dpkg_backend_state(
             meta.version = version;
         }
 
-        bool eligible = package_uses_native_dpkg_backend(meta) || pkg_name == "base-files";
+        bool satisfies_external_required_dep = false;
+        if (!external_required_deps.empty()) {
+            std::string dpkg_name = debian_backend_package_name(meta);
+            for (const auto& dep : external_required_deps) {
+                if (!dpkg_name.empty() &&
+                    package_metadata_satisfies_dependency(dpkg_name, meta, dep)) {
+                    satisfies_external_required_dep = true;
+                    break;
+                }
+                if (!pkg_name.empty() &&
+                    pkg_name != dpkg_name &&
+                    package_metadata_satisfies_dependency(pkg_name, meta, dep)) {
+                    satisfies_external_required_dep = true;
+                    break;
+                }
+            }
+        }
+
+        bool eligible =
+            package_uses_native_dpkg_backend(meta) ||
+            pkg_name == "base-files" ||
+            satisfies_external_required_dep;
         if (!eligible) return;
 
         std::string dpkg_name = debian_backend_package_name(meta);
@@ -1362,13 +1421,13 @@ InstallCommandResult install_native_debian_batch(
     const std::vector<PackageMetadata>& batch,
     bool verbose
 ) {
-    if (batch.empty()) return {true, "", ""};
+    if (batch.empty()) return {true, "", "", 0, ""};
     std::string sync_error;
     if (!sync_native_dpkg_backend_state(batch, verbose, &sync_error)) {
         std::cerr << "E: Failed to prepare native dpkg backend state";
         if (!sync_error.empty()) std::cerr << ": " << sync_error;
         std::cerr << std::endl;
-        return {false, "", batch.front().name};
+        return {false, "", batch.front().name, 0, ""};
     }
 
     std::vector<std::vector<size_t>> outgoing(batch.size());
@@ -1441,6 +1500,7 @@ InstallCommandResult install_native_debian_batch(
     }
 
     ScopedMaintscriptShellOverride maintscript_shell(true, verbose);
+    InstallCommandResult batch_result;
     for (size_t index : order) {
         const PackageMetadata& meta = batch[index];
         CommandCaptureResult result = run_command_captured_argv(
@@ -1448,11 +1508,21 @@ InstallCommandResult install_native_debian_batch(
             verbose,
             "dpkg-install"
         );
-        if (result.exit_code == 0) continue;
-        return {false, result.log_path, debian_backend_package_name(meta)};
+        batch_result.last_processed_package = debian_backend_package_name(meta);
+        if (batch_result.last_processed_package.empty()) batch_result.last_processed_package = meta.name;
+        if (result.exit_code == 0) {
+            ++batch_result.completed_count;
+            continue;
+        }
+        batch_result.success = false;
+        batch_result.log_path = result.log_path;
+        batch_result.failed_package = debian_backend_package_name(meta);
+        if (batch_result.failed_package.empty()) batch_result.failed_package = meta.name;
+        return batch_result;
     }
 
-    return {true, "", ""};
+    batch_result.success = true;
+    return batch_result;
 }
 
 bool retire_gpkg_package_without_state_erasure(
@@ -3599,6 +3669,13 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
             }
 
             InstallCommandResult result = install_native_debian_batch(batch, verbose);
+            installed_count += result.completed_count;
+            if (!verbose && result.completed_count > 0) {
+                std::string progress_label = result.last_processed_package.empty()
+                    ? batch[result.completed_count - 1].name
+                    : result.last_processed_package;
+                render_package_progress("current", i + result.completed_count, upgrade_queue.size(), progress_label, &install_progress_width);
+            }
             if (!result.success) {
                 if (!verbose) finish_progress_line(&install_progress_width);
                 std::string failed_name = result.failed_package.empty() ? batch.front().name : result.failed_package;
@@ -3623,7 +3700,6 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
                 break;
             }
 
-            installed_count += batch.size();
             mutated_runtime_state = true;
             i = batch_end;
             if (!verbose) render_package_progress("current", i, upgrade_queue.size(), batch.back().name, &install_progress_width);
@@ -4070,6 +4146,13 @@ int handle_repair(bool verbose) {
             }
 
             InstallCommandResult result = install_native_debian_batch(batch, verbose);
+            repaired_count += result.completed_count;
+            if (!verbose && result.completed_count > 0) {
+                std::string progress_label = result.last_processed_package.empty()
+                    ? batch[result.completed_count - 1].name
+                    : result.last_processed_package;
+                render_package_progress("current", i + result.completed_count, repair_queue.size(), progress_label, &install_progress_width);
+            }
             if (!result.success) {
                 if (!verbose) finish_progress_line(&install_progress_width);
                 std::string failed_name = result.failed_package.empty() ? batch.front().name : result.failed_package;
@@ -4094,7 +4177,6 @@ int handle_repair(bool verbose) {
                 break;
             }
 
-            repaired_count += batch.size();
             mutated_runtime_state = true;
             i = batch_end;
             if (!verbose) render_package_progress("current", i, repair_queue.size(), batch.back().name, &install_progress_width);
@@ -4505,6 +4587,13 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
             }
 
             InstallCommandResult result = install_native_debian_batch(batch, verbose);
+            installed_count += result.completed_count;
+            if (!verbose && result.completed_count > 0) {
+                std::string progress_label = result.last_processed_package.empty()
+                    ? batch[result.completed_count - 1].name
+                    : result.last_processed_package;
+                render_package_progress("current", i + result.completed_count, install_queue.size(), progress_label, &install_progress_width);
+            }
             if (!result.success) {
                 if (!verbose) finish_progress_line(&install_progress_width);
                 std::string failed_name = result.failed_package.empty() ? batch.front().name : result.failed_package;
@@ -4527,7 +4616,6 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
                 return 1;
             }
 
-            installed_count += batch.size();
             mutated_runtime_state = true;
             i = batch_end;
             if (!verbose) render_package_progress("current", i, install_queue.size(), batch.back().name, &install_progress_width);

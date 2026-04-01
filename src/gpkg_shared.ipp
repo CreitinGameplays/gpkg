@@ -629,7 +629,43 @@ std::string read_running_kernel_release() {
     return "";
 }
 
+pid_t read_lock_owner_pid() {
+    std::ifstream in(LOCK_FILE);
+    if (!in) return 0;
+
+    std::string line;
+    std::getline(in, line);
+    size_t first = line.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) return 0;
+    size_t last = line.find_last_not_of(" \t\r\n");
+    line = line.substr(first, last - first + 1);
+    if (line.empty()) return 0;
+
+    char* end = nullptr;
+    errno = 0;
+    long value = std::strtol(line.c_str(), &end, 10);
+    if (errno != 0 || end == line.c_str()) return 0;
+    while (end && *end != '\0' && std::isspace(static_cast<unsigned char>(*end))) ++end;
+    if (end && *end != '\0') return 0;
+    if (value <= 0) return 0;
+    return static_cast<pid_t>(value);
+}
+
+bool process_is_running(pid_t pid) {
+    if (pid <= 0) return false;
+    if (kill(pid, 0) == 0) return true;
+    return errno == EPERM;
+}
+
 void release_lock(bool verbose) {
+    pid_t owner_pid = read_lock_owner_pid();
+    if (owner_pid > 0 && owner_pid != getpid()) {
+        if (verbose) {
+            std::cout << "[DEBUG] Skipping lock release for " << LOCK_FILE
+                      << " because it is owned by PID " << owner_pid << std::endl;
+        }
+        return;
+    }
     if (verbose) std::cout << "[DEBUG] Releasing lock: " << LOCK_FILE << std::endl;
     unlink(LOCK_FILE.c_str());
 }
@@ -646,22 +682,48 @@ bool acquire_lock(bool verbose) {
         }
     }
 
-    if (access(LOCK_FILE.c_str(), F_OK) == 0) {
-        std::cerr << Color::RED << "E: Could not acquire lock (" << LOCK_FILE
-                  << "). Is another process using it?" << Color::RESET << std::endl;
-        return false;
-    }
+    while (true) {
+        if (access(LOCK_FILE.c_str(), F_OK) == 0) {
+            pid_t owner_pid = read_lock_owner_pid();
+            if (process_is_running(owner_pid)) {
+                std::cerr << Color::RED << "E: Could not acquire lock (" << LOCK_FILE << ")";
+                if (owner_pid > 0) {
+                    std::cerr << ". Held by PID " << owner_pid << ".";
+                } else {
+                    std::cerr << ". Is another process using it?";
+                }
+                std::cerr << Color::RESET << std::endl;
+                return false;
+            }
 
-    if (verbose) std::cout << "[DEBUG] Acquiring lock: " << LOCK_FILE << std::endl;
-    int fd = open(LOCK_FILE.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
-    if (fd < 0) {
+            if (verbose) {
+                std::cout << "[DEBUG] Removing stale lock " << LOCK_FILE;
+                if (owner_pid > 0) std::cout << " from PID " << owner_pid;
+                std::cout << std::endl;
+            }
+            if (unlink(LOCK_FILE.c_str()) != 0 && errno != ENOENT) {
+                std::cerr << Color::RED << "E: Failed to remove stale lock file: " << LOCK_FILE
+                          << " (errno: " << errno << ")" << Color::RESET << std::endl;
+                return false;
+            }
+        }
+
+        if (verbose) std::cout << "[DEBUG] Acquiring lock: " << LOCK_FILE << std::endl;
+        int fd = open(LOCK_FILE.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
+        if (fd >= 0) {
+            std::string owner_text = std::to_string(getpid()) + "\n";
+            ssize_t ignored = write(fd, owner_text.c_str(), owner_text.size());
+            (void)ignored;
+            close(fd);
+            return true;
+        }
+
+        if (errno == EEXIST) continue;
+
         std::cerr << Color::RED << "E: Failed to create lock file: " << LOCK_FILE
                   << " (errno: " << errno << ")" << Color::RESET << std::endl;
         return false;
     }
-
-    close(fd);
-    return true;
 }
 
 void check_triggers(const std::vector<std::string>& files) {
