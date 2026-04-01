@@ -684,11 +684,31 @@ void sort_transaction_queue_for_install(
 
     const size_t n = queue.size();
     std::vector<std::set<size_t>> outgoing(n);
+    std::vector<std::set<size_t>> incoming(n);
     std::vector<size_t> indegree(n, 0);
+
+    static const std::set<std::string> bootstrap_first = {
+        "libc6",
+        "libc-bin",
+        "libc-gconv-modules-extra",
+        "libgcc-s1",
+        "libstdc++6",
+        "libcrypt1",
+        "zlib1g",
+        "libzstd1",
+    };
+    static const std::set<std::string> shell_runtime_next = {
+        "libtinfo6",
+        "libncursesw6",
+        "libreadline8t64",
+        "bash",
+        "dash",
+    };
 
     auto add_edge = [&](size_t from, size_t to) {
         if (from == to) return;
         if (outgoing[from].insert(to).second) {
+            incoming[to].insert(from);
             ++indegree[to];
         }
     };
@@ -712,6 +732,23 @@ void sort_transaction_queue_for_install(
         }
     }
 
+    std::set<size_t> bootstrap_closure;
+    std::vector<size_t> bootstrap_stack;
+    for (size_t i = 0; i < n; ++i) {
+        std::string canonical_name = canonicalize_package_name(queue[i].name, verbose);
+        if (bootstrap_first.count(canonical_name) == 0) continue;
+        if (bootstrap_closure.insert(i).second) bootstrap_stack.push_back(i);
+    }
+    while (!bootstrap_stack.empty()) {
+        size_t current = bootstrap_stack.back();
+        bootstrap_stack.pop_back();
+        for (size_t prerequisite : incoming[current]) {
+            if (bootstrap_closure.insert(prerequisite).second) {
+                bootstrap_stack.push_back(prerequisite);
+            }
+        }
+    }
+
     std::map<std::string, std::vector<std::string>> companion_map =
         get_planner_upgrade_companion_map(context, verbose);
     std::map<std::string, std::set<std::string>> reverse_companions;
@@ -731,23 +768,6 @@ void sort_transaction_queue_for_install(
 
     auto bootstrap_rank = [&](size_t index) {
         std::string canonical_name = canonicalize_package_name(queue[index].name, verbose);
-        static const std::set<std::string> bootstrap_first = {
-            "libc6",
-            "libc-bin",
-            "libc-gconv-modules-extra",
-            "libgcc-s1",
-            "libstdc++6",
-            "libcrypt1",
-            "zlib1g",
-            "libzstd1",
-        };
-        static const std::set<std::string> shell_runtime_next = {
-            "libtinfo6",
-            "libncursesw6",
-            "libreadline8t64",
-            "bash",
-            "dash",
-        };
 
         if (bootstrap_first.count(canonical_name) != 0) return 0;
         if (shell_runtime_next.count(canonical_name) != 0) return 1;
@@ -771,20 +791,38 @@ void sort_transaction_queue_for_install(
         return 1;
     };
 
+    auto candidate_phase = [&](size_t index) {
+        if (bootstrap_closure.count(index) != 0) return 0;
+
+        std::string canonical_name = canonicalize_package_name(queue[index].name, verbose);
+        if (shell_runtime_next.count(canonical_name) != 0 &&
+            completed_names.count("libc6") == 0) {
+            // Do not let shell-linked runtime libraries run ahead of libc.
+            return 2;
+        }
+        return 1;
+    };
+
     for (size_t emitted_count = 0; emitted_count < n; ++emitted_count) {
         size_t best_index = n;
+        int best_phase = 3;
         int best_priority = 2;
         int best_bootstrap_rank = 5;
         for (size_t i = 0; i < n; ++i) {
             if (emitted[i] || indegree[i] != 0) continue;
+            int phase = candidate_phase(i);
             int priority = candidate_priority(i);
             int rank = bootstrap_rank(i);
-            if (best_index == n ||
-                priority < best_priority ||
-                (priority == best_priority &&
-                 (rank < best_bootstrap_rank ||
-                  (rank == best_bootstrap_rank && i < best_index)))) {
+            bool better = best_index == n ||
+                phase < best_phase ||
+                (phase == best_phase &&
+                 (priority < best_priority ||
+                  (priority == best_priority &&
+                   (rank < best_bootstrap_rank ||
+                    (rank == best_bootstrap_rank && i < best_index)))));
+            if (better) {
                 best_index = i;
+                best_phase = phase;
                 best_priority = priority;
                 best_bootstrap_rank = rank;
             }
@@ -792,23 +830,29 @@ void sort_transaction_queue_for_install(
 
         if (best_index == n) {
             size_t best_cycle_index = n;
+            int best_cycle_phase = 3;
             int best_cycle_priority = 2;
             int best_cycle_rank = 5;
             size_t best_cycle_indegree = std::numeric_limits<size_t>::max();
 
             for (size_t i = 0; i < n; ++i) {
                 if (emitted[i]) continue;
+                int phase = candidate_phase(i);
                 int priority = candidate_priority(i);
                 int rank = bootstrap_rank(i);
                 size_t current_indegree = indegree[i];
-                if (best_cycle_index == n ||
-                    priority < best_cycle_priority ||
-                    (priority == best_cycle_priority &&
-                     (rank < best_cycle_rank ||
-                      (rank == best_cycle_rank &&
-                       (current_indegree < best_cycle_indegree ||
-                        (current_indegree == best_cycle_indegree && i < best_cycle_index)))))) {
+                bool better_cycle = best_cycle_index == n ||
+                    phase < best_cycle_phase ||
+                    (phase == best_cycle_phase &&
+                     (priority < best_cycle_priority ||
+                      (priority == best_cycle_priority &&
+                       (rank < best_cycle_rank ||
+                        (rank == best_cycle_rank &&
+                         (current_indegree < best_cycle_indegree ||
+                          (current_indegree == best_cycle_indegree && i < best_cycle_index)))))));
+                if (better_cycle) {
                     best_cycle_index = i;
+                    best_cycle_phase = phase;
                     best_cycle_priority = priority;
                     best_cycle_rank = rank;
                     best_cycle_indegree = current_indegree;
@@ -823,7 +867,8 @@ void sort_transaction_queue_for_install(
             VLOG(verbose,
                  "Breaking dependency-order ambiguity by scheduling "
                  << queue[best_cycle_index].name
-                 << " next (priority=" << best_cycle_priority
+                 << " next (phase=" << best_cycle_phase
+                 << ", priority=" << best_cycle_priority
                  << ", bootstrap-rank=" << best_cycle_rank
                  << ", indegree=" << best_cycle_indegree << ").");
             best_index = best_cycle_index;
