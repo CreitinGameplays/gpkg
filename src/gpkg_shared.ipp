@@ -694,6 +694,39 @@ void queue_selinux_label_state_refresh() {
     g_pending_selinux_relabel = true;
 }
 
+std::string pending_dpkg_trigger_queue_path() {
+    return ROOT_PREFIX + "/var/lib/gpkg/triggers/dpkg-pending.list";
+}
+
+bool has_pending_dpkg_trigger_state() {
+    std::ifstream in(pending_dpkg_trigger_queue_path());
+    if (!in) return false;
+
+    std::string line;
+    while (std::getline(in, line)) {
+        for (char ch : line) {
+            if (!std::isspace(static_cast<unsigned char>(ch))) return true;
+        }
+    }
+    return false;
+}
+
+int run_dpkg_trigger_refresh(bool verbose, const std::string& worker_command = "") {
+    std::string resolved_worker = worker_command.empty()
+        ? resolve_gpkg_worker_command()
+        : worker_command;
+    if (resolved_worker.empty()) return 127;
+
+    std::vector<std::string> argv = {resolved_worker, "--refresh-dpkg-trigger-state"};
+    if (verbose) argv.push_back("--verbose");
+    if (!ROOT_PREFIX.empty()) {
+        argv.push_back("--root");
+        argv.push_back(ROOT_PREFIX);
+    }
+
+    return decode_command_exit_status(run_command_argv(argv, verbose));
+}
+
 int run_ldconfig_trigger(bool verbose, const std::string& worker_command = "") {
     std::string resolved_worker = worker_command.empty()
         ? resolve_gpkg_worker_command()
@@ -989,11 +1022,13 @@ struct ScopedServiceSuppression {
 };
 
 void run_triggers(bool verbose) {
+    bool pending_dpkg_triggers = has_pending_dpkg_trigger_state();
     bool pending_runtime_refresh = g_pending_runtime_linker_refresh;
     bool pending_selinux_relabel = g_pending_selinux_relabel;
     std::set<std::string> pending_commands = g_pending_triggers;
 
     if (pending_commands.empty() &&
+        !pending_dpkg_triggers &&
         !pending_runtime_refresh &&
         !pending_selinux_relabel) {
         return;
@@ -1006,6 +1041,7 @@ void run_triggers(bool verbose) {
     std::cout << Color::CYAN << "Processing triggers..." << Color::RESET << std::endl;
     if (verbose) {
         size_t pending_count = pending_commands.size();
+        if (pending_dpkg_triggers) ++pending_count;
         if (pending_runtime_refresh) ++pending_count;
         if (pending_selinux_relabel) ++pending_count;
         std::cout << "[DEBUG] " << pending_count << " triggers pending." << std::endl;
@@ -1013,6 +1049,23 @@ void run_triggers(bool verbose) {
 
     std::vector<std::string> failed_triggers;
     std::string worker_command = resolve_gpkg_worker_command();
+
+    if (pending_dpkg_triggers) {
+        if (worker_command.empty()) {
+            if (verbose) {
+                std::cout << "[DEBUG] Skipping maintainer trigger refresh because gpkg-worker is unavailable."
+                          << std::endl;
+            }
+        } else {
+            if (verbose) {
+                std::cout << "[DEBUG] Running trigger via gpkg-worker: --refresh-dpkg-trigger-state"
+                          << std::endl;
+            }
+            if (run_dpkg_trigger_refresh(verbose, worker_command) != 0) {
+                failed_triggers.push_back("gpkg-worker --refresh-dpkg-trigger-state");
+            }
+        }
+    }
 
     if (pending_runtime_refresh) {
         if (worker_command.empty()) {

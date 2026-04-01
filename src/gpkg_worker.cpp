@@ -96,6 +96,14 @@ std::string get_debian_control_sidecar_path(
     return get_info_dir() + pkg_name + ".debctl." + control_name;
 }
 
+std::string get_trigger_state_dir() {
+    return g_root_prefix + "/var/lib/gpkg/triggers";
+}
+
+std::string get_pending_dpkg_trigger_queue_path() {
+    return get_trigger_state_dir() + "/dpkg-pending.list";
+}
+
 struct PackageStatusRecord {
     std::string package;
     std::string want = "install";
@@ -176,6 +184,9 @@ bool ensure_symlink_target_if_possible(
     const std::string& target,
     bool replace_non_symlink
 );
+bool action_refresh_dpkg_trigger_state();
+bool append_pending_dpkg_trigger_name(const std::string& trigger_name, std::string* error_out = nullptr);
+void mark_packages_trigger_pending(const std::vector<std::string>& trigger_names);
 std::vector<std::string> collect_shadowed_stale_runtime_provider_paths();
 std::vector<std::pair<std::string, std::string>> collect_broken_runtime_linker_symlink_repairs();
 std::vector<std::string> collect_broken_unowned_runtime_linker_symlink_paths();
@@ -2488,6 +2499,7 @@ struct ScopedMaintainerScriptCompat {
         const CompatWrapperSpec wrappers[] = {
             {"dpkg", "--compat-dpkg"},
             {"dpkg-query", "--compat-dpkg-query"},
+            {"dpkg-trigger", "--compat-dpkg-trigger"},
             {"update-rc.d", "--compat-update-rc.d"},
             {"invoke-rc.d", "--compat-invoke-rc.d"},
             {"service", "--compat-service"},
@@ -3625,6 +3637,50 @@ int action_compat_dpkg(const std::vector<std::string>& raw_args) {
     }
 
     return run_real_dpkg_with_args(raw_args);
+}
+
+int action_compat_dpkg_trigger(const std::vector<std::string>& raw_args) {
+    bool check_supported = false;
+    std::vector<std::string> trigger_names;
+
+    for (size_t i = 0; i < raw_args.size(); ++i) {
+        const std::string& arg = raw_args[i];
+        if (arg == "--admindir" || arg == "--root" || arg == "--by-package") {
+            if (i + 1 < raw_args.size()) ++i;
+            continue;
+        }
+        if (arg.rfind("--admindir=", 0) == 0 ||
+            arg.rfind("--root=", 0) == 0 ||
+            arg.rfind("--by-package=", 0) == 0) {
+            continue;
+        }
+        if (arg == "--check-supported") {
+            check_supported = true;
+            continue;
+        }
+        if (arg == "--no-await" || arg == "--await" || arg == "--no-act") continue;
+        if (!arg.empty() && arg[0] == '-') continue;
+        trigger_names.push_back(arg);
+    }
+
+    if (check_supported) return 0;
+    if (trigger_names.empty()) {
+        std::cerr << "dpkg-trigger: missing trigger name" << std::endl;
+        return 1;
+    }
+
+    for (const auto& trigger_name : trigger_names) {
+        std::string queue_error;
+        if (!append_pending_dpkg_trigger_name(trigger_name, &queue_error)) {
+            if (!queue_error.empty()) {
+                std::cerr << "dpkg-trigger: " << queue_error << std::endl;
+            }
+            return 1;
+        }
+    }
+
+    mark_packages_trigger_pending(trigger_names);
+    return 0;
 }
 
 std::string resolve_real_dpkg_query_path() {
@@ -5815,6 +5871,165 @@ bool package_status_has_installed_history(const std::string& status) {
            status == "triggers-pending";
 }
 
+std::vector<std::string> split_ascii_whitespace_tokens(const std::string& line) {
+    std::vector<std::string> tokens;
+    std::istringstream iss(line);
+    std::string token;
+    while (iss >> token) tokens.push_back(token);
+    return tokens;
+}
+
+struct DebianTriggerInterest {
+    std::string name;
+    bool no_await = false;
+};
+
+std::vector<DebianTriggerInterest> load_debian_trigger_interests_for_package(
+    const std::string& pkg_name
+) {
+    std::vector<DebianTriggerInterest> interests;
+    std::ifstream in(get_debian_control_sidecar_path(pkg_name, "triggers"));
+    if (!in) return interests;
+
+    std::string line;
+    while (std::getline(in, line)) {
+        line = trim(line);
+        if (line.empty() || line[0] == '#') continue;
+
+        std::vector<std::string> tokens = split_ascii_whitespace_tokens(line);
+        if (tokens.size() < 2) continue;
+
+        const std::string& directive = tokens[0];
+        if (directive != "interest" &&
+            directive != "interest-await" &&
+            directive != "interest-noawait") {
+            continue;
+        }
+
+        bool no_await = directive == "interest-noawait";
+        for (size_t i = 1; i < tokens.size(); ++i) {
+            DebianTriggerInterest interest;
+            interest.name = trim(tokens[i]);
+            interest.no_await = no_await;
+            if (!interest.name.empty()) interests.push_back(interest);
+        }
+    }
+
+    return interests;
+}
+
+std::vector<std::string> load_pending_dpkg_trigger_names() {
+    std::vector<std::string> loaded = read_trimmed_line_file(get_pending_dpkg_trigger_queue_path());
+    std::vector<std::string> pending;
+    std::set<std::string> seen;
+    for (const auto& raw_name : loaded) {
+        std::string name = trim(raw_name);
+        if (name.empty()) continue;
+        if (!seen.insert(name).second) continue;
+        pending.push_back(name);
+    }
+    return pending;
+}
+
+bool rewrite_pending_dpkg_trigger_names(
+    const std::vector<std::string>& trigger_names,
+    std::string* error_out = nullptr
+) {
+    if (error_out) *error_out = "";
+
+    std::string queue_path = get_pending_dpkg_trigger_queue_path();
+    if (trigger_names.empty()) {
+        if (unlink(queue_path.c_str()) != 0 && errno != ENOENT) {
+            if (error_out) *error_out = "Failed to clear pending dpkg trigger queue.";
+            return false;
+        }
+        return true;
+    }
+
+    std::ostringstream content;
+    std::set<std::string> seen;
+    for (const auto& raw_name : trigger_names) {
+        std::string name = trim(raw_name);
+        if (name.empty()) continue;
+        if (!seen.insert(name).second) continue;
+        content << name << "\n";
+    }
+
+    if (!mkdir_p(path_parent_dir(queue_path))) {
+        if (error_out) *error_out = "Failed to prepare pending dpkg trigger directory.";
+        return false;
+    }
+    if (!write_text_file_atomic(queue_path, content.str(), 0644)) {
+        if (error_out) *error_out = "Failed to write pending dpkg trigger queue.";
+        return false;
+    }
+    return true;
+}
+
+bool append_pending_dpkg_trigger_name(
+    const std::string& trigger_name,
+    std::string* error_out
+) {
+    if (error_out) *error_out = "";
+    std::string normalized = trim(trigger_name);
+    if (normalized.empty()) {
+        if (error_out) *error_out = "Empty dpkg trigger name.";
+        return false;
+    }
+
+    std::vector<std::string> pending = load_pending_dpkg_trigger_names();
+    pending.push_back(normalized);
+    return rewrite_pending_dpkg_trigger_names(pending, error_out);
+}
+
+std::map<std::string, std::vector<std::string>> build_installed_trigger_interest_map(
+    const std::vector<std::string>& trigger_names
+) {
+    std::map<std::string, std::vector<std::string>> interest_map;
+    std::set<std::string> wanted(trigger_names.begin(), trigger_names.end());
+    if (wanted.empty()) return interest_map;
+
+    for (const auto& record : load_package_status_records()) {
+        if (record.package.empty()) continue;
+        if (!package_status_has_installed_history(record.status)) continue;
+
+        for (const auto& interest : load_debian_trigger_interests_for_package(record.package)) {
+            if (wanted.count(interest.name) == 0) continue;
+            interest_map[record.package].push_back(interest.name);
+        }
+    }
+
+    for (auto& entry : interest_map) {
+        auto& names = entry.second;
+        std::sort(names.begin(), names.end());
+        names.erase(std::unique(names.begin(), names.end()), names.end());
+    }
+    return interest_map;
+}
+
+void mark_packages_trigger_pending(const std::vector<std::string>& trigger_names) {
+    for (const auto& entry : build_installed_trigger_interest_map(trigger_names)) {
+        PackageStatusRecord record;
+        if (!get_package_status_record(entry.first, &record)) continue;
+        if (!package_status_has_installed_history(record.status)) continue;
+        if (record.status == "half-installed" ||
+            record.status == "unpacked" ||
+            record.status == "half-configured") {
+            continue;
+        }
+
+        if (!set_package_status_record(
+                entry.first,
+                record.want.empty() ? "install" : record.want,
+                record.flag.empty() ? "ok" : record.flag,
+                "triggers-pending",
+                record.version)) {
+            std::cerr << "W: Failed to record triggers-pending state for "
+                      << entry.first << "." << std::endl;
+        }
+    }
+}
+
 std::vector<std::string> build_preinst_arguments(
     const std::string& previous_status,
     const std::string& old_version,
@@ -5843,6 +6058,87 @@ bool finalize_failed_configuration_state(
     std::cerr << "E: " << message << std::endl;
     std::cerr << "E: Package " << pkg_name
               << " remains installed in a half-configured state." << std::endl;
+    return false;
+}
+
+bool action_refresh_dpkg_trigger_state() {
+    std::vector<std::string> pending = load_pending_dpkg_trigger_names();
+    if (pending.empty()) {
+        rewrite_pending_dpkg_trigger_names({});
+        return true;
+    }
+
+    std::map<std::string, std::vector<std::string>> interest_map =
+        build_installed_trigger_interest_map(pending);
+    if (interest_map.empty()) {
+        rewrite_pending_dpkg_trigger_names({});
+        return true;
+    }
+
+    std::string queue_error;
+    if (!rewrite_pending_dpkg_trigger_names({}, &queue_error)) {
+        if (!queue_error.empty()) {
+            std::cerr << "E: " << queue_error << std::endl;
+        }
+        return false;
+    }
+
+    std::set<std::string> remaining_triggers;
+    std::vector<std::string> failed_packages;
+    for (const auto& entry : interest_map) {
+        const std::string& pkg_name = entry.first;
+        const std::vector<std::string>& pkg_triggers = entry.second;
+
+        PackageStatusRecord record;
+        if (!get_package_status_record(pkg_name, &record)) continue;
+        if (!package_status_has_installed_history(record.status)) continue;
+
+        std::string version = !record.version.empty() ? record.version : get_package_version(pkg_name);
+        std::string want = record.want.empty() ? "install" : record.want;
+        std::string flag = record.flag.empty() ? "ok" : record.flag;
+        set_package_status_record(pkg_name, want, flag, "triggers-pending", version);
+
+        std::string postinst_path = installed_maintainer_script_path(pkg_name, "postinst");
+        if (access(postinst_path.c_str(), X_OK) == 0) {
+            std::vector<std::string> args = {"triggered"};
+            args.insert(args.end(), pkg_triggers.begin(), pkg_triggers.end());
+            int rc = run_maintainer_script_with_args(
+                postinst_path,
+                "postinst",
+                pkg_name,
+                get_info_dir() + pkg_name + ".json",
+                args
+            );
+            if (rc != 0) {
+                set_package_status_record(pkg_name, want, flag, "half-configured", version);
+                remaining_triggers.insert(pkg_triggers.begin(), pkg_triggers.end());
+                failed_packages.push_back(pkg_name);
+                continue;
+            }
+        }
+
+        if (!set_package_status_record(pkg_name, want, flag, "installed", version)) {
+            std::cerr << "W: Failed to restore installed state after trigger processing for "
+                      << pkg_name << "." << std::endl;
+        }
+    }
+
+    for (const auto& queued_name : load_pending_dpkg_trigger_names()) {
+        remaining_triggers.insert(queued_name);
+    }
+
+    std::vector<std::string> remaining(remaining_triggers.begin(), remaining_triggers.end());
+    if (!rewrite_pending_dpkg_trigger_names(remaining, &queue_error) && !queue_error.empty()) {
+        std::cerr << "W: " << queue_error << std::endl;
+    }
+
+    if (failed_packages.empty()) return true;
+
+    std::cerr << "E: Maintainer trigger processing failed for";
+    for (size_t i = 0; i < failed_packages.size(); ++i) {
+        std::cerr << (i == 0 ? " " : ", ") << failed_packages[i];
+    }
+    std::cerr << "." << std::endl;
     return false;
 }
 
@@ -7127,7 +7423,7 @@ bool restorecon_transaction_paths(const std::vector<std::string>& logical_paths,
 }
 
 std::string deferred_selinux_relabel_queue_path() {
-    return g_root_prefix + "/var/lib/gpkg/triggers/selinux-relabel.list";
+    return get_trigger_state_dir() + "/selinux-relabel.list";
 }
 
 bool append_deferred_selinux_relabel_paths(const std::vector<std::string>& logical_paths, std::string* error_out) {
@@ -8051,6 +8347,11 @@ int main(int argc, char* argv[]) {
             for (int j = i + 1; j < argc; ++j) compat_args.push_back(argv[j]);
             return action_compat_dpkg(compat_args);
         }
+        if (arg == "--compat-dpkg-trigger") {
+            std::vector<std::string> compat_args;
+            for (int j = i + 1; j < argc; ++j) compat_args.push_back(argv[j]);
+            return action_compat_dpkg_trigger(compat_args);
+        }
         if (arg == "--compat-update-rc.d") {
             std::vector<std::string> compat_args;
             for (int j = i + 1; j < argc; ++j) compat_args.push_back(argv[j]);
@@ -8085,7 +8386,7 @@ int main(int argc, char* argv[]) {
 
     if (argc < 2) {
 
-        std::cout << "Usage: gpkg-worker [options]\nOptions:\n  --install <file>\n  --remove <pkg>\n  --purge <pkg>\n  --retire <pkg>\n  --verify <pkg>\n  --hydrate-control-metadata <pkg>\n  --compat-dpkg [dpkg args...]\n  --compat-dpkg-query [dpkg-query args...]\n  --compat-update-rc.d [update-rc.d args...]\n  --compat-invoke-rc.d [invoke-rc.d args...]\n  --compat-service [service args...]\n  --compat-systemctl [systemctl args...]\n  --compat-deb-systemd-invoke [args...]\n  --compat-initctl [args...]\n  --refresh-runtime-linker-state\n  --refresh-selinux-label-state\n  --register-file <path> --pkg <name>\n  --register-undo <cmd> --pkg <name>\n  --jobs <n>\n  --defer-runtime-linker-refresh\n  --defer-selinux-relabel\n  --unsafe-io\n";
+        std::cout << "Usage: gpkg-worker [options]\nOptions:\n  --install <file>\n  --remove <pkg>\n  --purge <pkg>\n  --retire <pkg>\n  --verify <pkg>\n  --hydrate-control-metadata <pkg>\n  --compat-dpkg [dpkg args...]\n  --compat-dpkg-query [dpkg-query args...]\n  --compat-dpkg-trigger [dpkg-trigger args...]\n  --compat-update-rc.d [update-rc.d args...]\n  --compat-invoke-rc.d [invoke-rc.d args...]\n  --compat-service [service args...]\n  --compat-systemctl [systemctl args...]\n  --compat-deb-systemd-invoke [args...]\n  --compat-initctl [args...]\n  --refresh-dpkg-trigger-state\n  --refresh-runtime-linker-state\n  --refresh-selinux-label-state\n  --register-file <path> --pkg <name>\n  --register-undo <cmd> --pkg <name>\n  --jobs <n>\n  --defer-runtime-linker-refresh\n  --defer-selinux-relabel\n  --unsafe-io\n";
 
         return 1;
 
@@ -8109,6 +8410,8 @@ int main(int argc, char* argv[]) {
         else if (arg == "--verify") mode = "verify", target = argv[++i];
 
         else if (arg == "--hydrate-control-metadata") mode = "hydrate-control-metadata", target = argv[++i];
+
+        else if (arg == "--refresh-dpkg-trigger-state") mode = "refresh-dpkg-trigger-state";
 
         else if (arg == "--refresh-runtime-linker-state") mode = "refresh-runtime-linker-state";
 
@@ -8154,6 +8457,8 @@ int main(int argc, char* argv[]) {
     if (mode == "hydrate-control-metadata" && !target.empty()) {
         return action_hydrate_control_metadata(target) ? 0 : 1;
     }
+
+    if (mode == "refresh-dpkg-trigger-state") return action_refresh_dpkg_trigger_state() ? 0 : 1;
 
     if (mode == "refresh-runtime-linker-state") return action_refresh_runtime_linker_state() ? 0 : 1;
 

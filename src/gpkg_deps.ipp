@@ -729,6 +729,38 @@ void sort_transaction_queue_for_install(
     std::vector<bool> emitted(n, false);
     std::set<std::string> completed_names;
 
+    auto bootstrap_rank = [&](size_t index) {
+        std::string canonical_name = canonicalize_package_name(queue[index].name, verbose);
+        static const std::set<std::string> bootstrap_first = {
+            "libc6",
+            "libc-bin",
+            "libc-gconv-modules-extra",
+            "libgcc-s1",
+            "libstdc++6",
+            "libcrypt1",
+            "zlib1g",
+            "libzstd1",
+        };
+        static const std::set<std::string> shell_runtime_next = {
+            "libtinfo6",
+            "libncursesw6",
+            "libreadline8t64",
+            "bash",
+            "dash",
+        };
+
+        if (bootstrap_first.count(canonical_name) != 0) return 0;
+        if (shell_runtime_next.count(canonical_name) != 0) return 1;
+
+        std::string priority = trim(queue[index].priority);
+        std::transform(priority.begin(), priority.end(), priority.begin(), [](unsigned char ch) {
+            return static_cast<char>(std::tolower(ch));
+        });
+        if (priority == "required") return 2;
+        if (priority == "important") return 3;
+        return 4;
+    };
+
     auto candidate_priority = [&](size_t index) {
         std::string canonical_name = canonicalize_package_name(queue[index].name, verbose);
         auto it = reverse_companions.find(canonical_name);
@@ -742,18 +774,59 @@ void sort_transaction_queue_for_install(
     for (size_t emitted_count = 0; emitted_count < n; ++emitted_count) {
         size_t best_index = n;
         int best_priority = 2;
+        int best_bootstrap_rank = 5;
         for (size_t i = 0; i < n; ++i) {
             if (emitted[i] || indegree[i] != 0) continue;
             int priority = candidate_priority(i);
-            if (best_index == n || priority < best_priority || (priority == best_priority && i < best_index)) {
+            int rank = bootstrap_rank(i);
+            if (best_index == n ||
+                priority < best_priority ||
+                (priority == best_priority &&
+                 (rank < best_bootstrap_rank ||
+                  (rank == best_bootstrap_rank && i < best_index)))) {
                 best_index = i;
                 best_priority = priority;
+                best_bootstrap_rank = rank;
             }
         }
 
         if (best_index == n) {
-            VLOG(verbose, "Falling back to original transaction order because dependency ordering contains a cycle or unresolved provider ambiguity.");
-            return;
+            size_t best_cycle_index = n;
+            int best_cycle_priority = 2;
+            int best_cycle_rank = 5;
+            size_t best_cycle_indegree = std::numeric_limits<size_t>::max();
+
+            for (size_t i = 0; i < n; ++i) {
+                if (emitted[i]) continue;
+                int priority = candidate_priority(i);
+                int rank = bootstrap_rank(i);
+                size_t current_indegree = indegree[i];
+                if (best_cycle_index == n ||
+                    priority < best_cycle_priority ||
+                    (priority == best_cycle_priority &&
+                     (rank < best_cycle_rank ||
+                      (rank == best_cycle_rank &&
+                       (current_indegree < best_cycle_indegree ||
+                        (current_indegree == best_cycle_indegree && i < best_cycle_index)))))) {
+                    best_cycle_index = i;
+                    best_cycle_priority = priority;
+                    best_cycle_rank = rank;
+                    best_cycle_indegree = current_indegree;
+                }
+            }
+
+            if (best_cycle_index == n) {
+                VLOG(verbose, "Dependency ordering aborted because no install candidate remained.");
+                return;
+            }
+
+            VLOG(verbose,
+                 "Breaking dependency-order ambiguity by scheduling "
+                 << queue[best_cycle_index].name
+                 << " next (priority=" << best_cycle_priority
+                 << ", bootstrap-rank=" << best_cycle_rank
+                 << ", indegree=" << best_cycle_indegree << ").");
+            best_index = best_cycle_index;
         }
 
         emitted[best_index] = true;
