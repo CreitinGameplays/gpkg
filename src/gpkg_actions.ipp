@@ -1363,14 +1363,74 @@ InstallCommandResult install_native_debian_batch(
         return {false, "", batch.front().name};
     }
 
-    std::vector<size_t> order(batch.size());
-    for (size_t i = 0; i < batch.size(); ++i) order[i] = i;
-    std::stable_sort(order.begin(), order.end(), [&](size_t left, size_t right) {
+    std::vector<std::vector<size_t>> outgoing(batch.size());
+    std::vector<int> indegree(batch.size(), 0);
+    std::set<std::pair<size_t, size_t>> seen_edges;
+
+    auto package_satisfies_batch_dependency = [&](size_t provider_index, const Dependency& dep) {
+        if (provider_index >= batch.size()) return false;
+        const PackageMetadata& provider = batch[provider_index];
+        std::string provider_name = debian_backend_package_name(provider);
+        if (!provider_name.empty() &&
+            package_metadata_satisfies_dependency(provider_name, provider, dep)) {
+            return true;
+        }
+        return !provider.name.empty() &&
+               provider.name != provider_name &&
+               package_metadata_satisfies_dependency(provider.name, provider, dep);
+    };
+
+    for (size_t dependent = 0; dependent < batch.size(); ++dependent) {
+        for (const auto& dep_str : batch[dependent].depends) {
+            Dependency dep = parse_dependency(dep_str);
+            if (dep.name.empty()) continue;
+
+            for (size_t provider = 0; provider < batch.size(); ++provider) {
+                if (provider == dependent) continue;
+                if (!package_satisfies_batch_dependency(provider, dep)) continue;
+                if (!seen_edges.insert({provider, dependent}).second) continue;
+                outgoing[provider].push_back(dependent);
+                ++indegree[dependent];
+            }
+        }
+    }
+
+    std::vector<size_t> order;
+    order.reserve(batch.size());
+    std::vector<size_t> ready;
+    for (size_t i = 0; i < batch.size(); ++i) {
+        if (indegree[i] == 0) ready.push_back(i);
+    }
+
+    auto ready_less = [&](size_t left, size_t right) {
         int left_rank = package_runtime_bootstrap_rank(batch[left].name, verbose);
         int right_rank = package_runtime_bootstrap_rank(batch[right].name, verbose);
         if (left_rank != right_rank) return left_rank < right_rank;
         return left < right;
-    });
+    };
+
+    while (!ready.empty()) {
+        auto best_it = std::min_element(ready.begin(), ready.end(), ready_less);
+        size_t current = *best_it;
+        ready.erase(best_it);
+        order.push_back(current);
+
+        for (size_t next : outgoing[current]) {
+            --indegree[next];
+            if (indegree[next] == 0) ready.push_back(next);
+        }
+    }
+
+    if (order.size() != batch.size()) {
+        std::vector<size_t> remaining;
+        for (size_t i = 0; i < batch.size(); ++i) {
+            if (std::find(order.begin(), order.end(), i) == order.end()) remaining.push_back(i);
+        }
+        std::stable_sort(remaining.begin(), remaining.end(), ready_less);
+        order.insert(order.end(), remaining.begin(), remaining.end());
+        VLOG(verbose, "Fell back to rank ordering for a native dpkg cycle involving "
+                     << remaining.size() << " package(s).");
+    }
 
     for (size_t index : order) {
         const PackageMetadata& meta = batch[index];
