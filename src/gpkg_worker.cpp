@@ -6032,6 +6032,59 @@ bool append_transaction_manifest_line(const std::string& path, const std::string
     return out.good();
 }
 
+bool regular_files_match_bytewise(const std::string& left_path, const std::string& right_path) {
+    struct stat left_st {};
+    struct stat right_st {};
+    if (stat(left_path.c_str(), &left_st) != 0 || stat(right_path.c_str(), &right_st) != 0) return false;
+    if (!S_ISREG(left_st.st_mode) || !S_ISREG(right_st.st_mode)) return false;
+    if (left_st.st_size != right_st.st_size) return false;
+
+    int left_fd = open(left_path.c_str(), O_RDONLY);
+    if (left_fd < 0) return false;
+    int right_fd = open(right_path.c_str(), O_RDONLY);
+    if (right_fd < 0) {
+        close(left_fd);
+        return false;
+    }
+
+    char left_buf[65536];
+    char right_buf[65536];
+    bool match = true;
+    while (true) {
+        ssize_t left_read = read(left_fd, left_buf, sizeof(left_buf));
+        ssize_t right_read = read(right_fd, right_buf, sizeof(right_buf));
+        if (left_read < 0 || right_read < 0 || left_read != right_read) {
+            match = false;
+            break;
+        }
+        if (left_read == 0) break;
+        if (memcmp(left_buf, right_buf, static_cast<size_t>(left_read)) != 0) {
+            match = false;
+            break;
+        }
+    }
+
+    close(left_fd);
+    close(right_fd);
+    return match;
+}
+
+bool rooted_paths_match_no_follow(const std::string& snapshot_path, const std::string& live_path) {
+    struct stat snapshot_st {};
+    struct stat live_st {};
+    if (lstat(snapshot_path.c_str(), &snapshot_st) != 0 || lstat(live_path.c_str(), &live_st) != 0) return false;
+
+    if ((snapshot_st.st_mode & S_IFMT) != (live_st.st_mode & S_IFMT)) return false;
+    if ((snapshot_st.st_mode & 07777) != (live_st.st_mode & 07777)) return false;
+
+    if (S_ISLNK(snapshot_st.st_mode)) {
+        return read_symlink_target(snapshot_path) == read_symlink_target(live_path);
+    }
+    if (S_ISDIR(snapshot_st.st_mode)) return true;
+    if (!S_ISREG(snapshot_st.st_mode)) return false;
+    return regular_files_match_bytewise(snapshot_path, live_path);
+}
+
 bool overlay_upper_entry_is_whiteout(const struct stat& st) {
     return S_ISCHR(st.st_mode) && major(st.st_rdev) == 0 && minor(st.st_rdev) == 0;
 }
@@ -6085,6 +6138,106 @@ bool commit_transaction_root_entry(
     if (!had_existing) {
         rollback_entries.push_back({logical_path, live_full_path, "", true});
     }
+    return true;
+}
+
+bool commit_snapshot_tree_diff_recursive(
+    const std::string& snapshot_path,
+    const std::string& live_full_path,
+    const std::string& logical_path,
+    std::vector<InstallRollbackEntry>& rollback_entries
+) {
+    struct stat snapshot_st {};
+    if (lstat(snapshot_path.c_str(), &snapshot_st) != 0) {
+        if (errno == ENOENT) return apply_transaction_live_removal(logical_path, rollback_entries);
+        std::cerr << "E: Failed to inspect transaction snapshot " << snapshot_path << ": "
+                  << strerror(errno) << std::endl;
+        return false;
+    }
+
+    struct stat live_st {};
+    bool live_exists = lstat(live_full_path.c_str(), &live_st) == 0;
+    if (!live_exists && errno != ENOENT) {
+        std::cerr << "E: Failed to inspect live path " << live_full_path << ": "
+                  << strerror(errno) << std::endl;
+        return false;
+    }
+
+    bool snapshot_is_dir = S_ISDIR(snapshot_st.st_mode) && !S_ISLNK(snapshot_st.st_mode);
+    bool live_is_dir = live_exists && S_ISDIR(live_st.st_mode) && !S_ISLNK(live_st.st_mode);
+    if (!snapshot_is_dir || !live_is_dir) {
+        if (live_exists && rooted_paths_match_no_follow(snapshot_path, live_full_path)) return true;
+        return commit_transaction_root_entry(snapshot_path, logical_path, rollback_entries);
+    }
+
+    if (!mkdir_p(live_full_path)) {
+        std::cerr << "E: Failed to ensure live directory " << live_full_path << std::endl;
+        return false;
+    }
+    chmod(live_full_path.c_str(), snapshot_st.st_mode & 07777);
+
+    std::set<std::string> names;
+    auto collect_names = [&](const std::string& dir_path) -> bool {
+        DIR* dir = opendir(dir_path.c_str());
+        if (!dir) {
+            std::cerr << "E: Failed to open directory " << dir_path << ": "
+                      << strerror(errno) << std::endl;
+            return false;
+        }
+        errno = 0;
+        struct dirent* entry = nullptr;
+        while ((entry = readdir(dir)) != nullptr) {
+            std::string name = entry->d_name;
+            if (name == "." || name == "..") continue;
+            names.insert(name);
+        }
+        int read_errno = errno;
+        closedir(dir);
+        if (read_errno != 0) {
+            std::cerr << "E: Failed while reading directory " << dir_path << ": "
+                      << strerror(read_errno) << std::endl;
+            return false;
+        }
+        return true;
+    };
+
+    if (!collect_names(snapshot_path)) return false;
+    if (!collect_names(live_full_path)) return false;
+
+    for (const auto& name : names) {
+        std::string child_snapshot = snapshot_path + "/" + name;
+        std::string child_live = live_full_path + "/" + name;
+        std::string child_logical = logical_path + "/" + name;
+
+        struct stat child_snapshot_st {};
+        if (lstat(child_snapshot.c_str(), &child_snapshot_st) != 0) {
+            if (errno == ENOENT) {
+                if (!apply_transaction_live_removal(child_logical, rollback_entries)) return false;
+                continue;
+            }
+            std::cerr << "E: Failed to inspect transaction snapshot " << child_snapshot << ": "
+                      << strerror(errno) << std::endl;
+            return false;
+        }
+
+        bool child_snapshot_is_dir = S_ISDIR(child_snapshot_st.st_mode) && !S_ISLNK(child_snapshot_st.st_mode);
+        if (child_snapshot_is_dir) {
+            if (!commit_snapshot_tree_diff_recursive(
+                    child_snapshot,
+                    child_live,
+                    child_logical,
+                    rollback_entries)) {
+                return false;
+            }
+            continue;
+        }
+
+        struct stat child_live_st {};
+        bool child_live_exists = lstat(child_live.c_str(), &child_live_st) == 0;
+        if (child_live_exists && rooted_paths_match_no_follow(child_snapshot, child_live)) continue;
+        if (!commit_transaction_root_entry(child_snapshot, child_logical, rollback_entries)) return false;
+    }
+
     return true;
 }
 
@@ -6235,6 +6388,8 @@ bool action_prepare_transaction_root(const std::string& txn_dir) {
     bool ok = true;
     int saved_errno = 0;
     struct dirent* entry = nullptr;
+    bool overlay_snapshot_only = false;
+    bool overlay_fallback_announced = false;
     errno = 0;
     while ((entry = readdir(root_dir)) != nullptr) {
         std::string name = entry->d_name;
@@ -6270,26 +6425,35 @@ bool action_prepare_transaction_root(const std::string& txn_dir) {
         } else if (name == "tmp") {
             mounted = transaction_mount_tmpfs_path(target_path, 01777);
         } else if (transaction_should_overlay_top_level(name)) {
-            mounted = transaction_mount_overlay_path(
-                source_path,
-                upper_root + "/" + name,
-                work_root + "/" + name,
-                target_path
-            );
-            if (!mounted &&
-                (errno == EINVAL || errno == ENODEV || errno == EOPNOTSUPP || errno == ENOSYS)) {
-                std::cerr << "W: Overlay mount is unavailable for " << source_path
-                          << "; falling back to a copied transaction snapshot for this top-level path."
-                          << std::endl;
+            if (!overlay_snapshot_only) {
+                mounted = transaction_mount_overlay_path(
+                    source_path,
+                    upper_root + "/" + name,
+                    work_root + "/" + name,
+                    target_path
+                );
+                if (!mounted &&
+                    (errno == EINVAL || errno == ENODEV || errno == EOPNOTSUPP || errno == ENOSYS)) {
+                    overlay_snapshot_only = true;
+                    if (!overlay_fallback_announced) {
+                        std::cerr << "W: Overlay mounts are unavailable in this environment; "
+                                  << "switching the transaction root to copied snapshots for regular top-level paths."
+                                  << std::endl;
+                        overlay_fallback_announced = true;
+                    }
+                    errno = 0;
+                }
+            }
+
+            if (overlay_snapshot_only) {
                 if (remove_tree_no_follow(target_path) &&
                     copy_path_atomic_no_follow(source_path, target_path) &&
                     append_transaction_manifest_line(initial_root_manifest, name)) {
-                    mounted = false;
-                } else {
-                    ok = false;
-                    break;
+                    errno = 0;
+                    continue;
                 }
-                continue;
+                ok = false;
+                break;
             }
         } else {
             mounted = transaction_bind_mount_path(source_path, target_path, true);
@@ -6397,7 +6561,11 @@ bool action_commit_transaction_root(const std::string& txn_dir) {
         if (name == "." || name == "..") continue;
         current_root_entries.insert(name);
         if (mounted_name_set.count(name) != 0) continue;
-        if (!commit_transaction_root_entry(merged_root + "/" + name, "/" + name, rollback_entries)) {
+        if (!commit_snapshot_tree_diff_recursive(
+                merged_root + "/" + name,
+                g_root_prefix + "/" + name,
+                "/" + name,
+                rollback_entries)) {
             closedir(merged_dir);
             rollback_install_changes(rollback_entries);
             return false;
