@@ -535,12 +535,34 @@ bool repair_native_dpkg_status_database(bool verbose, std::string* error_out) {
         if (record.package.empty() || !package_status_is_installed_like(record.status)) continue;
 
         std::string list_path = DPKG_INFO_DIR + "/" + record.package + ".list";
-        if (access(list_path.c_str(), F_OK) == 0) continue;
+        bool list_exists = access(list_path.c_str(), F_OK) == 0;
 
-        std::vector<std::string> files = read_installed_file_list(record.package);
+        std::vector<std::string> files = list_exists
+            ? load_dependency_entries(list_path)
+            : std::vector<std::string>{};
+        if (files.empty()) files = read_installed_file_list(record.package);
         if (files.empty()) {
             auto base_it = base_files_by_package.find(record.package);
             if (base_it != base_files_by_package.end()) files = base_it->second;
+        }
+        if (list_exists && !files.empty()) {
+            std::set<std::string> existing_normalized;
+            for (const auto& file : load_dependency_entries(list_path)) {
+                std::string normalized = trim(file);
+                if (normalized.empty()) continue;
+                if (normalized.front() != '/') normalized = "/" + normalized;
+                existing_normalized.insert(normalized);
+            }
+            std::set<std::string> desired_normalized;
+            for (const auto& file : files) {
+                std::string normalized = trim(file);
+                if (normalized.empty()) continue;
+                if (normalized.front() != '/') normalized = "/" + normalized;
+                desired_normalized.insert(normalized);
+            }
+            if (existing_normalized == desired_normalized) continue;
+        } else if (list_exists && files.empty()) {
+            continue;
         }
 
         std::set<std::string> normalized_files;
@@ -560,7 +582,7 @@ bool repair_native_dpkg_status_database(bool verbose, std::string* error_out) {
             return false;
         }
 
-        VLOG(verbose, "Reconstructed missing native dpkg file manifest for " << record.package
+        VLOG(verbose, "Reconstructed native dpkg file manifest for " << record.package
                      << " with " << normalized_files.size() << " path(s).");
     }
 
@@ -574,6 +596,15 @@ bool native_dpkg_package_looks_synthetic(const std::string& pkg_name) {
     PackageMetadata meta;
     if (get_installed_package_metadata(pkg_name, meta)) return true;
     return false;
+}
+
+std::vector<std::string> get_base_system_registry_files_for_package(const std::string& pkg_name) {
+    if (pkg_name.empty()) return {};
+    for (const auto& entry : load_base_system_registry_entries()) {
+        if (entry.package != pkg_name) continue;
+        return entry.files;
+    }
+    return {};
 }
 
 bool prune_synthetic_dpkg_file_ownership_for_package(
@@ -611,6 +642,12 @@ bool prune_synthetic_dpkg_file_ownership_for_package(
 
         std::string list_path = DPKG_INFO_DIR + "/" + record.package + ".list";
         std::vector<std::string> owned_paths = load_dependency_entries(list_path);
+        if (owned_paths.empty()) {
+            owned_paths = get_base_system_registry_files_for_package(record.package);
+        }
+        if (owned_paths.empty()) {
+            owned_paths = read_installed_file_list(record.package);
+        }
         if (owned_paths.empty()) continue;
 
         std::vector<std::string> filtered_paths;
