@@ -69,6 +69,15 @@ bool get_live_installed_package_metadata(const std::string& pkg_name, PackageMet
 
 Dependency parse_dependency(const std::string& dep_str) {
     Dependency dep;
+
+    RelationAtom normalized = normalize_relation_atom(dep_str, "any");
+    if (normalized.valid) {
+        dep.name = normalized.name;
+        dep.op = normalized.op;
+        dep.version = normalized.version;
+        return dep;
+    }
+
     size_t open_paren = dep_str.find('(');
     if (open_paren == std::string::npos) {
         dep.name = trim(dep_str);
