@@ -480,6 +480,20 @@ std::string normalize_dpkg_compatible_version(
     return "0~" + version;
 }
 
+bool is_native_dpkg_compat_placeholder_version(
+    const std::string& pkg_name,
+    const std::string& version,
+    const ImportPolicy& policy
+) {
+    std::string normalized = trim(version);
+    if (normalized.empty()) return true;
+    if (normalized == "0") return true;
+    if (native_dpkg_seed_prefers_high_compat_version(pkg_name, policy) && normalized == "9999") {
+        return true;
+    }
+    return false;
+}
+
 bool repair_native_dpkg_status_database(bool verbose, std::string* error_out) {
     if (error_out) error_out->clear();
     if (!ensure_native_dpkg_admin_layout(error_out)) return false;
@@ -534,8 +548,11 @@ bool repair_native_dpkg_status_database(bool verbose, std::string* error_out) {
         }
 
         if (!pkg_name.empty()) {
+            PackageMetadata resolved_meta;
+            bool have_resolved_meta = false;
             if (native_dpkg_package_looks_synthetic(pkg_name)) {
-                std::string target_pkg_name = resolve_native_dpkg_bootstrap_name(pkg_name);
+                std::string target_pkg_name = resolve_native_dpkg_bootstrap_name(pkg_name, &resolved_meta);
+                have_resolved_meta = !resolved_meta.name.empty();
                 if (!target_pkg_name.empty() &&
                     target_pkg_name != pkg_name &&
                     package_index >= 0) {
@@ -551,8 +568,30 @@ bool repair_native_dpkg_status_database(bool verbose, std::string* error_out) {
                 }
             }
 
+            std::string effective_version = version;
+            if (native_dpkg_package_looks_synthetic(pkg_name)) {
+                if (!have_resolved_meta) {
+                    have_resolved_meta = !resolve_native_dpkg_bootstrap_name(pkg_name, &resolved_meta).empty() &&
+                        !resolved_meta.name.empty();
+                }
+
+                std::string resolved_version;
+                if (have_resolved_meta) {
+                    if (!resolved_meta.version.empty()) {
+                        resolved_version = resolved_meta.version;
+                    } else if (!resolved_meta.debian_version.empty()) {
+                        resolved_version = resolved_meta.debian_version;
+                    }
+                }
+
+                if (!resolved_version.empty() &&
+                    is_native_dpkg_compat_placeholder_version(pkg_name, effective_version, policy)) {
+                    effective_version = resolved_version;
+                }
+            }
+
             std::string normalized_version =
-                normalize_dpkg_compatible_version(pkg_name, version, policy);
+                normalize_dpkg_compatible_version(pkg_name, effective_version, policy);
             if (version_index >= 0) {
                 if (trim(version) != normalized_version) {
                     paragraph[static_cast<size_t>(version_index)] = "Version: " + normalized_version;
