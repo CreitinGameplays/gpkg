@@ -881,6 +881,7 @@ InstallCommandResult remove_package_by_name(const std::string& pkg_name, bool ve
             return {false, "", pkg_name};
         }
 
+        ScopedMaintscriptShellOverride maintscript_shell(true, verbose);
         CommandCaptureResult result = run_command_captured_argv(
             build_dpkg_command_argv({"--remove", pkg_name}),
             verbose,
@@ -911,6 +912,7 @@ InstallCommandResult purge_package_by_name(const std::string& pkg_name, bool ver
             return {false, "", pkg_name};
         }
 
+        ScopedMaintscriptShellOverride maintscript_shell(true, verbose);
         CommandCaptureResult result = run_command_captured_argv(
             build_dpkg_command_argv({"--purge", pkg_name}),
             verbose,
@@ -1438,6 +1440,7 @@ InstallCommandResult install_native_debian_batch(
                      << remaining.size() << " package(s).");
     }
 
+    ScopedMaintscriptShellOverride maintscript_shell(true, verbose);
     for (size_t index : order) {
         const PackageMetadata& meta = batch[index];
         CommandCaptureResult result = run_command_captured_argv(

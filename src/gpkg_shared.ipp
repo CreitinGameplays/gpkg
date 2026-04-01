@@ -1023,6 +1023,131 @@ struct ScopedServiceSuppression {
     }
 };
 
+std::string read_symlink_target(const std::string& path) {
+    std::vector<char> buffer(4096, '\0');
+    ssize_t len = readlink(path.c_str(), buffer.data(), buffer.size() - 1);
+    if (len < 0) return "";
+    buffer[static_cast<size_t>(len)] = '\0';
+    return std::string(buffer.data(), static_cast<size_t>(len));
+}
+
+struct ScopedMaintscriptShellOverride {
+    bool verbose = false;
+    ScopedEnvOverrides env;
+    std::string shell_path = "/bin/sh";
+    std::string replacement_path;
+    std::string backup_path;
+    bool installed_override = false;
+    bool had_original_shell = false;
+
+    explicit ScopedMaintscriptShellOverride(bool active, bool v) : verbose(v) {
+        if (!active) return;
+
+        env.set("SHELL", shell_path);
+        env.set("CONFIG_SHELL", shell_path);
+
+        if (!ROOT_PREFIX.empty()) {
+            if (verbose) {
+                std::cout << "[DEBUG] Skipping maintainer shell override because gpkg is using ROOT_PREFIX="
+                          << ROOT_PREFIX << "." << std::endl;
+            }
+            return;
+        }
+
+        const std::vector<std::string> candidates = {
+            "/bin/dash",
+            "/usr/bin/dash",
+            "/bin/busybox",
+            "/usr/bin/busybox",
+        };
+        for (const auto& candidate : candidates) {
+            if (access(candidate.c_str(), X_OK) == 0) {
+                replacement_path = candidate;
+                break;
+            }
+        }
+
+        if (replacement_path.empty()) {
+            if (verbose) {
+                std::cout << "[DEBUG] No maintainer-script shell override candidate found; keeping existing /bin/sh."
+                          << std::endl;
+            }
+            return;
+        }
+
+        struct stat st {};
+        if (lstat(shell_path.c_str(), &st) == 0 && S_ISLNK(st.st_mode)) {
+            std::string current_target = read_symlink_target(shell_path);
+            if (current_target == replacement_path) {
+                if (verbose) {
+                    std::cout << "[DEBUG] Maintainer scripts already use " << replacement_path
+                              << " via /bin/sh." << std::endl;
+                }
+                return;
+            }
+        } else if (errno != 0 && errno != ENOENT && verbose) {
+            std::cout << "[DEBUG] Failed to inspect /bin/sh before maintainer shell override: "
+                      << strerror(errno) << std::endl;
+        }
+
+        if (lstat(shell_path.c_str(), &st) == 0) {
+            had_original_shell = true;
+            backup_path = shell_path + ".gpkg-backup-" +
+                          std::to_string(static_cast<long long>(getpid()));
+            if (rename(shell_path.c_str(), backup_path.c_str()) != 0) {
+                if (verbose) {
+                    std::cout << "[DEBUG] Failed to back up /bin/sh for maintainer shell override: "
+                              << strerror(errno) << std::endl;
+                }
+                had_original_shell = false;
+                backup_path.clear();
+                return;
+            }
+        } else if (errno != ENOENT) {
+            if (verbose) {
+                std::cout << "[DEBUG] Failed to inspect /bin/sh for maintainer shell override: "
+                          << strerror(errno) << std::endl;
+            }
+            return;
+        }
+
+        if (symlink(replacement_path.c_str(), shell_path.c_str()) == 0) {
+            installed_override = true;
+            if (verbose) {
+                std::cout << "[DEBUG] Redirected /bin/sh to " << replacement_path
+                          << " for native dpkg maintainer scripts." << std::endl;
+            }
+            return;
+        }
+
+        if (verbose) {
+            std::cout << "[DEBUG] Failed to install maintainer shell override via /bin/sh -> "
+                      << replacement_path << ": " << strerror(errno) << std::endl;
+        }
+        if (had_original_shell && !backup_path.empty()) {
+            rename(backup_path.c_str(), shell_path.c_str());
+            had_original_shell = false;
+            backup_path.clear();
+        }
+    }
+
+    ~ScopedMaintscriptShellOverride() {
+        if (installed_override) {
+            if (unlink(shell_path.c_str()) != 0 && errno != ENOENT && verbose) {
+                std::cout << "[DEBUG] Failed to remove temporary maintainer shell override: "
+                          << strerror(errno) << std::endl;
+            }
+        }
+
+        if (had_original_shell && !backup_path.empty()) {
+            if (rename(backup_path.c_str(), shell_path.c_str()) != 0 && verbose) {
+                std::cout << "[DEBUG] Failed to restore original /bin/sh after native dpkg transaction: "
+                          << strerror(errno) << std::endl;
+            }
+        }
+    }
+};
+
 void run_triggers(bool verbose) {
     bool pending_dpkg_triggers = has_pending_dpkg_trigger_state();
     bool pending_runtime_refresh = g_pending_runtime_linker_refresh;
