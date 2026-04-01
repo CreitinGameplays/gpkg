@@ -46,6 +46,7 @@ void append_unique_policy_value(std::vector<std::string>& values, const std::str
 }
 
 bool wildcard_match(const std::string& value, const std::string& pattern) {
+    if (pattern.find_first_of("*?[]") == std::string::npos) return value == pattern;
     return fnmatch(pattern.c_str(), value.c_str(), 0) == 0;
 }
 
@@ -107,9 +108,25 @@ RelationAtom normalize_relation_atom(const std::string& raw_atom, const std::str
     std::string cleaned = trim(raw_atom);
     if (cleaned.empty()) return parsed;
 
-    std::regex profile_re("\\s*<[^>]+>");
-    cleaned = std::regex_replace(cleaned, profile_re, "");
-    cleaned = trim(cleaned);
+    std::string without_profiles;
+    without_profiles.reserve(cleaned.size());
+    bool in_profile = false;
+    for (char ch : cleaned) {
+        if (in_profile) {
+            if (ch == '>') in_profile = false;
+            continue;
+        }
+        if (ch == '<') {
+            while (!without_profiles.empty() &&
+                   std::isspace(static_cast<unsigned char>(without_profiles.back()))) {
+                without_profiles.pop_back();
+            }
+            in_profile = true;
+            continue;
+        }
+        without_profiles.push_back(ch);
+    }
+    cleaned = trim(without_profiles);
 
     size_t bracket_open = cleaned.find('[');
     size_t bracket_close = cleaned.find(']', bracket_open == std::string::npos ? 0 : bracket_open);
@@ -512,11 +529,20 @@ std::string apply_dependency_rewrite_name(
     const std::map<std::string, std::string>& rewrites,
     const std::map<std::string, std::string>* aliases = nullptr
 ) {
+    auto exact_rewrite = rewrites.find(name);
+    if (exact_rewrite != rewrites.end()) return trim(exact_rewrite->second);
+    if (aliases) {
+        auto exact_alias = aliases->find(name);
+        if (exact_alias != aliases->end()) return trim(exact_alias->second);
+    }
+
     for (const auto& entry : rewrites) {
+        if (entry.first == name) continue;
         if (wildcard_match(name, entry.first)) return trim(entry.second);
     }
     if (aliases) {
         for (const auto& entry : *aliases) {
+            if (entry.first == name) continue;
             if (wildcard_match(name, entry.first)) return trim(entry.second);
         }
     }
@@ -525,7 +551,13 @@ std::string apply_dependency_rewrite_name(
 
 std::string canonicalize_package_name(const std::string& name, bool verbose = false) {
     const ImportPolicy& policy = get_import_policy(verbose);
+    auto exact_alias = policy.package_aliases.find(name);
+    if (exact_alias != policy.package_aliases.end()) {
+        std::string canonical = trim(exact_alias->second);
+        return canonical.empty() ? name : canonical;
+    }
     for (const auto& entry : policy.package_aliases) {
+        if (entry.first == name) continue;
         if (!wildcard_match(name, entry.first)) continue;
         std::string canonical = trim(entry.second);
         return canonical.empty() ? name : canonical;

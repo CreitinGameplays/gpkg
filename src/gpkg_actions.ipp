@@ -593,6 +593,25 @@ bool native_dpkg_package_looks_synthetic(const std::string& pkg_name) {
     if (pkg_name.empty()) return false;
     if (package_is_base_system_provided(pkg_name)) return true;
 
+    // Legacy gpkg-managed packages may only have status/list artifacts. Treat
+    // them as synthetic dpkg owners so overlap pruning can prevent file
+    // ownership collisions during native Debian transitions.
+    static std::set<std::string> registered_gpkg_packages;
+    static bool registered_gpkg_packages_loaded = false;
+    if (!registered_gpkg_packages_loaded) {
+        std::vector<std::string> names = collect_registered_package_names_from_status_records(
+            load_package_status_records()
+        );
+        registered_gpkg_packages.insert(names.begin(), names.end());
+        registered_gpkg_packages_loaded = true;
+    }
+    if (registered_gpkg_packages.count(pkg_name) != 0) return true;
+
+    if (access((INFO_DIR + pkg_name + ".json").c_str(), F_OK) == 0 ||
+        access((INFO_DIR + pkg_name + ".list").c_str(), F_OK) == 0) {
+        return true;
+    }
+
     PackageMetadata meta;
     if (get_installed_package_metadata(pkg_name, meta)) return true;
     return false;
