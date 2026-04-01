@@ -17,11 +17,6 @@ bool prepare_install_archives(
 std::vector<std::string> build_dpkg_command_argv(const std::vector<std::string>& args);
 std::string debian_backend_package_name(const PackageMetadata& meta);
 bool package_uses_native_dpkg_backend(const PackageMetadata& meta);
-bool sync_native_dpkg_backend_state(
-    const std::vector<PackageMetadata>& batch,
-    bool verbose,
-    std::string* error_out = nullptr
-);
 InstallCommandResult install_native_debian_batch(
     const std::vector<PackageMetadata>& batch,
     bool verbose
@@ -875,14 +870,6 @@ InstallCommandResult remove_package_by_name(const std::string& pkg_name, bool ve
     if (!is_installed(pkg_name) &&
         get_dpkg_package_status_record(pkg_name, &dpkg_record) &&
         package_status_is_installed_like(dpkg_record.status)) {
-        std::string sync_error;
-        if (!sync_native_dpkg_backend_state({}, verbose, &sync_error)) {
-            std::cerr << "E: Failed to prepare native dpkg backend state";
-            if (!sync_error.empty()) std::cerr << ": " << sync_error;
-            std::cerr << std::endl;
-            return {false, "", pkg_name, 0, ""};
-        }
-
         ScopedMaintscriptShellOverride maintscript_shell(true, verbose);
         CommandCaptureResult result = run_command_captured_argv(
             build_dpkg_command_argv({"--remove", pkg_name}),
@@ -906,14 +893,6 @@ InstallCommandResult purge_package_by_name(const std::string& pkg_name, bool ver
     if (!is_installed(pkg_name) &&
         get_dpkg_package_status_record(pkg_name, &dpkg_record) &&
         (package_status_is_installed_like(dpkg_record.status) || dpkg_record.status == "config-files")) {
-        std::string sync_error;
-        if (!sync_native_dpkg_backend_state({}, verbose, &sync_error)) {
-            std::cerr << "E: Failed to prepare native dpkg backend state";
-            if (!sync_error.empty()) std::cerr << ": " << sync_error;
-            std::cerr << std::endl;
-            return {false, "", pkg_name, 0, ""};
-        }
-
         ScopedMaintscriptShellOverride maintscript_shell(true, verbose);
         CommandCaptureResult result = run_command_captured_argv(
             build_dpkg_command_argv({"--purge", pkg_name}),
@@ -1056,341 +1035,6 @@ InstallCommandResult install_package_v2(
     );
 }
 
-struct NativeDpkgStatusEntry {
-    PackageStatusRecord record;
-    PackageMetadata meta;
-    std::vector<std::string> file_list;
-};
-
-std::vector<std::string> read_text_lines_simple(const std::string& path) {
-    std::vector<std::string> lines;
-    std::ifstream f(path);
-    if (!f) return lines;
-
-    std::string line;
-    while (std::getline(f, line)) {
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        if (!line.empty()) lines.push_back(line);
-    }
-    return lines;
-}
-
-std::string simple_parent_dir(const std::string& path) {
-    size_t slash = path.rfind('/');
-    if (slash == std::string::npos) return ".";
-    if (slash == 0) return "/";
-    return path.substr(0, slash);
-}
-
-bool write_text_file_atomic_simple(const std::string& path, const std::string& content, mode_t mode = 0644) {
-    if (!mkdir_p(simple_parent_dir(path))) return false;
-
-    std::string pattern = path + ".tmp.XXXXXX";
-    std::vector<char> tmpl(pattern.begin(), pattern.end());
-    tmpl.push_back('\0');
-    int fd = mkstemp(tmpl.data());
-    if (fd < 0) return false;
-
-    bool ok = true;
-    const char* cursor = content.data();
-    ssize_t remaining = static_cast<ssize_t>(content.size());
-    while (remaining > 0) {
-        ssize_t written = write(fd, cursor, static_cast<size_t>(remaining));
-        if (written < 0) {
-            ok = false;
-            break;
-        }
-        remaining -= written;
-        cursor += written;
-    }
-    if (ok && fchmod(fd, mode) != 0) ok = false;
-    if (ok && fsync(fd) != 0) ok = false;
-    if (close(fd) != 0) ok = false;
-    if (ok && rename(tmpl.data(), path.c_str()) != 0) ok = false;
-    if (!ok) unlink(tmpl.data());
-    return ok;
-}
-
-std::string native_dpkg_status_architecture(const PackageMetadata& meta) {
-    if (ascii_lower_copy(meta.arch) == "all") return "all";
-
-    std::string filename = meta.filename;
-    if (filename.empty()) filename = get_cached_debian_archive_path(meta);
-    if (filename.size() >= 8 &&
-        filename.compare(filename.size() - 8, 8, "_all.deb") == 0) {
-        return "all";
-    }
-
-    DebianBackendConfig config = load_debian_backend_config(false);
-    return config.apt_arch.empty() ? "amd64" : config.apt_arch;
-}
-
-bool ensure_native_dpkg_admin_layout(std::string* error_out = nullptr) {
-    if (error_out) error_out->clear();
-
-    const std::vector<std::string> required_dirs = {
-        DPKG_ADMIN_DIR,
-        DPKG_INFO_DIR,
-        DPKG_ADMIN_DIR + "/updates",
-        DPKG_ADMIN_DIR + "/triggers",
-        DPKG_ADMIN_DIR + "/alternatives",
-        DPKG_ADMIN_DIR + "/parts",
-    };
-    for (const auto& dir : required_dirs) {
-        if (mkdir_p(dir)) continue;
-        if (error_out) *error_out = "failed to create " + dir;
-        return false;
-    }
-
-    const std::vector<std::string> placeholder_files = {
-        DPKG_ADMIN_DIR + "/available",
-        DPKG_ADMIN_DIR + "/diversions",
-        DPKG_ADMIN_DIR + "/statoverride",
-        DPKG_ADMIN_DIR + "/triggers/Unincorp",
-        DPKG_ADMIN_DIR + "/triggers/Lock",
-    };
-    for (const auto& path : placeholder_files) {
-        if (access(path.c_str(), F_OK) == 0) continue;
-        if (write_text_file_atomic_simple(path, "", 0644)) continue;
-        if (error_out) *error_out = "failed to initialize " + path;
-        return false;
-    }
-
-    return true;
-}
-
-bool write_native_dpkg_status_entries(
-    const std::map<std::string, NativeDpkgStatusEntry>& entries,
-    std::string* error_out = nullptr
-) {
-    if (error_out) error_out->clear();
-
-    std::ostringstream buffer;
-    for (const auto& pair : entries) {
-        const NativeDpkgStatusEntry& entry = pair.second;
-        if (entry.record.package.empty()) continue;
-
-        std::string version = entry.record.version.empty() ? entry.meta.version : entry.record.version;
-        std::string maintainer = entry.meta.maintainer.empty()
-            ? "GeminiOS Debian Backend"
-            : entry.meta.maintainer;
-        std::string description = description_summary(entry.meta.description);
-        if (description.empty()) description = "Synthetic dpkg state entry managed by gpkg";
-        std::string architecture = native_dpkg_status_architecture(entry.meta);
-
-        buffer << "Package: " << entry.record.package << "\n";
-        buffer << "Status: "
-               << (entry.record.want.empty() ? "install" : entry.record.want) << " "
-               << (entry.record.flag.empty() ? "ok" : entry.record.flag) << " "
-               << (entry.record.status.empty() ? "not-installed" : entry.record.status) << "\n";
-        buffer << "Priority: " << (entry.meta.priority.empty() ? "optional" : entry.meta.priority) << "\n";
-        buffer << "Section: " << (entry.meta.section.empty() ? "misc" : entry.meta.section) << "\n";
-        buffer << "Maintainer: " << maintainer << "\n";
-        buffer << "Architecture: " << architecture << "\n";
-        if (!version.empty()) buffer << "Version: " << version << "\n";
-        if (!entry.meta.depends.empty()) buffer << "Depends: " << join_strings(entry.meta.depends) << "\n";
-        if (!entry.meta.provides.empty()) buffer << "Provides: " << join_strings(entry.meta.provides) << "\n";
-        if (!entry.meta.conflicts.empty()) buffer << "Conflicts: " << join_strings(entry.meta.conflicts) << "\n";
-        if (!entry.meta.replaces.empty()) buffer << "Replaces: " << join_strings(entry.meta.replaces) << "\n";
-        buffer << "Description: " << description << "\n\n";
-    }
-
-    if (!write_text_file_atomic_simple(DPKG_STATUS_FILE, buffer.str(), 0644)) {
-        if (error_out) *error_out = "failed to write " + DPKG_STATUS_FILE;
-        return false;
-    }
-
-    for (const auto& pair : entries) {
-        const NativeDpkgStatusEntry& entry = pair.second;
-        if (entry.record.package.empty()) continue;
-
-        bool installed_like = package_status_is_installed_like(entry.record.status);
-        if (!installed_like && entry.file_list.empty()) continue;
-
-        std::ostringstream file_buffer;
-        for (const auto& line : entry.file_list) {
-            if (line.empty()) continue;
-            file_buffer << line << "\n";
-        }
-        std::string list_path = DPKG_INFO_DIR + "/" + entry.record.package + ".list";
-        if (write_text_file_atomic_simple(list_path, file_buffer.str(), 0644)) continue;
-        if (error_out) *error_out = "failed to write " + list_path;
-        return false;
-    }
-
-    return true;
-}
-
-bool sync_native_dpkg_backend_state(
-    const std::vector<PackageMetadata>& batch,
-    bool verbose,
-    std::string* error_out
-) {
-    if (error_out) error_out->clear();
-    if (!ensure_native_dpkg_admin_layout(error_out)) return false;
-
-    std::vector<Dependency> external_required_deps;
-    std::set<std::string> seen_external_required_deps;
-    auto batch_package_satisfies_dependency = [&](const PackageMetadata& provider, const Dependency& dep) {
-        std::string provider_dpkg_name = debian_backend_package_name(provider);
-        if (!provider_dpkg_name.empty() &&
-            package_metadata_satisfies_dependency(provider_dpkg_name, provider, dep)) {
-            return true;
-        }
-        return !provider.name.empty() &&
-               provider.name != provider_dpkg_name &&
-               package_metadata_satisfies_dependency(provider.name, provider, dep);
-    };
-    for (const auto& meta : batch) {
-        for (const auto& dep_str : collect_required_transaction_dependency_edges(meta)) {
-            Dependency dep = parse_dependency(dep_str);
-            if (dep.name.empty()) continue;
-
-            bool satisfied_by_batch = false;
-            for (const auto& provider : batch) {
-                if (batch_package_satisfies_dependency(provider, dep)) {
-                    satisfied_by_batch = true;
-                    break;
-                }
-            }
-            if (satisfied_by_batch) continue;
-
-            std::string dep_key = dep.name + "\n" + dep.op + "\n" + dep.version;
-            if (!seen_external_required_deps.insert(dep_key).second) continue;
-            external_required_deps.push_back(dep);
-        }
-    }
-
-    std::map<std::string, NativeDpkgStatusEntry> entries;
-    auto existing_records = load_dpkg_package_status_records();
-    for (const auto& record : existing_records) {
-        if (record.package.empty()) continue;
-        NativeDpkgStatusEntry& entry = entries[record.package];
-        entry.record = record;
-        entry.file_list = read_text_lines_simple(DPKG_INFO_DIR + "/" + record.package + ".list");
-        PackageMetadata meta;
-        if (get_repo_package_info(record.package, meta) || get_installed_package_metadata(record.package, meta)) {
-            entry.meta = meta;
-        }
-    }
-
-    auto install_live_entry = [&](const std::string& pkg_name,
-                                  const std::string& version,
-                                  const std::vector<std::string>* files) {
-        if (pkg_name.empty()) return;
-
-        PackageMetadata meta;
-        bool have_meta = get_live_installed_package_metadata(pkg_name, meta) || get_repo_package_info(pkg_name, meta);
-        if (!have_meta) {
-            meta.name = pkg_name;
-            meta.version = version;
-        }
-
-        bool satisfies_external_required_dep = false;
-        if (!external_required_deps.empty()) {
-            std::string dpkg_name = debian_backend_package_name(meta);
-            for (const auto& dep : external_required_deps) {
-                if (!dpkg_name.empty() &&
-                    package_metadata_satisfies_dependency(dpkg_name, meta, dep)) {
-                    satisfies_external_required_dep = true;
-                    break;
-                }
-                if (!pkg_name.empty() &&
-                    pkg_name != dpkg_name &&
-                    package_metadata_satisfies_dependency(pkg_name, meta, dep)) {
-                    satisfies_external_required_dep = true;
-                    break;
-                }
-            }
-        }
-
-        bool eligible =
-            package_uses_native_dpkg_backend(meta) ||
-            pkg_name == "base-files" ||
-            satisfies_external_required_dep;
-        if (!eligible) return;
-
-        std::string dpkg_name = debian_backend_package_name(meta);
-        if (dpkg_name.empty()) dpkg_name = pkg_name;
-        if (meta.name.empty()) meta.name = dpkg_name;
-        if (meta.debian_package.empty()) meta.debian_package = dpkg_name;
-        if (!version.empty()) meta.version = version;
-
-        NativeDpkgStatusEntry& entry = entries[dpkg_name];
-        entry.record.package = dpkg_name;
-        entry.record.want = "install";
-        entry.record.flag = "ok";
-        entry.record.status = "installed";
-        entry.record.version = version.empty() ? meta.version : version;
-        entry.meta = meta;
-        if (files && !files->empty()) {
-            entry.file_list = *files;
-        } else if (entry.file_list.empty()) {
-            entry.file_list = read_text_lines_simple(INFO_DIR + pkg_name + ".list");
-        }
-    };
-
-    for (const auto& record : load_package_status_records()) {
-        if (record.package.empty()) continue;
-        if (!package_status_is_installed_like(record.status)) continue;
-        std::vector<std::string> files = read_text_lines_simple(INFO_DIR + record.package + ".list");
-        install_live_entry(record.package, record.version, &files);
-    }
-
-    for (const auto& record : existing_records) {
-        if (record.package.empty()) continue;
-        if (!package_status_is_installed_like(record.status)) continue;
-        std::vector<std::string> files = read_text_lines_simple(DPKG_INFO_DIR + "/" + record.package + ".list");
-        install_live_entry(record.package, record.version, &files);
-    }
-
-    for (const auto& entry : load_base_system_registry_entries()) {
-        if (entry.package.empty()) continue;
-        if (!base_system_registry_entry_looks_present(entry)) continue;
-        install_live_entry(entry.package, entry.version, &entry.files);
-    }
-
-    for (const auto& meta : batch) {
-        std::string dpkg_name = debian_backend_package_name(meta);
-        if (dpkg_name.empty()) continue;
-
-        auto existing = entries.find(dpkg_name);
-        if (existing == entries.end()) continue;
-        if (existing->second.meta.name.empty()) existing->second.meta = meta;
-        if (existing->second.record.version.empty()) existing->second.record.version = meta.version;
-    }
-
-    if (entries.count("base-files") == 0 &&
-        (access((ROOT_PREFIX + "/etc/debian_version").c_str(), F_OK) == 0 ||
-         access("/bin/dpkg", X_OK) == 0)) {
-        PackageMetadata meta;
-        get_repo_package_info("base-files", meta);
-        meta.name = "base-files";
-        meta.debian_package = "base-files";
-        if (meta.version.empty()) meta.version = "9999";
-        if (meta.maintainer.empty()) meta.maintainer = "GeminiOS Debian Backend";
-        if (meta.description.empty()) meta.description = "Synthetic compatibility package for Debian maintainer scripts";
-        if (meta.priority.empty()) meta.priority = "required";
-        if (meta.section.empty()) meta.section = "admin";
-
-        NativeDpkgStatusEntry& stub = entries["base-files"];
-        stub.record.package = "base-files";
-        stub.record.want = "install";
-        stub.record.flag = "ok";
-        stub.record.status = "installed";
-        stub.record.version = meta.version;
-        stub.meta = meta;
-        stub.file_list.clear();
-    }
-
-    if (verbose) {
-        std::cout << "[DEBUG] Synchronized native dpkg backend state at "
-                  << DPKG_ADMIN_DIR << " with " << entries.size()
-                  << " package record(s)." << std::endl;
-    }
-    return write_native_dpkg_status_entries(entries, error_out);
-}
-
 std::vector<std::string> build_dpkg_command_argv(const std::vector<std::string>& args) {
     std::vector<std::string> argv = {
         "/usr/bin/env",
@@ -1422,10 +1066,13 @@ InstallCommandResult install_native_debian_batch(
     bool verbose
 ) {
     if (batch.empty()) return {true, "", "", 0, ""};
-    std::string sync_error;
-    if (!sync_native_dpkg_backend_state(batch, verbose, &sync_error)) {
-        std::cerr << "E: Failed to prepare native dpkg backend state";
-        if (!sync_error.empty()) std::cerr << ": " << sync_error;
+    if (access("/bin/dpkg", X_OK) != 0 || access(DPKG_STATUS_FILE.c_str(), F_OK) != 0) {
+        std::cerr << "E: Native Debian backend is unavailable";
+        if (access("/bin/dpkg", X_OK) != 0) {
+            std::cerr << ": /bin/dpkg is missing";
+        } else {
+            std::cerr << ": " << DPKG_STATUS_FILE << " is missing";
+        }
         std::cerr << std::endl;
         return {false, "", batch.front().name, 0, ""};
     }

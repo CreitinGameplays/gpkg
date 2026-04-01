@@ -328,16 +328,37 @@ bool find_installed_dependency_provider(
     const std::set<std::string>& installed_cache,
     std::string* provider_out = nullptr,
     UpgradeContext* context = nullptr,
-    bool verbose = false
+    bool verbose = false,
+    bool prefer_native_dpkg = false
 ) {
     if (provider_out) provider_out->clear();
+
+    auto provider_matches_preferred_backend = [&](const std::string& provider_name) {
+        if (!prefer_native_dpkg) return true;
+        if (provider_name.empty() || provider_name == BASE_SYSTEM_PROVIDER) return true;
+
+        PackageStatusRecord dpkg_record;
+        if (get_dpkg_package_status_record(provider_name, &dpkg_record) &&
+            package_status_is_installed_like(dpkg_record.status)) {
+            return true;
+        }
+
+        PackageMetadata provider_meta;
+        bool have_meta = context
+            ? get_context_live_installed_package_metadata(*context, provider_name, provider_meta)
+            : get_live_installed_package_metadata(provider_name, provider_meta);
+        if (!have_meta) return false;
+
+        return package_is_debian_source(provider_meta) || !provider_meta.debian_package.empty();
+    };
 
     if (context) {
         std::string normalized_name = normalize_upgrade_root_name(dep.name, *context, verbose);
         if (!normalized_name.empty()) {
             PackageMetadata normalized_meta;
             if (get_context_live_installed_package_metadata(*context, normalized_name, normalized_meta) &&
-                package_metadata_satisfies_dependency(normalized_name, normalized_meta, dep)) {
+                package_metadata_satisfies_dependency(normalized_name, normalized_meta, dep) &&
+                provider_matches_preferred_backend(normalized_name)) {
                 if (provider_out) *provider_out = normalized_name;
                 return true;
             }
@@ -365,6 +386,7 @@ bool find_installed_dependency_provider(
                     context
                 );
             if (!satisfies_dependency && !shadows_base_alias) continue;
+            if (!provider_matches_preferred_backend(candidate_name)) continue;
 
             if (best_name.empty() || should_prefer_repo_candidate(candidate_meta, best_meta)) {
                 best_name = candidate_name;
@@ -381,6 +403,7 @@ bool find_installed_dependency_provider(
         PackageMetadata meta;
         if (!get_live_installed_package_metadata(installed_name, meta)) continue;
         if (!package_metadata_satisfies_dependency(installed_name, meta, dep)) continue;
+        if (!provider_matches_preferred_backend(installed_name)) continue;
         if (provider_out) *provider_out = installed_name;
         return true;
     }
@@ -394,7 +417,8 @@ bool is_dependency_satisfied_locally(
     bool verbose,
     std::string* provider_out = nullptr,
     UpgradeContext* context = nullptr,
-    RawDebianContext* raw_context = nullptr
+    RawDebianContext* raw_context = nullptr,
+    bool prefer_native_dpkg = false
 ) {
     if (provider_out) provider_out->clear();
     (void)raw_context;
@@ -402,12 +426,28 @@ bool is_dependency_satisfied_locally(
     std::string installed_ver;
     if (get_local_installed_package_version(dep.name, &installed_ver, context) &&
         version_satisfies(installed_ver, dep.op, dep.version)) {
-        if (provider_out) *provider_out = dep.name;
-        return true;
+        if (!prefer_native_dpkg) {
+            if (provider_out) *provider_out = dep.name;
+            return true;
+        }
+
+        PackageStatusRecord dpkg_record;
+        if (get_dpkg_package_status_record(dep.name, &dpkg_record) &&
+            package_status_is_installed_like(dpkg_record.status)) {
+            if (provider_out) *provider_out = dep.name;
+            return true;
+        }
     }
 
     std::string provider_name;
-    if (find_installed_dependency_provider(dep, installed_cache, &provider_name, context, verbose)) {
+    if (find_installed_dependency_provider(
+            dep,
+            installed_cache,
+            &provider_name,
+            context,
+            verbose,
+            prefer_native_dpkg
+        )) {
         if (provider_out) *provider_out = provider_name;
         return true;
     }
@@ -470,7 +510,8 @@ bool resolve_dependencies(
     UpgradeContext* context = nullptr,
     bool suppress_errors = false,
     RawDebianContext* raw_context = nullptr,
-    std::string* failure_reason_out = nullptr
+    std::string* failure_reason_out = nullptr,
+    bool prefer_native_dpkg = false
 ) {
     if (failure_reason_out) failure_reason_out->clear();
     std::string canonical_pkg = canonicalize_package_name(pkg, verbose);
@@ -503,7 +544,8 @@ bool resolve_dependencies(
             verbose,
             &provider_name,
             context,
-            raw_context
+            raw_context,
+            prefer_native_dpkg
         )) {
         if (provider_name == BASE_SYSTEM_PROVIDER) {
             VLOG(verbose, canonical_pkg << " is satisfied by the base-system policy.");
@@ -520,12 +562,21 @@ bool resolve_dependencies(
     std::string installed_ver;
     if (!force_queue_requested &&
         package_has_exact_live_install_state(canonical_pkg, &installed_ver, context)) {
-        if (version_satisfies(installed_ver, op, req_version)) {
+        bool acceptable_exact_live_state = true;
+        if (prefer_native_dpkg) {
+            PackageStatusRecord dpkg_record;
+            acceptable_exact_live_state =
+                get_dpkg_package_status_record(canonical_pkg, &dpkg_record) &&
+                package_status_is_installed_like(dpkg_record.status);
+        }
+
+        if (acceptable_exact_live_state &&
+            version_satisfies(installed_ver, op, req_version)) {
             VLOG(verbose, canonical_pkg << " " << installed_ver << " is installed and satisfies constraints.");
             return true;
         }
 
-        if (!suppress_errors) {
+        if (!suppress_errors && acceptable_exact_live_state) {
             std::cerr << Color::YELLOW << "W: " << canonical_pkg << " " << installed_ver
                       << " is installed but does not meet requirements (" << op
                       << " " << req_version << ")." << Color::RESET << std::endl;
@@ -551,7 +602,9 @@ bool resolve_dependencies(
             req_version,
             universe_result,
             verbose,
-            raw_context
+            raw_context,
+            nullptr,
+            prefer_native_dpkg
         )) {
         if (failure_reason_out && failure_reason_out->empty()) {
             *failure_reason_out = universe_result.reason.empty()
@@ -588,7 +641,8 @@ bool resolve_dependencies(
             context,
             suppress_errors,
             raw_context,
-            failure_reason_out
+            failure_reason_out,
+            prefer_native_dpkg
         );
     }
 
@@ -627,6 +681,7 @@ bool resolve_dependencies(
     }
 
     visited.insert(canonical_pkg);
+    bool child_prefer_native_dpkg = prefer_native_dpkg || package_is_debian_source(meta);
     for (const auto& edge : collect_transaction_dependency_edge_details(meta)) {
         Dependency dep = parse_dependency(edge.relation);
         if (dep.name.empty()) continue;
@@ -644,7 +699,8 @@ bool resolve_dependencies(
                     context,
                     suppress_errors,
                     raw_context,
-                    failure_reason_out
+                    failure_reason_out,
+                    child_prefer_native_dpkg
                 )) {
                 return false;
             }
@@ -664,7 +720,9 @@ bool resolve_dependencies(
                 false,
                 context,
                 true,
-                raw_context
+                raw_context,
+                nullptr,
+                child_prefer_native_dpkg
             )) {
             VLOG(
                 verbose,

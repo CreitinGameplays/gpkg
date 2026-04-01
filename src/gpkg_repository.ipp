@@ -48,7 +48,8 @@ bool resolve_full_universe_relation_candidate(
     PackageUniverseResult& out_result,
     bool verbose,
     RawDebianContext* raw_context = nullptr,
-    const PackageMetadata* installed_meta = nullptr
+    const PackageMetadata* installed_meta = nullptr,
+    bool prefer_native_debian = false
 );
 
 std::string relation_name_from_text(const std::string& relation) {
@@ -1761,7 +1762,8 @@ bool resolve_full_universe_relation_candidate(
     PackageUniverseResult& out_result,
     bool verbose,
     RawDebianContext* raw_context,
-    const PackageMetadata* installed_meta
+    const PackageMetadata* installed_meta,
+    bool prefer_native_debian
 ) {
     out_result = {};
     std::string canonical_name = canonicalize_package_name(pkg_name, verbose);
@@ -1770,7 +1772,61 @@ bool resolve_full_universe_relation_candidate(
         return false;
     }
 
-    if (try_ensure_repo_package_cache_loaded(verbose)) {
+    bool effective_prefer_native_debian = prefer_native_debian;
+    if (!effective_prefer_native_debian && installed_meta) {
+        effective_prefer_native_debian =
+            package_is_debian_source(*installed_meta) ||
+            !installed_meta->debian_package.empty();
+    }
+
+    std::vector<std::string> raw_queries;
+    auto append_query = [&](const std::string& value) {
+        if (value.empty()) return;
+        std::string canonical = canonicalize_package_name(value, verbose);
+        if (canonical.empty()) return;
+        if (std::find(raw_queries.begin(), raw_queries.end(), canonical) == raw_queries.end()) {
+            raw_queries.push_back(canonical);
+        }
+    };
+    if (installed_meta && !installed_meta->debian_package.empty()) {
+        append_query(installed_meta->debian_package);
+    }
+    append_query(canonical_name);
+
+    auto try_raw_debian_candidate = [&](std::string* reason_out) {
+        if (reason_out) reason_out->clear();
+        if (!raw_context) return false;
+
+        std::string best_reason;
+        for (const auto& query_name : raw_queries) {
+            RawDebianAvailabilityResult raw_result;
+            std::string raw_reason;
+            if (resolve_raw_debian_relation_candidate(
+                    query_name,
+                    op,
+                    req_version,
+                    *raw_context,
+                    raw_result,
+                    verbose,
+                    &raw_reason
+                )) {
+                out_result.found = true;
+                out_result.installable = true;
+                out_result.raw_only = true;
+                out_result.reason.clear();
+                out_result.meta = raw_result.meta;
+                return true;
+            }
+            if (best_reason.empty() && !raw_reason.empty()) best_reason = raw_reason;
+        }
+
+        if (reason_out) *reason_out = best_reason;
+        return false;
+    };
+
+    auto try_repo_candidate = [&]() {
+        if (!try_ensure_repo_package_cache_loaded(verbose)) return false;
+
         PackageMetadata repo_meta;
         if (get_loaded_repo_package_info(canonical_name, repo_meta) &&
             catalog_version_satisfies(repo_meta.version, op, req_version)) {
@@ -1789,72 +1845,46 @@ bool resolve_full_universe_relation_candidate(
             ? relation.name
             : (relation.name + " (" + relation.op + " " + relation.version + ")");
         auto provider_it = g_repo_provider_cache.find(canonical_name);
-        if (provider_it != g_repo_provider_cache.end()) {
-            bool found = false;
-            PackageMetadata best_meta;
-            for (const auto& provider_name : provider_it->second) {
-                PackageMetadata candidate;
-                if (!get_loaded_repo_package_info(provider_name, candidate)) continue;
-                if (!catalog_meta_satisfies_relation(provider_name, candidate, relation)) continue;
-                if (!found || should_prefer_repo_candidate(candidate, best_meta)) {
-                    best_meta = candidate;
-                    found = true;
-                }
-            }
-            if (found) {
-                out_result.found = true;
-                out_result.installable = true;
-                out_result.meta = best_meta;
-                return true;
+        if (provider_it == g_repo_provider_cache.end()) return false;
+
+        bool found = false;
+        PackageMetadata best_meta;
+        for (const auto& provider_name : provider_it->second) {
+            PackageMetadata candidate;
+            if (!get_loaded_repo_package_info(provider_name, candidate)) continue;
+            if (!catalog_meta_satisfies_relation(provider_name, candidate, relation)) continue;
+            if (!found || should_prefer_repo_candidate(candidate, best_meta)) {
+                best_meta = candidate;
+                found = true;
             }
         }
+        if (!found) return false;
+
+        out_result.found = true;
+        out_result.installable = true;
+        out_result.meta = best_meta;
+        return true;
+    };
+
+    std::string raw_reason;
+    if (effective_prefer_native_debian && try_raw_debian_candidate(&raw_reason)) {
+        return true;
     }
+
+    if (try_repo_candidate()) return true;
 
     if (!raw_context) {
         out_result.reason = "no repository package or provider candidate";
         return false;
     }
 
-    std::vector<std::string> raw_queries;
-    auto append_query = [&](const std::string& value) {
-        if (value.empty()) return;
-        std::string canonical = canonicalize_package_name(value, verbose);
-        if (canonical.empty()) return;
-        if (std::find(raw_queries.begin(), raw_queries.end(), canonical) == raw_queries.end()) {
-            raw_queries.push_back(canonical);
-        }
-    };
-    if (installed_meta && !installed_meta->debian_package.empty()) {
-        append_query(installed_meta->debian_package);
-    }
-    append_query(canonical_name);
-
-    std::string best_reason;
-    for (const auto& query_name : raw_queries) {
-        RawDebianAvailabilityResult raw_result;
-        std::string raw_reason;
-        if (resolve_raw_debian_relation_candidate(
-                query_name,
-                op,
-                req_version,
-                *raw_context,
-                raw_result,
-                verbose,
-                &raw_reason
-            )) {
-            out_result.found = true;
-            out_result.installable = true;
-            out_result.raw_only = true;
-            out_result.reason.clear();
-            out_result.meta = raw_result.meta;
-            return true;
-        }
-        if (best_reason.empty() && !raw_reason.empty()) best_reason = raw_reason;
+    if (!effective_prefer_native_debian && try_raw_debian_candidate(&raw_reason)) {
+        return true;
     }
 
-    out_result.reason = best_reason.empty()
+    out_result.reason = raw_reason.empty()
         ? "no cached Debian candidate satisfies the required relation"
-        : best_reason;
+        : raw_reason;
     return false;
 }
 
