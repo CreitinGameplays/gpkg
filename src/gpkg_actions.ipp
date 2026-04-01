@@ -2340,6 +2340,32 @@ bool inspect_debian_archive_payload_for_disk_estimate(
 ) {
     if (out_info) *out_info = CachedArchivePayloadInfo{};
 
+    if (access("/bin/dpkg-deb", X_OK) == 0) {
+        char temp_template[] = "/tmp/gpkg-deb-payload-XXXXXX.tar";
+        int fd = mkstemps(temp_template, 4);
+        if (fd >= 0) {
+            std::string payload_tar = temp_template;
+            int status = run_command_argv(
+                {"/bin/dpkg-deb", "--fsys-tarfile", archive_path},
+                false,
+                fd,
+                -1
+            );
+            close(fd);
+
+            if (decode_command_exit_status(status) == 0) {
+                CachedArchivePayloadInfo info = inspect_payload_tar_for_disk_estimate(payload_tar);
+                remove_path_recursive(payload_tar);
+                if (info.available) {
+                    if (out_info) *out_info = info;
+                    return true;
+                }
+            } else {
+                unlink(payload_tar.c_str());
+            }
+        }
+    }
+
     char temp_template[] = "/tmp/gpkg-deb-disk-estimate-XXXXXX";
     char* temp_dir = mkdtemp(temp_template);
     if (!temp_dir) return false;
