@@ -6276,6 +6276,21 @@ bool action_prepare_transaction_root(const std::string& txn_dir) {
                 work_root + "/" + name,
                 target_path
             );
+            if (!mounted &&
+                (errno == EINVAL || errno == ENODEV || errno == EOPNOTSUPP || errno == ENOSYS)) {
+                std::cerr << "W: Overlay mount is unavailable for " << source_path
+                          << "; falling back to a copied transaction snapshot for this top-level path."
+                          << std::endl;
+                if (remove_tree_no_follow(target_path) &&
+                    copy_path_atomic_no_follow(source_path, target_path) &&
+                    append_transaction_manifest_line(initial_root_manifest, name)) {
+                    mounted = false;
+                } else {
+                    ok = false;
+                    break;
+                }
+                continue;
+            }
         } else {
             mounted = transaction_bind_mount_path(source_path, target_path, true);
         }
