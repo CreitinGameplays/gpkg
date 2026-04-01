@@ -757,6 +757,22 @@ void append_upgrade_catalog_skip_entry(
     catalog.skipped_entries.push_back(entry);
 }
 
+UpgradeCatalogSkipEntry make_upgrade_catalog_skip_entry(
+    const std::string& kind,
+    const std::string& configured_name,
+    const std::string& reason,
+    const std::string& trigger = "",
+    const std::string& resolved_name = ""
+) {
+    UpgradeCatalogSkipEntry entry;
+    entry.kind = kind;
+    entry.trigger = trigger;
+    entry.configured_name = configured_name;
+    entry.resolved_name = resolved_name;
+    entry.reason = reason;
+    return entry;
+}
+
 bool resolve_catalog_relation(
     const RelationAtom& relation,
     PackageMetadata& out_meta,
@@ -882,6 +898,148 @@ bool validate_catalog_package_closure(
     return ok;
 }
 
+struct EvaluatedUpgradeRootResult {
+    bool emit_root = false;
+    bool map_configured = false;
+    bool has_skip = false;
+    std::string raw_root;
+    std::string resolved_name;
+    UpgradeCatalogSkipEntry skip_entry;
+};
+
+EvaluatedUpgradeRootResult evaluate_upgrade_root_candidate(
+    const std::string& raw_root,
+    bool report_skip,
+    const std::set<std::string>& present_base_packages,
+    UpgradeCatalogValidationCache& validation_cache,
+    bool verbose
+) {
+    EvaluatedUpgradeRootResult result;
+    result.raw_root = raw_root;
+
+    RelationAtom relation = normalize_relation_atom(raw_root, "any");
+    if (!relation.valid || relation.name.empty()) {
+        if (report_skip) {
+            result.has_skip = true;
+            result.skip_entry = make_upgrade_catalog_skip_entry(
+                "root",
+                raw_root,
+                "invalid configured upgrade root"
+            );
+        }
+        return result;
+    }
+
+    PackageMetadata resolved_meta;
+    std::string resolved_name;
+    std::string resolve_reason;
+    if (!resolve_catalog_relation(relation, resolved_meta, resolved_name, &resolve_reason)) {
+        RelationAtom effective_relation = apply_catalog_policy_resolution(relation);
+        std::string canonical_root = canonicalize_package_name(effective_relation.name);
+        if (report_skip && !canonical_root.empty() && present_base_packages.count(canonical_root) != 0) {
+            VLOG(verbose, "Skipping base-only runtime family " << raw_root
+                         << " because no repository upgrade candidate is configured.");
+            return result;
+        }
+        if (report_skip) {
+            result.has_skip = true;
+            result.skip_entry = make_upgrade_catalog_skip_entry(
+                "root",
+                raw_root,
+                resolve_reason
+            );
+        } else {
+            VLOG(verbose, "Skipping unresolved base-system upgrade root " << raw_root
+                         << ": " << resolve_reason);
+        }
+        return result;
+    }
+
+    std::string validation_reason;
+    if (!validate_catalog_package_closure(resolved_name, validation_cache, &validation_reason)) {
+        if (report_skip) {
+            result.has_skip = true;
+            result.skip_entry = make_upgrade_catalog_skip_entry(
+                "root",
+                raw_root,
+                validation_reason,
+                "",
+                resolved_name
+            );
+        } else {
+            VLOG(verbose, "Skipping invalid base-system upgrade root " << raw_root
+                         << ": " << validation_reason);
+        }
+        return result;
+    }
+
+    result.emit_root = true;
+    result.resolved_name = resolved_name;
+    result.map_configured = report_skip;
+    return result;
+}
+
+struct EvaluatedUpgradeCompanionResult {
+    bool emit_companion = false;
+    bool has_skip = false;
+    std::string resolved_trigger;
+    std::string resolved_name;
+    UpgradeCatalogSkipEntry skip_entry;
+};
+
+EvaluatedUpgradeCompanionResult evaluate_upgrade_companion_candidate(
+    const std::string& raw_companion,
+    const std::string& resolved_trigger,
+    UpgradeCatalogValidationCache& validation_cache
+) {
+    EvaluatedUpgradeCompanionResult result;
+    result.resolved_trigger = resolved_trigger;
+
+    RelationAtom relation = normalize_relation_atom(raw_companion, "any");
+    if (!relation.valid || relation.name.empty()) {
+        result.has_skip = true;
+        result.skip_entry = make_upgrade_catalog_skip_entry(
+            "companion",
+            raw_companion,
+            "invalid configured runtime companion",
+            resolved_trigger
+        );
+        return result;
+    }
+
+    PackageMetadata resolved_meta;
+    std::string resolved_name;
+    std::string resolve_reason;
+    if (!resolve_catalog_relation(relation, resolved_meta, resolved_name, &resolve_reason)) {
+        result.has_skip = true;
+        result.skip_entry = make_upgrade_catalog_skip_entry(
+            "companion",
+            raw_companion,
+            resolve_reason,
+            resolved_trigger
+        );
+        return result;
+    }
+
+    std::string validation_reason;
+    if (!validate_catalog_package_closure(resolved_name, validation_cache, &validation_reason)) {
+        result.has_skip = true;
+        result.skip_entry = make_upgrade_catalog_skip_entry(
+            "companion",
+            raw_companion,
+            validation_reason,
+            resolved_trigger,
+            resolved_name
+        );
+        return result;
+    }
+
+    if (resolved_name == resolved_trigger) return result;
+    result.emit_companion = true;
+    result.resolved_name = resolved_name;
+    return result;
+}
+
 bool build_resolved_upgrade_catalog(
     ResolvedUpgradeCatalog& out_catalog,
     bool verbose,
@@ -904,132 +1062,122 @@ bool build_resolved_upgrade_catalog(
     std::map<std::string, std::vector<std::string>> raw_companions =
         load_raw_upgrade_companions_for_catalog();
     std::set<std::string> present_base_packages = load_present_base_registry_package_names();
-    UpgradeCatalogValidationCache validation_cache;
     std::map<std::string, std::string> resolved_root_by_configured;
     std::set<std::string> emitted_roots;
-
-    auto try_add_root = [&](const std::string& raw_root, bool report_skip) {
-        RelationAtom relation = normalize_relation_atom(raw_root, "any");
-        if (!relation.valid || relation.name.empty()) {
-            if (report_skip) {
-                append_upgrade_catalog_skip_entry(
-                    out_catalog,
-                    "root",
-                    raw_root,
-                    "invalid configured upgrade root"
-                );
-            }
-            return;
-        }
-
-        PackageMetadata resolved_meta;
-        std::string resolved_name;
-        std::string resolve_reason;
-        if (!resolve_catalog_relation(relation, resolved_meta, resolved_name, &resolve_reason)) {
-            RelationAtom effective_relation = apply_catalog_policy_resolution(relation);
-            std::string canonical_root = canonicalize_package_name(effective_relation.name);
-            if (report_skip && !canonical_root.empty() && present_base_packages.count(canonical_root) != 0) {
-                VLOG(verbose, "Skipping base-only runtime family " << raw_root
-                             << " because no repository upgrade candidate is configured.");
-                return;
-            }
-            if (report_skip) {
-                append_upgrade_catalog_skip_entry(
-                    out_catalog,
-                    "root",
-                    raw_root,
-                    resolve_reason
-                );
-            } else {
-                VLOG(verbose, "Skipping unresolved base-system upgrade root " << raw_root
-                             << ": " << resolve_reason);
-            }
-            return;
-        }
-
-        std::string validation_reason;
-        if (!validate_catalog_package_closure(resolved_name, validation_cache, &validation_reason)) {
-            if (report_skip) {
-                append_upgrade_catalog_skip_entry(
-                    out_catalog,
-                    "root",
-                    raw_root,
-                    validation_reason,
-                    "",
-                    resolved_name
-                );
-            } else {
-                VLOG(verbose, "Skipping invalid base-system upgrade root " << raw_root
-                             << ": " << validation_reason);
-            }
-            return;
-        }
-
-        if (report_skip) resolved_root_by_configured[raw_root] = resolved_name;
-        if (emitted_roots.insert(resolved_name).second) {
-            out_catalog.resolved_roots.push_back(resolved_name);
-        }
+    struct RootTask {
+        std::string raw_root;
+        bool report_skip = false;
     };
-
+    std::vector<RootTask> root_tasks;
+    root_tasks.reserve(raw_roots.size() + present_base_packages.size());
     for (const auto& raw_root : raw_roots) {
-        try_add_root(raw_root, true);
+        root_tasks.push_back({raw_root, true});
     }
-
     for (const auto& base_root : present_base_packages) {
         if (base_root.empty()) continue;
         if (is_blocked_import_package(base_root, verbose)) continue;
-        try_add_root(base_root, false);
+        root_tasks.push_back({base_root, false});
     }
 
+    const size_t root_worker_count = recommended_parallel_worker_count(root_tasks.size());
+    if (verbose && !root_tasks.empty()) {
+        std::cout << "[DEBUG] Rebuilding upgrade catalog roots with "
+                  << root_worker_count << " worker(s) across "
+                  << root_tasks.size() << " candidate(s)." << std::endl;
+    }
+
+    std::vector<EvaluatedUpgradeRootResult> root_results(root_tasks.size());
+    if (!root_tasks.empty()) {
+        std::atomic<size_t> next_root{0};
+        auto root_worker = [&](size_t) {
+            UpgradeCatalogValidationCache validation_cache;
+            while (true) {
+                size_t task_index = next_root.fetch_add(1);
+                if (task_index >= root_tasks.size()) return;
+                const auto& task = root_tasks[task_index];
+                root_results[task_index] = evaluate_upgrade_root_candidate(
+                    task.raw_root,
+                    task.report_skip,
+                    present_base_packages,
+                    validation_cache,
+                    verbose
+                );
+            }
+        };
+
+        std::vector<std::thread> workers;
+        workers.reserve(root_worker_count > 0 ? root_worker_count - 1 : 0);
+        for (size_t worker_index = 1; worker_index < root_worker_count; ++worker_index) {
+            workers.emplace_back(root_worker, worker_index);
+        }
+        root_worker(0);
+        for (auto& thread : workers) thread.join();
+    }
+
+    for (size_t i = 0; i < root_results.size(); ++i) {
+        const auto& result = root_results[i];
+        if (result.has_skip) out_catalog.skipped_entries.push_back(result.skip_entry);
+        if (!result.emit_root) continue;
+        if (result.map_configured) resolved_root_by_configured[result.raw_root] = result.resolved_name;
+        if (emitted_roots.insert(result.resolved_name).second) {
+            out_catalog.resolved_roots.push_back(result.resolved_name);
+        }
+    }
+
+    struct CompanionTask {
+        std::string resolved_trigger;
+        std::string raw_companion;
+    };
+    std::vector<CompanionTask> companion_tasks;
     for (const auto& entry : raw_companions) {
         auto resolved_trigger_it = resolved_root_by_configured.find(entry.first);
         if (resolved_trigger_it == resolved_root_by_configured.end()) continue;
-
         const std::string& resolved_trigger = resolved_trigger_it->second;
-        auto& resolved_list = out_catalog.resolved_companions[resolved_trigger];
-        std::set<std::string> seen(resolved_list.begin(), resolved_list.end());
         for (const auto& raw_companion : entry.second) {
-            RelationAtom relation = normalize_relation_atom(raw_companion, "any");
-            if (!relation.valid || relation.name.empty()) {
-                append_upgrade_catalog_skip_entry(
-                    out_catalog,
-                    "companion",
-                    raw_companion,
-                    "invalid configured runtime companion",
-                    resolved_trigger
-                );
-                continue;
-            }
+            companion_tasks.push_back({resolved_trigger, raw_companion});
+        }
+    }
 
-            PackageMetadata resolved_meta;
-            std::string resolved_name;
-            std::string resolve_reason;
-            if (!resolve_catalog_relation(relation, resolved_meta, resolved_name, &resolve_reason)) {
-                append_upgrade_catalog_skip_entry(
-                    out_catalog,
-                    "companion",
-                    raw_companion,
-                    resolve_reason,
-                    resolved_trigger
-                );
-                continue;
-            }
+    const size_t companion_worker_count = recommended_parallel_worker_count(companion_tasks.size());
+    if (verbose && !companion_tasks.empty()) {
+        std::cout << "[DEBUG] Rebuilding upgrade catalog companions with "
+                  << companion_worker_count << " worker(s) across "
+                  << companion_tasks.size() << " candidate(s)." << std::endl;
+    }
 
-            std::string validation_reason;
-            if (!validate_catalog_package_closure(resolved_name, validation_cache, &validation_reason)) {
-                append_upgrade_catalog_skip_entry(
-                    out_catalog,
-                    "companion",
-                    raw_companion,
-                    validation_reason,
-                    resolved_trigger,
-                    resolved_name
+    std::vector<EvaluatedUpgradeCompanionResult> companion_results(companion_tasks.size());
+    if (!companion_tasks.empty()) {
+        std::atomic<size_t> next_companion{0};
+        auto companion_worker = [&](size_t) {
+            UpgradeCatalogValidationCache validation_cache;
+            while (true) {
+                size_t task_index = next_companion.fetch_add(1);
+                if (task_index >= companion_tasks.size()) return;
+                const auto& task = companion_tasks[task_index];
+                companion_results[task_index] = evaluate_upgrade_companion_candidate(
+                    task.raw_companion,
+                    task.resolved_trigger,
+                    validation_cache
                 );
-                continue;
             }
+        };
 
-            if (resolved_name == resolved_trigger) continue;
-            if (seen.insert(resolved_name).second) resolved_list.push_back(resolved_name);
+        std::vector<std::thread> workers;
+        workers.reserve(companion_worker_count > 0 ? companion_worker_count - 1 : 0);
+        for (size_t worker_index = 1; worker_index < companion_worker_count; ++worker_index) {
+            workers.emplace_back(companion_worker, worker_index);
+        }
+        companion_worker(0);
+        for (auto& thread : workers) thread.join();
+    }
+
+    for (size_t i = 0; i < companion_results.size(); ++i) {
+        const auto& result = companion_results[i];
+        if (result.has_skip) out_catalog.skipped_entries.push_back(result.skip_entry);
+        if (!result.emit_companion) continue;
+        auto& resolved_list = out_catalog.resolved_companions[result.resolved_trigger];
+        if (std::find(resolved_list.begin(), resolved_list.end(), result.resolved_name) == resolved_list.end()) {
+            resolved_list.push_back(result.resolved_name);
         }
     }
 
