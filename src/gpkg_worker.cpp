@@ -232,6 +232,259 @@ bool env_var_is_truthy(const char* value) {
            normalized == "on";
 }
 
+std::string get_etc_passwd_path() {
+    return g_root_prefix + "/etc/passwd";
+}
+
+std::string get_etc_group_path() {
+    return g_root_prefix + "/etc/group";
+}
+
+std::string get_etc_shadow_path() {
+    return g_root_prefix + "/etc/shadow";
+}
+
+std::vector<std::string> split_preserve_empty_local(const std::string& text, char delimiter) {
+    std::vector<std::string> parts;
+    std::string current;
+    for (char ch : text) {
+        if (ch == delimiter) {
+            parts.push_back(current);
+            current.clear();
+        } else {
+            current += ch;
+        }
+    }
+    parts.push_back(current);
+    return parts;
+}
+
+std::vector<std::string> read_text_lines_local(const std::string& path) {
+    std::vector<std::string> lines;
+    std::ifstream file(path);
+    if (!file) return lines;
+    std::string line;
+    while (std::getline(file, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        lines.push_back(line);
+    }
+    return lines;
+}
+
+bool parse_small_int_local(const std::string& text, int* out) {
+    if (out) *out = -1;
+    std::string normalized = trim(text);
+    if (normalized.empty()) return false;
+    char* end = nullptr;
+    errno = 0;
+    long value = std::strtol(normalized.c_str(), &end, 10);
+    if (errno != 0 || !end || *end != '\0' || value < 0 || value > 65534) return false;
+    if (out) *out = static_cast<int>(value);
+    return true;
+}
+
+struct DebianStaticGroupSpec {
+    const char* name;
+    int preferred_gid;
+    const char* members;
+};
+
+struct DebianStaticUserSpec {
+    const char* name;
+    int preferred_uid;
+    const char* primary_group;
+    const char* gecos;
+    const char* home;
+    const char* shell;
+};
+
+const DebianStaticGroupSpec kDebianStaticGroupBaseline[] = {
+    {"daemon", 1, ""},
+    {"bin", 2, ""},
+    {"sys", 3, ""},
+    {"adm", 4, ""},
+    {"tty", 5, ""},
+    {"disk", 6, ""},
+    {"lp", 7, ""},
+    {"mail", 8, ""},
+    {"news", 9, ""},
+    {"uucp", 10, ""},
+    {"man", 12, ""},
+    {"proxy", 13, ""},
+    {"kmem", 15, ""},
+    {"dialout", 20, ""},
+    {"fax", 21, ""},
+    {"voice", 22, ""},
+    {"cdrom", 24, ""},
+    {"floppy", 25, ""},
+    {"tape", 26, ""},
+    {"sudo", 27, "root"},
+    {"audio", 29, ""},
+    {"dip", 30, ""},
+    {"www-data", 33, ""},
+    {"backup", 34, ""},
+    {"operator", 37, ""},
+    {"list", 38, ""},
+    {"irc", 39, ""},
+    {"src", 40, ""},
+    {"shadow", 42, ""},
+    {"utmp", 43, ""},
+    {"video", 44, ""},
+    {"sasl", 45, ""},
+    {"plugdev", 46, ""},
+    {"staff", 50, ""},
+    {"games", 60, ""},
+    {"users", 100, ""},
+    {"netdev", 106, ""},
+    {"nogroup", 65534, ""},
+};
+
+const DebianStaticUserSpec kDebianStaticUserBaseline[] = {
+    {"daemon", 1, "daemon", "daemon", "/usr/sbin", "/usr/sbin/nologin"},
+    {"bin", 2, "bin", "bin", "/bin", "/usr/sbin/nologin"},
+    {"sys", 3, "sys", "sys", "/dev", "/usr/sbin/nologin"},
+    {"sync", 4, "nogroup", "sync", "/bin", "/bin/sync"},
+    {"games", 5, "games", "games", "/usr/games", "/usr/sbin/nologin"},
+    {"man", 6, "man", "man", "/var/cache/man", "/usr/sbin/nologin"},
+    {"lp", 7, "lp", "lp", "/var/spool/lpd", "/usr/sbin/nologin"},
+    {"mail", 8, "mail", "mail", "/var/mail", "/usr/sbin/nologin"},
+    {"news", 9, "news", "news", "/var/spool/news", "/usr/sbin/nologin"},
+    {"uucp", 10, "uucp", "uucp", "/var/spool/uucp", "/usr/sbin/nologin"},
+    {"proxy", 13, "proxy", "proxy", "/bin", "/usr/sbin/nologin"},
+    {"www-data", 33, "www-data", "www-data", "/var/www", "/usr/sbin/nologin"},
+    {"backup", 34, "backup", "backup", "/var/backups", "/usr/sbin/nologin"},
+    {"list", 38, "list", "Mailing List Manager", "/var/list", "/usr/sbin/nologin"},
+    {"irc", 39, "irc", "ircd", "/run/ircd", "/usr/sbin/nologin"},
+    {"_apt", 42, "nogroup", "", "/nonexistent", "/usr/sbin/nologin"},
+    {"nobody", 65534, "nogroup", "nobody", "/nonexistent", "/usr/sbin/nologin"},
+};
+
+int choose_available_compat_id(int preferred_id, const std::set<int>& used_ids, int first_id, int last_id) {
+    if (preferred_id >= 0 && used_ids.count(preferred_id) == 0) return preferred_id;
+    for (int candidate = first_id; candidate <= last_id; ++candidate) {
+        if (used_ids.count(candidate) == 0) return candidate;
+    }
+    for (int candidate = last_id + 1; candidate < 65534; ++candidate) {
+        if (used_ids.count(candidate) == 0) return candidate;
+    }
+    return -1;
+}
+
+bool ensure_debian_static_identity_baseline(std::string* error_out = nullptr) {
+    if (error_out) error_out->clear();
+
+    std::vector<std::string> passwd_lines = read_text_lines_local(get_etc_passwd_path());
+    std::vector<std::string> group_lines = read_text_lines_local(get_etc_group_path());
+    std::vector<std::string> shadow_lines = read_text_lines_local(get_etc_shadow_path());
+
+    std::set<std::string> group_names;
+    std::set<int> group_ids;
+    std::map<std::string, int> gid_by_group_name;
+    for (const auto& line : group_lines) {
+        auto fields = split_preserve_empty_local(line, ':');
+        if (fields.size() < 4 || fields[0].empty()) continue;
+        int gid = -1;
+        if (!parse_small_int_local(fields[2], &gid)) continue;
+        group_names.insert(fields[0]);
+        group_ids.insert(gid);
+        gid_by_group_name[fields[0]] = gid;
+    }
+
+    bool group_modified = false;
+    for (const auto& spec : kDebianStaticGroupBaseline) {
+        if (group_names.count(spec.name) != 0) continue;
+        int gid = choose_available_compat_id(spec.preferred_gid, group_ids, 100, 999);
+        if (gid < 0) {
+            if (error_out) *error_out = "no available GID for " + std::string(spec.name);
+            return false;
+        }
+        std::ostringstream line;
+        line << spec.name << ":x:" << gid << ":" << spec.members;
+        group_lines.push_back(line.str());
+        group_names.insert(spec.name);
+        group_ids.insert(gid);
+        gid_by_group_name[spec.name] = gid;
+        group_modified = true;
+    }
+
+    std::set<std::string> user_names;
+    std::set<int> user_ids;
+    for (const auto& line : passwd_lines) {
+        auto fields = split_preserve_empty_local(line, ':');
+        if (fields.size() < 7 || fields[0].empty()) continue;
+        int uid = -1;
+        if (!parse_small_int_local(fields[2], &uid)) continue;
+        user_names.insert(fields[0]);
+        user_ids.insert(uid);
+    }
+
+    bool passwd_modified = false;
+    for (const auto& spec : kDebianStaticUserBaseline) {
+        if (user_names.count(spec.name) != 0) continue;
+        auto gid_it = gid_by_group_name.find(spec.primary_group);
+        if (gid_it == gid_by_group_name.end()) {
+            if (error_out) {
+                *error_out = "missing primary group " + std::string(spec.primary_group) +
+                             " while creating " + spec.name;
+            }
+            return false;
+        }
+        int uid = choose_available_compat_id(spec.preferred_uid, user_ids, 100, 999);
+        if (uid < 0) {
+            if (error_out) *error_out = "no available UID for " + std::string(spec.name);
+            return false;
+        }
+        std::ostringstream line;
+        line << spec.name << ":x:" << uid << ":" << gid_it->second << ":" << spec.gecos << ":"
+             << spec.home << ":" << spec.shell;
+        passwd_lines.push_back(line.str());
+        user_names.insert(spec.name);
+        user_ids.insert(uid);
+        passwd_modified = true;
+    }
+
+    std::set<std::string> shadow_names;
+    for (const auto& line : shadow_lines) {
+        auto fields = split_preserve_empty_local(line, ':');
+        if (!fields.empty() && !fields[0].empty()) shadow_names.insert(fields[0]);
+    }
+
+    bool shadow_modified = false;
+    for (const auto& spec : kDebianStaticUserBaseline) {
+        if (user_names.count(spec.name) == 0 || shadow_names.count(spec.name) != 0) continue;
+        shadow_lines.push_back(std::string(spec.name) + ":!:19000:0:99999:7:::");
+        shadow_names.insert(spec.name);
+        shadow_modified = true;
+    }
+
+    if (group_modified) {
+        std::ostringstream content;
+        for (const auto& line : group_lines) content << line << "\n";
+        if (!write_text_file_atomic(get_etc_group_path(), content.str(), 0644)) {
+            if (error_out) *error_out = "failed to update /etc/group";
+            return false;
+        }
+    }
+    if (passwd_modified) {
+        std::ostringstream content;
+        for (const auto& line : passwd_lines) content << line << "\n";
+        if (!write_text_file_atomic(get_etc_passwd_path(), content.str(), 0644)) {
+            if (error_out) *error_out = "failed to update /etc/passwd";
+            return false;
+        }
+    }
+    if (shadow_modified) {
+        std::ostringstream content;
+        for (const auto& line : shadow_lines) content << line << "\n";
+        if (!write_text_file_atomic(get_etc_shadow_path(), content.str(), 0600)) {
+            if (error_out) *error_out = "failed to update /etc/shadow";
+            return false;
+        }
+    }
+
+    return true;
+}
+
 std::string format_phase_seconds(double seconds) {
     std::ostringstream out;
     out << std::fixed << std::setprecision(seconds >= 10.0 ? 1 : 2) << seconds << "s";
@@ -2179,6 +2432,14 @@ int run_maintainer_script_with_args(
     const std::string& metadata_path,
     const std::vector<std::string>& args = {}
 ) {
+    std::string identity_error;
+    if (!ensure_debian_static_identity_baseline(&identity_error)) {
+        std::cerr << "E: Failed to prepare Debian static account/group compatibility baseline";
+        if (!identity_error.empty()) std::cerr << ": " << identity_error;
+        std::cerr << std::endl;
+        return 1;
+    }
+
     std::string maintscript_package =
         read_maintscript_package_name_from_metadata_path(metadata_path, fallback_pkg_name);
     if (maintscript_package.empty()) maintscript_package = fallback_pkg_name;
