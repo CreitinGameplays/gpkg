@@ -2861,6 +2861,50 @@ DebianIncrementalImportResult load_debian_index_entries_from_current_parsed_cach
         }
     }
 
+    if (full_rebuild) {
+        if (verbose) {
+            std::cout << "[DEBUG] Loading Debian parsed records into memory so the compiled-record"
+                      << " cache rebuild can run in parallel." << std::endl;
+            if (!have_previous_cache && !cache_problem.empty()) {
+                std::cout << "[DEBUG] "
+                          << describe_debian_cache_rebuild_reason(
+                                 "Debian compiled record cache",
+                                 cache_problem
+                             )
+                          << std::endl;
+            }
+        }
+
+        std::vector<DebianPackageRecord> records;
+        if (parsed_state.record_count > 0) records.reserve(parsed_state.record_count);
+
+        std::string records_error;
+        if (!foreach_current_debian_parsed_record(
+                packages_path,
+                config,
+                [&](const DebianPackageRecord& record) {
+                    records.push_back(record);
+                    return true;
+                },
+                nullptr,
+                &records_error
+            )) {
+            if (verbose && !records_error.empty()) {
+                std::cout << "[DEBUG] Failed while loading Debian parsed records for the"
+                          << " parallel compiled-cache rebuild: "
+                          << records_error << std::endl;
+            }
+            return result;
+        }
+
+        return load_debian_index_entries_from_records_incremental(
+            records,
+            config,
+            policy,
+            verbose
+        );
+    }
+
     if (verbose) {
         std::cout << "[DEBUG] Importing Debian metadata from the parsed-record cache"
                   << " (" << (full_rebuild ? "full rebuild" : "incremental reuse") << ")."

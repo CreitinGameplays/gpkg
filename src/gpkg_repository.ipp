@@ -1,12 +1,19 @@
 // Repository configuration, index management, and repo-backed commands.
 
 std::map<std::string, PackageMetadata> g_repo_package_cache;
-std::map<std::string, uint64_t> g_repo_package_offsets;
+struct RepoPackageLocator {
+    std::string shard_path;
+    uint64_t offset = 0;
+};
+
+std::map<std::string, RepoPackageLocator> g_repo_package_offsets;
 std::map<std::string, std::vector<std::string>> g_repo_provider_cache;
 std::set<std::string> g_repo_available_package_cache;
 bool g_repo_package_cache_loaded = false;
 
-const char REPO_CATALOG_MAGIC[8] = {'G','P','K','C','A','T','1','\0'};
+const char REPO_RUNTIME_INDEX_MAGIC[8] = {'G','P','K','R','I','D','1','\0'};
+const char REPO_CATALOG_SHARD_MAGIC[8] = {'G','P','K','S','H','D','1','\0'};
+const char REPO_CATALOG_SHARD_INDEX_MAGIC[8] = {'G','P','K','S','I','D','1','\0'};
 
 struct RepoIndexCacheState {
     std::string index_url;
@@ -18,6 +25,30 @@ struct RepoIndexCacheState {
 
 struct RepoCatalogState {
     std::string fingerprint;
+};
+
+struct RepoCatalogShardState {
+    std::string fingerprint;
+    size_t package_count = 0;
+};
+
+struct RepoCatalogShardIndexEntry {
+    std::string name;
+    std::string version;
+    std::string source_kind;
+    uint64_t offset = 0;
+    std::vector<std::string> provides;
+};
+
+struct RepoRuntimePackageEntry {
+    std::string name;
+    uint32_t shard_id = 0;
+    uint64_t offset = 0;
+};
+
+struct RepoRuntimeProviderEntry {
+    std::string capability;
+    std::vector<std::string> package_names;
 };
 
 struct PackageUniverseResult {
@@ -67,6 +98,32 @@ std::string get_legacy_repo_index_path() {
 
 std::string get_repo_catalog_state_path() {
     return REPO_CACHE_PATH + "Packages.catalog.state";
+}
+
+std::string get_repo_source_cache_root(const std::string& repo_url);
+
+std::string get_repo_source_catalog_shard_path(const std::string& repo_url) {
+    return get_repo_source_cache_root(repo_url) + "Packages.catalog.bin";
+}
+
+std::string get_repo_source_catalog_shard_state_path(const std::string& repo_url) {
+    return get_repo_source_cache_root(repo_url) + "Packages.catalog.state";
+}
+
+std::string get_repo_source_catalog_shard_index_path(const std::string& repo_url) {
+    return get_repo_source_cache_root(repo_url) + "Packages.runtime.bin";
+}
+
+std::string get_debian_catalog_shard_path() {
+    return REPO_CACHE_PATH + "debian/Packages.catalog.bin";
+}
+
+std::string get_debian_catalog_shard_state_path() {
+    return REPO_CACHE_PATH + "debian/Packages.catalog.state";
+}
+
+std::string get_debian_catalog_shard_index_path() {
+    return REPO_CACHE_PATH + "debian/Packages.runtime.bin";
 }
 
 std::string get_repo_source_cache_root(const std::string& repo_url) {
@@ -139,7 +196,7 @@ bool save_repo_index_cache_state(const std::string& path, const RepoIndexCacheSt
         return false;
     }
 
-    return true;
+    return false;
 }
 
 bool load_repo_catalog_state(const std::string& path, RepoCatalogState& state) {
@@ -184,6 +241,126 @@ bool save_repo_catalog_state(const std::string& path, const RepoCatalogState& st
     }
 
     return true;
+}
+
+bool load_repo_catalog_shard_state(const std::string& path, RepoCatalogShardState& state) {
+    std::ifstream f(path);
+    if (!f) return false;
+
+    state = {};
+    std::string line;
+    while (std::getline(f, line)) {
+        line = trim(line);
+        if (line.empty() || line[0] == '#') continue;
+
+        size_t eq = line.find('=');
+        if (eq == std::string::npos) continue;
+
+        std::string key = trim(line.substr(0, eq));
+        std::string value = line.substr(eq + 1);
+        if (key == "FINGERPRINT") state.fingerprint = value;
+        else if (key == "PACKAGE_COUNT") {
+            state.package_count = static_cast<size_t>(std::strtoull(value.c_str(), nullptr, 10));
+        }
+    }
+
+    return !state.fingerprint.empty();
+}
+
+bool save_repo_catalog_shard_state(const std::string& path, const RepoCatalogShardState& state) {
+    if (!mkdir_parent(path)) return false;
+
+    std::string temp_path = path + ".tmp";
+    std::ofstream out(temp_path, std::ios::trunc);
+    if (!out) return false;
+
+    out << "FINGERPRINT=" << state.fingerprint << "\n";
+    out << "PACKAGE_COUNT=" << state.package_count << "\n";
+    out.close();
+
+    if (!out) {
+        remove(temp_path.c_str());
+        return false;
+    }
+
+    if (rename(temp_path.c_str(), path.c_str()) != 0) {
+        remove(temp_path.c_str());
+        return false;
+    }
+
+    return true;
+}
+
+bool write_repo_catalog_shard_index_entry_binary(
+    std::ostream& out,
+    const RepoCatalogShardIndexEntry& entry
+) {
+    return
+        write_binary_string(out, entry.name) &&
+        write_binary_string(out, entry.version) &&
+        write_binary_string(out, entry.source_kind) &&
+        write_binary_u64(out, entry.offset) &&
+        write_binary_string_vector(out, entry.provides);
+}
+
+bool read_repo_catalog_shard_index_entry_binary(
+    std::istream& in,
+    RepoCatalogShardIndexEntry& entry
+) {
+    entry = {};
+    return
+        read_binary_string(in, entry.name) &&
+        read_binary_string(in, entry.version) &&
+        read_binary_string(in, entry.source_kind) &&
+        read_binary_u64(in, entry.offset) &&
+        read_binary_string_vector(in, entry.provides);
+}
+
+bool write_repo_runtime_package_entry_binary(
+    std::ostream& out,
+    const RepoRuntimePackageEntry& entry
+) {
+    return
+        write_binary_string(out, entry.name) &&
+        write_binary_u32(out, entry.shard_id) &&
+        write_binary_u64(out, entry.offset);
+}
+
+bool read_repo_runtime_package_entry_binary(
+    std::istream& in,
+    RepoRuntimePackageEntry& entry
+) {
+    entry = {};
+    return
+        read_binary_string(in, entry.name) &&
+        read_binary_u32(in, entry.shard_id) &&
+        read_binary_u64(in, entry.offset);
+}
+
+bool write_repo_runtime_provider_entry_binary(
+    std::ostream& out,
+    const RepoRuntimeProviderEntry& entry
+) {
+    return
+        write_binary_string(out, entry.capability) &&
+        write_binary_string_vector(out, entry.package_names);
+}
+
+bool read_repo_runtime_provider_entry_binary(
+    std::istream& in,
+    RepoRuntimeProviderEntry& entry
+) {
+    entry = {};
+    return
+        read_binary_string(in, entry.capability) &&
+        read_binary_string_vector(in, entry.package_names);
+}
+
+bool repo_runtime_index_header_is_valid(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;
+    uint32_t entry_count = 0;
+    return read_binary_cache_header(in, REPO_RUNTIME_INDEX_MAGIC, entry_count, nullptr);
 }
 
 bool fetch_remote_repo_index_state(
@@ -362,19 +539,36 @@ std::string build_repo_catalog_fingerprint(const std::vector<std::string>& urls)
     return fnv1a64_hex_digest(fields);
 }
 
+std::string build_repo_source_catalog_shard_fingerprint(const std::string& repo_url) {
+    std::string normalized = normalize_repo_base_url(repo_url);
+    return fnv1a64_hex_digest({
+        "repo-shard-v1",
+        normalized,
+        debian_cache_fingerprint_component(get_repo_source_index_json_path(normalized))
+    });
+}
+
+std::string build_debian_catalog_shard_fingerprint(const std::string& packages_path) {
+    return fnv1a64_hex_digest({
+        "debian-shard-v1",
+        build_debian_imported_index_cache_fingerprint(packages_path)
+    });
+}
+
 bool repo_catalog_matches_current_sources(const std::vector<std::string>& urls) {
     std::string catalog_path = get_repo_catalog_path();
     std::string state_path = get_repo_catalog_state_path();
     if (access(catalog_path.c_str(), F_OK) != 0 || access(state_path.c_str(), F_OK) != 0) {
         return false;
     }
+    if (!repo_runtime_index_header_is_valid(catalog_path)) return false;
 
     RepoCatalogState state;
     if (!load_repo_catalog_state(state_path, state)) return false;
     return state.fingerprint == build_repo_catalog_fingerprint(urls);
 }
 
-bool read_repo_catalog_entry_at_offset(
+bool read_repo_shard_entry_at_offset(
     const std::string& path,
     uint64_t offset,
     PackageMetadata& meta,
@@ -385,12 +579,12 @@ bool read_repo_catalog_entry_at_offset(
 
     std::ifstream in(path, std::ios::binary);
     if (!in) {
-        if (error_out) *error_out = "failed to open package catalog";
+        if (error_out) *error_out = "failed to open package catalog shard";
         return false;
     }
 
     uint32_t entry_count = 0;
-    if (!read_binary_cache_header(in, REPO_CATALOG_MAGIC, entry_count, error_out)) return false;
+    if (!read_binary_cache_header(in, REPO_CATALOG_SHARD_MAGIC, entry_count, error_out)) return false;
     (void)entry_count;
 
     in.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
@@ -412,53 +606,84 @@ bool foreach_repo_catalog_entry(
     Callback callback,
     std::string* error_out = nullptr
 ) {
-    return foreach_debian_binary_cache_entry<PackageMetadata>(
-        get_repo_catalog_path(),
-        REPO_CATALOG_MAGIC,
-        [](std::istream& in, PackageMetadata& meta) {
-            return read_package_metadata_binary(in, meta);
-        },
-        callback,
-        error_out
-    );
+    if (!ensure_repo_package_cache_loaded(false)) {
+        if (error_out) *error_out = "failed to load the local package runtime index";
+        return false;
+    }
+
+    for (const auto& entry : g_repo_package_offsets) {
+        PackageMetadata meta;
+        if (!read_repo_shard_entry_at_offset(entry.second.shard_path, entry.second.offset, meta, error_out)) {
+            return false;
+        }
+        if (!callback(meta)) break;
+    }
+
+    return true;
 }
 
-bool write_repo_catalog(
-    const std::map<std::string, PackageMetadata>& packages,
+bool write_repo_runtime_index(
+    const std::vector<std::string>& shard_paths,
+    const std::vector<RepoRuntimePackageEntry>& packages,
+    const std::vector<RepoRuntimeProviderEntry>& providers,
     std::string* error_out = nullptr
 ) {
     if (error_out) *error_out = "";
 
-    std::string catalog_path = get_repo_catalog_path();
-    if (!mkdir_parent(catalog_path)) {
-        if (error_out) *error_out = "failed to create package catalog directory";
+    std::string runtime_path = get_repo_catalog_path();
+    if (!mkdir_parent(runtime_path)) {
+        if (error_out) *error_out = "failed to create package runtime index directory";
         return false;
     }
 
-    if (packages.size() > std::numeric_limits<uint32_t>::max()) {
-        if (error_out) *error_out = "package catalog is too large";
+    if (packages.size() > std::numeric_limits<uint32_t>::max() ||
+        providers.size() > std::numeric_limits<uint32_t>::max() ||
+        shard_paths.size() > std::numeric_limits<uint32_t>::max()) {
+        if (error_out) *error_out = "package runtime index is too large";
         return false;
     }
 
-    std::string temp_path = catalog_path + ".tmp";
+    std::string temp_path = runtime_path + ".tmp";
     std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
     if (!out) {
-        if (error_out) *error_out = "failed to open package catalog for writing";
+        if (error_out) *error_out = "failed to open package runtime index for writing";
         return false;
     }
 
-    if (!write_binary_cache_header(out, REPO_CATALOG_MAGIC, static_cast<uint32_t>(packages.size()))) {
+    if (!write_binary_exact(out, REPO_RUNTIME_INDEX_MAGIC, 8) ||
+        !write_binary_u32(out, DEBIAN_COMPILED_CACHE_VERSION) ||
+        !write_binary_u32(out, static_cast<uint32_t>(shard_paths.size())) ||
+        !write_binary_u32(out, static_cast<uint32_t>(packages.size())) ||
+        !write_binary_u32(out, static_cast<uint32_t>(providers.size()))) {
         out.close();
         remove(temp_path.c_str());
-        if (error_out) *error_out = "failed to write package catalog header";
+        if (error_out) *error_out = "failed to write package runtime index header";
         return false;
     }
 
-    for (const auto& entry : packages) {
-        if (!write_package_metadata_binary(out, entry.second)) {
+    for (size_t i = 0; i < shard_paths.size(); ++i) {
+        if (!write_binary_string(out, shard_paths[i])) {
             out.close();
             remove(temp_path.c_str());
-            if (error_out) *error_out = "failed to encode package catalog entry " + entry.first;
+            if (error_out) *error_out = "failed to encode package runtime shard path " + std::to_string(i + 1);
+            return false;
+        }
+    }
+
+    for (size_t i = 0; i < packages.size(); ++i) {
+        if (!write_repo_runtime_package_entry_binary(out, packages[i])) {
+            out.close();
+            remove(temp_path.c_str());
+            if (error_out) *error_out = "failed to encode package runtime package entry " + std::to_string(i + 1);
+            return false;
+        }
+    }
+
+    for (size_t i = 0; i < providers.size(); ++i) {
+        if (!write_repo_runtime_provider_entry_binary(out, providers[i])) {
+            out.close();
+            remove(temp_path.c_str());
+            if (error_out) *error_out = "failed to encode package runtime provider entry " + std::to_string(i + 1);
             return false;
         }
     }
@@ -466,11 +691,11 @@ bool write_repo_catalog(
     out.close();
     if (!out) {
         remove(temp_path.c_str());
-        if (error_out) *error_out = "failed to flush package catalog";
+        if (error_out) *error_out = "failed to flush package runtime index";
         return false;
     }
 
-    if (rename(temp_path.c_str(), catalog_path.c_str()) != 0) {
+    if (rename(temp_path.c_str(), runtime_path.c_str()) != 0) {
         remove(temp_path.c_str());
         if (error_out) *error_out = strerror(errno);
         return false;
@@ -479,41 +704,157 @@ bool write_repo_catalog(
     return true;
 }
 
-bool migrate_legacy_repo_index_to_catalog(bool verbose, std::string* error_out = nullptr) {
+bool write_repo_catalog_shard(
+    const std::string& path,
+    const std::vector<PackageMetadata>& entries,
+    std::string* error_out = nullptr
+) {
+    return write_debian_binary_cache(
+        path,
+        REPO_CATALOG_SHARD_MAGIC,
+        entries,
+        [](std::ostream& out, const PackageMetadata& meta) {
+            return write_package_metadata_binary(out, meta);
+        },
+        error_out
+    );
+}
+
+bool write_repo_catalog_shard_index(
+    const std::string& path,
+    const std::vector<RepoCatalogShardIndexEntry>& entries,
+    std::string* error_out = nullptr
+) {
+    return write_debian_binary_cache(
+        path,
+        REPO_CATALOG_SHARD_INDEX_MAGIC,
+        entries,
+        [](std::ostream& out, const RepoCatalogShardIndexEntry& entry) {
+            return write_repo_catalog_shard_index_entry_binary(out, entry);
+        },
+        error_out
+    );
+}
+
+bool read_repo_catalog_shard_index(
+    const std::string& path,
+    std::vector<RepoCatalogShardIndexEntry>& entries,
+    std::string* error_out = nullptr
+) {
+    entries.clear();
+    return foreach_debian_binary_cache_entry<RepoCatalogShardIndexEntry>(
+        path,
+        REPO_CATALOG_SHARD_INDEX_MAGIC,
+        [](std::istream& in, RepoCatalogShardIndexEntry& entry) {
+            return read_repo_catalog_shard_index_entry_binary(in, entry);
+        },
+        [&](const RepoCatalogShardIndexEntry& entry) {
+            entries.push_back(entry);
+            return true;
+        },
+        error_out
+    );
+}
+
+bool build_repo_catalog_shard_index(
+    const std::string& shard_path,
+    const std::string& index_path,
+    std::string* error_out = nullptr
+) {
+    if (error_out) *error_out = "";
+
+    std::ifstream in(shard_path, std::ios::binary);
+    if (!in) {
+        if (error_out) *error_out = "failed to open package catalog shard";
+        return false;
+    }
+
+    uint32_t entry_count = 0;
+    if (!read_binary_cache_header(in, REPO_CATALOG_SHARD_MAGIC, entry_count, error_out)) return false;
+
+    std::vector<RepoCatalogShardIndexEntry> entries;
+    entries.reserve(entry_count);
+    for (uint32_t index = 0; index < entry_count; ++index) {
+        std::streamoff offset = in.tellg();
+        if (offset < 0) {
+            if (error_out) *error_out = "failed to locate package catalog shard entry offset";
+            return false;
+        }
+
+        PackageMetadata meta;
+        if (!read_package_metadata_binary(in, meta)) {
+            if (error_out) *error_out = "failed to decode package catalog shard entry " + std::to_string(index + 1);
+            return false;
+        }
+        if (meta.name.empty()) continue;
+
+        RepoCatalogShardIndexEntry entry;
+        entry.name = meta.name;
+        entry.version = meta.version;
+        entry.source_kind = meta.source_kind;
+        entry.offset = static_cast<uint64_t>(offset);
+        for (const auto& capability : meta.provides) {
+            std::string relation_name = relation_name_from_text(capability);
+            if (relation_name.empty()) continue;
+            if (std::find(entry.provides.begin(), entry.provides.end(), relation_name) == entry.provides.end()) {
+                entry.provides.push_back(relation_name);
+            }
+        }
+        entries.push_back(std::move(entry));
+    }
+
+    return write_repo_catalog_shard_index(index_path, entries, error_out);
+}
+
+bool ensure_repo_catalog_shard_index_ready(
+    const std::string& shard_path,
+    const std::string& index_path,
+    bool verbose,
+    const std::string& label,
+    std::string* error_out = nullptr
+) {
     if (error_out) error_out->clear();
 
-    std::string legacy_path = get_legacy_repo_index_path();
-    if (access(legacy_path.c_str(), F_OK) != 0) {
-        if (error_out) *error_out = "legacy merged package index is missing";
+    if (access(shard_path.c_str(), F_OK) != 0) {
+        if (error_out) *error_out = "package catalog shard is unavailable";
         return false;
     }
 
-    std::map<std::string, PackageMetadata> packages;
-    foreach_json_object(legacy_path, [&](const std::string& obj) {
-        PackageMetadata candidate;
-        populate_package_metadata_from_json(obj, candidate);
-        candidate.name = trim(candidate.name);
-        if (candidate.name.empty()) return true;
-
-        auto it = packages.find(candidate.name);
-        if (it == packages.end() || should_prefer_repo_candidate(candidate, it->second)) {
-            packages[candidate.name] = candidate;
+    if (access(index_path.c_str(), F_OK) == 0) {
+        std::string read_error;
+        std::vector<RepoCatalogShardIndexEntry> probe_entries;
+        if (read_repo_catalog_shard_index(index_path, probe_entries, &read_error)) {
+            return true;
         }
-        return true;
-    });
+        VLOG(verbose, "Rebuilding stale package catalog shard index for "
+             << label << ": " << read_error);
+    }
 
-    if (packages.empty()) {
-        if (error_out) *error_out = "legacy merged package index is empty";
+    std::string build_error;
+    if (!build_repo_catalog_shard_index(shard_path, index_path, &build_error)) {
+        if (error_out) {
+            *error_out = build_error.empty()
+                ? "failed to build package catalog shard index"
+                : build_error;
+        }
         return false;
     }
 
-    if (!write_repo_catalog(packages, error_out)) return false;
-    VLOG(verbose, "Migrated legacy merged package index to the binary catalog format.");
+    VLOG(verbose, "Rebuilt package catalog shard index for " << label << ".");
     return true;
 }
 
+bool migrate_legacy_repo_index_to_catalog(bool verbose, std::string* error_out = nullptr) {
+    (void)verbose;
+    if (error_out) error_out->clear();
+    if (error_out) {
+        *error_out = "legacy merged package index migration is no longer supported; run 'gpkg update'";
+    }
+    return false;
+}
+
 bool build_repo_catalog_runtime_index(
-    std::map<std::string, uint64_t>& offsets_out,
+    std::map<std::string, RepoPackageLocator>& offsets_out,
     std::map<std::string, std::vector<std::string>>& providers_out,
     std::set<std::string>& package_names_out,
     std::string* error_out = nullptr
@@ -525,47 +866,74 @@ bool build_repo_catalog_runtime_index(
 
     std::ifstream in(get_repo_catalog_path(), std::ios::binary);
     if (!in) {
-        if (error_out) *error_out = "failed to open package catalog";
+        if (error_out) *error_out = "failed to open package runtime index";
         return false;
     }
 
-    uint32_t entry_count = 0;
-    if (!read_binary_cache_header(in, REPO_CATALOG_MAGIC, entry_count, error_out)) return false;
+    char magic[8] = {};
+    uint32_t version = 0;
+    uint32_t shard_count = 0;
+    uint32_t package_count = 0;
+    uint32_t provider_count = 0;
+    if (!read_binary_exact(in, magic, sizeof(magic)) ||
+        std::memcmp(magic, REPO_RUNTIME_INDEX_MAGIC, sizeof(magic)) != 0 ||
+        !read_binary_u32(in, version) ||
+        !read_binary_u32(in, shard_count) ||
+        !read_binary_u32(in, package_count) ||
+        !read_binary_u32(in, provider_count)) {
+        if (error_out) *error_out = "failed to decode package runtime index header";
+        return false;
+    }
+    if (version != DEBIAN_COMPILED_CACHE_VERSION) {
+        if (error_out) *error_out = "package runtime index version is unsupported";
+        return false;
+    }
 
-    for (uint32_t index = 0; index < entry_count; ++index) {
-        std::streamoff offset = in.tellg();
-        if (offset < 0) {
-            if (error_out) *error_out = "failed to locate package catalog entry offset";
+    std::vector<std::string> shard_paths;
+    shard_paths.reserve(shard_count);
+    for (uint32_t i = 0; i < shard_count; ++i) {
+        std::string shard_path;
+        if (!read_binary_string(in, shard_path)) {
+            if (error_out) *error_out = "failed to decode package runtime shard path " + std::to_string(i + 1);
             return false;
         }
-
-        PackageMetadata meta;
-        if (!read_package_metadata_binary(in, meta)) {
-            if (error_out) *error_out = "failed to decode package catalog entry " + std::to_string(index + 1);
+        if (access(shard_path.c_str(), F_OK) != 0) {
+            if (error_out) *error_out = "package runtime shard is missing: " + shard_path;
             return false;
         }
-        if (meta.name.empty()) continue;
+        shard_paths.push_back(std::move(shard_path));
+    }
 
-        offsets_out[meta.name] = static_cast<uint64_t>(offset);
-        package_names_out.insert(meta.name);
-
-        for (const auto& capability : meta.provides) {
-            std::string relation_name = relation_name_from_text(capability);
-            if (relation_name.empty()) continue;
-
-            auto& provider_names = providers_out[relation_name];
-            if (std::find(provider_names.begin(), provider_names.end(), meta.name) == provider_names.end()) {
-                provider_names.push_back(meta.name);
-            }
+    for (uint32_t i = 0; i < package_count; ++i) {
+        RepoRuntimePackageEntry entry;
+        if (!read_repo_runtime_package_entry_binary(in, entry)) {
+            if (error_out) *error_out = "failed to decode package runtime package entry " + std::to_string(i + 1);
+            return false;
         }
+        if (entry.name.empty()) continue;
+        if (entry.shard_id >= shard_paths.size()) {
+            if (error_out) *error_out = "package runtime package entry references an invalid shard id";
+            return false;
+        }
+        offsets_out[entry.name] = {shard_paths[entry.shard_id], entry.offset};
+        package_names_out.insert(entry.name);
+    }
+
+    for (uint32_t i = 0; i < provider_count; ++i) {
+        RepoRuntimeProviderEntry entry;
+        if (!read_repo_runtime_provider_entry_binary(in, entry)) {
+            if (error_out) *error_out = "failed to decode package runtime provider entry " + std::to_string(i + 1);
+            return false;
+        }
+        if (entry.capability.empty()) continue;
+        providers_out[entry.capability] = std::move(entry.package_names);
     }
 
     return !offsets_out.empty();
 }
 
 bool repo_index_file_present() {
-    return access(get_repo_catalog_path().c_str(), F_OK) == 0 ||
-           access(get_legacy_repo_index_path().c_str(), F_OK) == 0;
+    return access(get_repo_catalog_path().c_str(), F_OK) == 0;
 }
 
 bool try_ensure_repo_package_cache_loaded(bool verbose) {
@@ -627,7 +995,11 @@ bool get_loaded_repo_package_info(const std::string& pkg_name, PackageMetadata& 
     if (offset_it == g_repo_package_offsets.end()) return false;
 
     PackageMetadata meta;
-    if (!read_repo_catalog_entry_at_offset(get_repo_catalog_path(), offset_it->second, meta)) {
+    if (!read_repo_shard_entry_at_offset(
+            offset_it->second.shard_path,
+            offset_it->second.offset,
+            meta
+        )) {
         return false;
     }
 
@@ -648,7 +1020,7 @@ std::string upgrade_catalog_file_fingerprint_component(const std::string& path) 
 
 std::string build_upgrade_catalog_fingerprint() {
     return "v1|" +
-        upgrade_catalog_file_fingerprint_component(get_repo_catalog_path()) + "|" +
+        upgrade_catalog_file_fingerprint_component(get_repo_catalog_state_path()) + "|" +
         upgrade_catalog_file_fingerprint_component(IMPORT_POLICY_PATH) + "|" +
         upgrade_catalog_file_fingerprint_component(UPGRADE_COMPANIONS_PATH);
 }
@@ -1434,15 +1806,6 @@ bool ensure_repo_urls(const std::vector<std::string>& urls) {
 bool ensure_repo_index_available() {
     auto urls = get_repo_urls();
     if (repo_catalog_matches_current_sources(urls)) return true;
-    if (access(get_legacy_repo_index_path().c_str(), F_OK) == 0) {
-        std::string migration_error;
-        if (migrate_legacy_repo_index_to_catalog(false, &migration_error)) return true;
-        std::cerr << Color::RED
-                  << "E: Failed to migrate the local merged package index to the binary catalog";
-        if (!migration_error.empty()) std::cerr << " (" << migration_error << ")";
-        std::cerr << Color::RESET << std::endl;
-        return false;
-    }
 
     std::string build_error;
     if (build_current_repo_catalog(false, &build_error)) return true;
@@ -1605,7 +1968,7 @@ bool ensure_repo_package_cache_loaded(bool verbose) {
     }
     if (!ensure_repo_index_available()) return false;
 
-    std::map<std::string, uint64_t> offsets;
+    std::map<std::string, RepoPackageLocator> offsets;
     std::map<std::string, std::vector<std::string>> providers;
     std::set<std::string> package_names;
     std::string load_error;
@@ -1958,48 +2321,378 @@ bool append_cached_debian_imported_catalog(
     return appended_count > 0;
 }
 
+bool append_repo_catalog_shard(
+    const std::string& path,
+    std::map<std::string, PackageMetadata>& packages,
+    bool verbose,
+    int* appended_count_out = nullptr
+) {
+    if (appended_count_out) *appended_count_out = 0;
+
+    int appended_count = 0;
+    std::string shard_error;
+    if (!foreach_debian_binary_cache_entry<PackageMetadata>(
+            path,
+            REPO_CATALOG_SHARD_MAGIC,
+            [](std::istream& in, PackageMetadata& meta) {
+                return read_package_metadata_binary(in, meta);
+            },
+            [&](const PackageMetadata& meta) {
+                merge_repo_catalog_candidate(packages, meta);
+                ++appended_count;
+                return true;
+            },
+            &shard_error
+        )) {
+        VLOG(verbose, "Discarded stale repository catalog shard " << path
+                     << ": " << shard_error);
+        return false;
+    }
+
+    if (appended_count_out) *appended_count_out = appended_count;
+    return true;
+}
+
+bool ensure_current_repo_source_catalog_shard(
+    const std::string& repo_url,
+    bool verbose,
+    int* package_count_out = nullptr,
+    std::string* error_out = nullptr
+) {
+    if (package_count_out) *package_count_out = 0;
+    if (error_out) error_out->clear();
+
+    std::string normalized = normalize_repo_base_url(repo_url);
+    std::string source_json = get_repo_source_index_json_path(normalized);
+    if (access(source_json.c_str(), F_OK) != 0) {
+        if (error_out) *error_out = "cached source index is unavailable for " + normalized;
+        return false;
+    }
+
+    std::string shard_path = get_repo_source_catalog_shard_path(normalized);
+    std::string shard_state_path = get_repo_source_catalog_shard_state_path(normalized);
+    std::string fingerprint = build_repo_source_catalog_shard_fingerprint(normalized);
+
+    RepoCatalogShardState shard_state;
+    if (access(shard_path.c_str(), F_OK) == 0 &&
+        load_repo_catalog_shard_state(shard_state_path, shard_state) &&
+        shard_state.fingerprint == fingerprint) {
+        if (package_count_out) *package_count_out = static_cast<int>(shard_state.package_count);
+        return true;
+    }
+
+    std::map<std::string, PackageMetadata> source_packages;
+    foreach_json_object(source_json, [&](const std::string& obj) {
+        PackageMetadata candidate;
+        populate_package_metadata_from_json(obj, candidate);
+        candidate.name = trim(candidate.name);
+        if (candidate.name.empty()) return true;
+        if (candidate.source_url.empty()) candidate.source_url = normalized;
+        if (candidate.source_kind.empty()) candidate.source_kind = "gpkg_repo";
+        merge_repo_catalog_candidate(source_packages, candidate);
+        return true;
+    });
+
+    std::vector<PackageMetadata> entries;
+    entries.reserve(source_packages.size());
+    for (const auto& entry : source_packages) {
+        entries.push_back(entry.second);
+    }
+
+    std::string shard_error;
+    if (!write_repo_catalog_shard(shard_path, entries, &shard_error)) {
+        if (error_out) {
+            *error_out = shard_error.empty()
+                ? "failed to write repository catalog shard for " + normalized
+                : shard_error;
+        }
+        return false;
+    }
+
+    RepoCatalogShardState new_state;
+    new_state.fingerprint = fingerprint;
+    new_state.package_count = entries.size();
+    if (!save_repo_catalog_shard_state(shard_state_path, new_state)) {
+        if (error_out) *error_out = "failed to persist repository catalog shard state for " + normalized;
+        return false;
+    }
+
+    if (package_count_out) *package_count_out = static_cast<int>(entries.size());
+    VLOG(verbose, "Rebuilt repository catalog shard for " << normalized
+         << " (" << entries.size() << " package records).");
+    return true;
+}
+
+bool copy_debian_imported_cache_to_repo_shard(
+    const std::string& shard_path,
+    size_t expected_entries,
+    std::string* error_out = nullptr
+) {
+    if (error_out) error_out->clear();
+
+    std::string imported_cache_path = get_debian_imported_index_binary_cache_path();
+    std::ifstream in(imported_cache_path, std::ios::binary);
+    if (!in) {
+        if (error_out) *error_out = "failed to open imported Debian cache";
+        return false;
+    }
+
+    uint32_t entry_count = 0;
+    if (!read_binary_cache_header(in, DEBIAN_IMPORTED_CACHE_MAGIC, entry_count, error_out)) {
+        return false;
+    }
+
+    if (expected_entries <= std::numeric_limits<uint32_t>::max() &&
+        entry_count != static_cast<uint32_t>(expected_entries)) {
+        if (error_out) *error_out = "imported Debian cache entry count does not match its state";
+        return false;
+    }
+
+    if (!mkdir_parent(shard_path)) {
+        if (error_out) *error_out = "failed to create Debian catalog shard directory";
+        return false;
+    }
+
+    std::string temp_path = shard_path + ".tmp";
+    std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        if (error_out) *error_out = "failed to open Debian catalog shard for writing";
+        return false;
+    }
+
+    if (!write_binary_cache_header(out, REPO_CATALOG_SHARD_MAGIC, entry_count)) {
+        out.close();
+        remove(temp_path.c_str());
+        if (error_out) *error_out = "failed to write Debian catalog shard header";
+        return false;
+    }
+
+    for (uint32_t i = 0; i < entry_count; ++i) {
+        PackageMetadata meta;
+        if (!read_package_metadata_binary(in, meta)) {
+            out.close();
+            remove(temp_path.c_str());
+            if (error_out) *error_out = "failed to decode imported Debian cache entry " + std::to_string(i + 1);
+            return false;
+        }
+        if (!write_package_metadata_binary(out, meta)) {
+            out.close();
+            remove(temp_path.c_str());
+            if (error_out) *error_out = "failed to encode Debian catalog shard entry " + std::to_string(i + 1);
+            return false;
+        }
+    }
+
+    out.close();
+    if (!out) {
+        remove(temp_path.c_str());
+        if (error_out) *error_out = "failed to flush Debian catalog shard";
+        return false;
+    }
+
+    if (rename(temp_path.c_str(), shard_path.c_str()) != 0) {
+        remove(temp_path.c_str());
+        if (error_out) *error_out = strerror(errno);
+        return false;
+    }
+
+    return true;
+}
+
+bool ensure_current_debian_catalog_shard(
+    bool verbose,
+    int* package_count_out = nullptr,
+    std::string* error_out = nullptr
+) {
+    if (package_count_out) *package_count_out = 0;
+    if (error_out) error_out->clear();
+
+    std::string packages_txt = get_debian_packages_cache_path();
+    if (access(packages_txt.c_str(), F_OK) != 0) {
+        if (error_out) *error_out = "cached Debian Packages index is unavailable";
+        return false;
+    }
+
+    std::string ensure_error;
+    if (!ensure_current_debian_imported_index_cache(verbose, &ensure_error)) {
+        if (error_out) {
+            *error_out = ensure_error.empty()
+                ? "failed to prepare the imported Debian metadata cache"
+                : ensure_error;
+        }
+        return false;
+    }
+
+    std::string imported_state_path = get_debian_imported_index_state_path();
+    DebianImportedIndexCacheState imported_state;
+    if (!load_debian_imported_index_cache_state(imported_state_path, imported_state)) {
+        if (error_out) *error_out = "failed to read imported Debian cache state";
+        return false;
+    }
+
+    std::string shard_path = get_debian_catalog_shard_path();
+    std::string shard_state_path = get_debian_catalog_shard_state_path();
+    std::string fingerprint = build_debian_catalog_shard_fingerprint(packages_txt);
+
+    RepoCatalogShardState shard_state;
+    if (access(shard_path.c_str(), F_OK) == 0 &&
+        load_repo_catalog_shard_state(shard_state_path, shard_state) &&
+        shard_state.fingerprint == fingerprint) {
+        if (package_count_out) *package_count_out = static_cast<int>(shard_state.package_count);
+        return true;
+    }
+
+    std::string shard_error;
+    if (!copy_debian_imported_cache_to_repo_shard(
+            shard_path,
+            imported_state.package_count,
+            &shard_error
+        )) {
+        if (error_out) {
+            *error_out = shard_error.empty()
+                ? "failed to write the Debian repository catalog shard"
+                : shard_error;
+        }
+        return false;
+    }
+
+    RepoCatalogShardState new_state;
+    new_state.fingerprint = fingerprint;
+    new_state.package_count = imported_state.package_count;
+    if (!save_repo_catalog_shard_state(shard_state_path, new_state)) {
+        if (error_out) *error_out = "failed to persist Debian catalog shard state";
+        return false;
+    }
+
+    if (package_count_out) *package_count_out = static_cast<int>(imported_state.package_count);
+    VLOG(verbose, "Rebuilt Debian catalog shard with "
+         << imported_state.package_count << " package records.");
+    return true;
+}
+
 bool build_current_repo_catalog(bool verbose, std::string* error_out) {
     if (error_out) error_out->clear();
 
     auto urls = get_repo_urls();
+    if (repo_catalog_matches_current_sources(urls)) return true;
+
     std::string fingerprint = build_repo_catalog_fingerprint(urls);
-    std::map<std::string, PackageMetadata> packages;
+    struct SelectedPackageEntry {
+        PackageMetadata meta;
+        RepoPackageLocator locator;
+        std::vector<std::string> provides;
+    };
+
+    std::map<std::string, SelectedPackageEntry> selected_packages;
+    std::vector<std::string> shard_paths;
+    std::set<std::string> seen_shards;
     int success_count = 0;
 
     for (const auto& url : urls) {
-        std::string source_json = get_repo_source_index_json_path(url);
-        if (access(source_json.c_str(), F_OK) != 0) continue;
+        std::string shard_error;
+        if (!ensure_current_repo_source_catalog_shard(
+                url,
+                verbose,
+                nullptr,
+                &shard_error
+            )) {
+            if (verbose && !shard_error.empty()) {
+                VLOG(verbose, "Skipping repository source " << normalize_repo_base_url(url)
+                             << " while rebuilding the merged package catalog: "
+                             << shard_error);
+            }
+            continue;
+        }
 
-        foreach_json_object(source_json, [&](const std::string& obj) {
-            PackageMetadata candidate;
-            populate_package_metadata_from_json(obj, candidate);
-            candidate.name = trim(candidate.name);
-            if (candidate.name.empty()) return true;
-            if (candidate.source_url.empty()) candidate.source_url = normalize_repo_base_url(url);
-            if (candidate.source_kind.empty()) candidate.source_kind = "gpkg_repo";
-            merge_repo_catalog_candidate(packages, candidate);
-            return true;
-        });
+        const std::string shard_path = get_repo_source_catalog_shard_path(url);
+        const std::string index_path = get_repo_source_catalog_shard_index_path(url);
+        if (!ensure_repo_catalog_shard_index_ready(
+                shard_path,
+                index_path,
+                verbose,
+                normalize_repo_base_url(url),
+                &shard_error
+            )) {
+            if (verbose && !shard_error.empty()) {
+                VLOG(verbose, "Skipping repository shard index for "
+                             << normalize_repo_base_url(url) << ": " << shard_error);
+            }
+            continue;
+        }
+
+        std::vector<RepoCatalogShardIndexEntry> shard_entries;
+        if (!read_repo_catalog_shard_index(index_path, shard_entries, &shard_error)) {
+            if (verbose && !shard_error.empty()) {
+                VLOG(verbose, "Skipping unreadable repository shard index for "
+                             << normalize_repo_base_url(url) << ": " << shard_error);
+            }
+            continue;
+        }
+
+        if (seen_shards.insert(shard_path).second) shard_paths.push_back(shard_path);
+        for (const auto& entry : shard_entries) {
+            if (entry.name.empty()) continue;
+
+            PackageMetadata candidate_meta;
+            candidate_meta.name = entry.name;
+            candidate_meta.version = entry.version;
+            candidate_meta.source_kind = entry.source_kind;
+
+            auto it = selected_packages.find(entry.name);
+            if (it == selected_packages.end() ||
+                should_prefer_repo_candidate(candidate_meta, it->second.meta)) {
+                SelectedPackageEntry selected;
+                selected.meta = candidate_meta;
+                selected.locator = {shard_path, entry.offset};
+                selected.provides = entry.provides;
+                selected_packages[entry.name] = std::move(selected);
+            }
+        }
         ++success_count;
     }
 
     std::string debian_error;
     std::string packages_txt = get_debian_packages_cache_path();
     if (access(packages_txt.c_str(), F_OK) == 0 &&
-        ensure_current_debian_imported_index_cache(verbose, &debian_error)) {
-        std::string import_cache_fingerprint =
-            build_debian_imported_index_cache_fingerprint(packages_txt);
-        int debian_package_count = 0;
-        if (append_cached_debian_imported_catalog(
-                packages,
-                import_cache_fingerprint,
+        ensure_current_debian_catalog_shard(verbose, nullptr, &debian_error)) {
+        const std::string shard_path = get_debian_catalog_shard_path();
+        const std::string index_path = get_debian_catalog_shard_index_path();
+        if (ensure_repo_catalog_shard_index_ready(
+                shard_path,
+                index_path,
                 verbose,
-                &debian_package_count
+                "Debian testing",
+                &debian_error
             )) {
-            ++success_count;
+            std::vector<RepoCatalogShardIndexEntry> shard_entries;
+            if (read_repo_catalog_shard_index(index_path, shard_entries, &debian_error)) {
+                if (seen_shards.insert(shard_path).second) shard_paths.push_back(shard_path);
+                for (const auto& entry : shard_entries) {
+                    if (entry.name.empty()) continue;
+
+                    PackageMetadata candidate_meta;
+                    candidate_meta.name = entry.name;
+                    candidate_meta.version = entry.version;
+                    candidate_meta.source_kind = entry.source_kind;
+
+                    auto it = selected_packages.find(entry.name);
+                    if (it == selected_packages.end() ||
+                        should_prefer_repo_candidate(candidate_meta, it->second.meta)) {
+                        SelectedPackageEntry selected;
+                        selected.meta = candidate_meta;
+                        selected.locator = {shard_path, entry.offset};
+                        selected.provides = entry.provides;
+                        selected_packages[entry.name] = std::move(selected);
+                    }
+                }
+                ++success_count;
+            } else if (verbose && !debian_error.empty()) {
+                VLOG(verbose, "Skipping unreadable Debian shard index while rebuilding the runtime package index: "
+                             << debian_error);
+            }
         }
     } else if (verbose && !debian_error.empty()) {
-        VLOG(verbose, "Skipping Debian imported catalog while rebuilding the repo catalog: "
+        VLOG(verbose, "Skipping the Debian catalog shard while rebuilding the repo catalog: "
                      << debian_error);
     }
 
@@ -2008,7 +2701,43 @@ bool build_current_repo_catalog(bool verbose, std::string* error_out) {
         return false;
     }
 
-    if (!write_repo_catalog(packages, error_out)) return false;
+    std::map<std::string, uint32_t> shard_ids;
+    for (size_t i = 0; i < shard_paths.size(); ++i) {
+        shard_ids[shard_paths[i]] = static_cast<uint32_t>(i);
+    }
+
+    std::vector<RepoRuntimePackageEntry> runtime_packages;
+    runtime_packages.reserve(selected_packages.size());
+    std::vector<RepoRuntimeProviderEntry> runtime_providers;
+    std::map<std::string, std::vector<std::string>> provider_map;
+    for (const auto& entry : selected_packages) {
+        RepoRuntimePackageEntry runtime_entry;
+        runtime_entry.name = entry.first;
+        runtime_entry.shard_id = shard_ids[entry.second.locator.shard_path];
+        runtime_entry.offset = entry.second.locator.offset;
+        runtime_packages.push_back(std::move(runtime_entry));
+
+        for (const auto& capability : entry.second.provides) {
+            if (capability.empty()) continue;
+            auto& provider_names = provider_map[capability];
+            if (std::find(provider_names.begin(), provider_names.end(), entry.first) == provider_names.end()) {
+                provider_names.push_back(entry.first);
+            }
+        }
+    }
+
+    runtime_providers.reserve(provider_map.size());
+    for (auto& entry : provider_map) {
+        RepoRuntimeProviderEntry provider_entry;
+        provider_entry.capability = entry.first;
+        provider_entry.package_names = std::move(entry.second);
+        runtime_providers.push_back(std::move(provider_entry));
+    }
+
+    if (!write_repo_runtime_index(shard_paths, runtime_packages, runtime_providers, error_out)) {
+        return false;
+    }
+
     RepoCatalogState state;
     state.fingerprint = fingerprint;
     if (!save_repo_catalog_state(get_repo_catalog_state_path(), state)) {
@@ -2407,15 +3136,31 @@ int handle_update(bool verbose) {
         invalidate_repo_package_cache();
     }
 
+    std::string catalog_error;
+    if (!build_current_repo_catalog(verbose, &catalog_error)) {
+        std::cerr << Color::RED
+                  << "E: Failed to rebuild the compiled package catalog";
+        if (!catalog_error.empty()) std::cerr << " (" << catalog_error << ")";
+        std::cerr << Color::RESET << std::endl;
+        return 1;
+    }
+
+    std::string upgrade_error;
+    if (!ensure_current_upgrade_catalog(verbose, &upgrade_error)) {
+        std::cerr << Color::RED
+                  << "E: Failed to rebuild the runtime upgrade catalog";
+        if (!upgrade_error.empty()) std::cerr << " (" << upgrade_error << ")";
+        std::cerr << Color::RESET << std::endl;
+        return 1;
+    }
+
     std::cout << Color::GREEN << "✓ Synced raw package indices from "
               << success_count << " source"
               << (success_count == 1 ? "" : "s")
               << Color::RESET << std::endl;
-    if (repo_sources_changed || debian_changed || debian_views_stale) {
-        std::cout << Color::BLUE
-                  << "Derived package catalogs will be rebuilt on demand."
-                  << Color::RESET << std::endl;
-    }
+    std::cout << Color::GREEN
+              << "✓ Rebuilt compiled package catalogs for fast queries."
+              << Color::RESET << std::endl;
 
     return 0;
 }
