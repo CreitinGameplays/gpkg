@@ -2095,6 +2095,63 @@ bool package_uses_native_dpkg_backend(const PackageMetadata& meta) {
     return package_is_debian_source(meta);
 }
 
+bool native_dpkg_status_requires_configuration(const std::string& status) {
+    return status == "unpacked" ||
+           status == "half-configured" ||
+           status == "triggers-awaited" ||
+           status == "triggers-pending";
+}
+
+std::vector<std::string> collect_pending_native_dpkg_configuration_packages() {
+    std::vector<std::string> pending;
+    for (const auto& record : load_dpkg_package_status_records()) {
+        if (record.package.empty()) continue;
+        if (!native_dpkg_status_requires_configuration(record.status)) continue;
+        pending.push_back(record.package);
+    }
+    return pending;
+}
+
+InstallCommandResult reconcile_pending_native_dpkg_configurations(bool verbose) {
+    InstallCommandResult result;
+    std::vector<std::string> pending = collect_pending_native_dpkg_configuration_packages();
+    if (pending.empty()) {
+        result.success = true;
+        return result;
+    }
+
+    VLOG(verbose, "Reconciling " << pending.size()
+                 << " pending native dpkg package(s) before continuing.");
+
+    int refresh_rc = run_ldconfig_trigger(verbose);
+    if (refresh_rc != 0) {
+        result.success = false;
+        result.failed_package = pending.front();
+        result.last_processed_package = pending.front();
+        std::cerr << "E: Runtime linker refresh failed before configuring pending Debian packages"
+                  << std::endl;
+        return result;
+    }
+
+    CommandCaptureResult configure_result = run_command_captured_argv(
+        build_dpkg_command_argv({"--configure", "--pending"}),
+        verbose,
+        "dpkg-configure-pending"
+    );
+    if (configure_result.exit_code == 0) {
+        result.success = true;
+        result.completed_count = pending.size();
+        result.last_processed_package = pending.back();
+        return result;
+    }
+
+    result.success = false;
+    result.log_path = configure_result.log_path;
+    result.failed_package = pending.front();
+    result.last_processed_package = pending.front();
+    return result;
+}
+
 InstallCommandResult install_native_debian_batch(
     const std::vector<PackageMetadata>& batch,
     bool verbose,
@@ -2111,6 +2168,16 @@ InstallCommandResult install_native_debian_batch(
         }
         std::cerr << std::endl;
         return {false, "", batch.front().name, 0, ""};
+    }
+
+    InstallCommandResult pending_result = reconcile_pending_native_dpkg_configurations(verbose);
+    if (!pending_result.success) {
+        std::cerr << "E: Failed to configure pending Debian packages before starting new batch";
+        if (!pending_result.failed_package.empty()) {
+            std::cerr << ": " << pending_result.failed_package;
+        }
+        std::cerr << std::endl;
+        return pending_result;
     }
 
     std::vector<std::vector<size_t>> outgoing(batch.size());
@@ -2217,6 +2284,20 @@ InstallCommandResult install_native_debian_batch(
                               << batch_result.failed_package << std::endl;
                     return batch_result;
                 }
+            }
+
+            InstallCommandResult pending_after_install = reconcile_pending_native_dpkg_configurations(verbose);
+            if (!pending_after_install.success) {
+                batch_result.success = false;
+                batch_result.log_path = pending_after_install.log_path;
+                batch_result.failed_package = pending_after_install.failed_package;
+                if (batch_result.failed_package.empty()) {
+                    batch_result.failed_package = debian_backend_package_name(meta);
+                    if (batch_result.failed_package.empty()) batch_result.failed_package = meta.name;
+                }
+                std::cerr << "E: Failed to configure pending Debian packages after installing "
+                          << batch_result.last_processed_package << std::endl;
+                return batch_result;
             }
             if (!verbose && progress_width && progress_total > 0) {
                 render_package_progress(
