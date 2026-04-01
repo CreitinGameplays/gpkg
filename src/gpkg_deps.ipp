@@ -153,12 +153,16 @@ bool dependency_list_matches(
 }
 
 bool is_system_provided(const std::string& pkg, const std::string& op, const std::string& req_version) {
-    if (dependency_list_matches(load_system_provides(), pkg, op, req_version)) return true;
-    return dependency_list_matches(load_upgradeable_system_packages(), pkg, op, req_version);
+    bool claimed_by_policy =
+        dependency_list_matches(load_system_provides(), pkg) ||
+        dependency_list_matches(load_upgradeable_system_packages(), pkg);
+    if (!claimed_by_policy) return false;
+    return system_package_has_live_evidence(pkg, op, req_version);
 }
 
 bool is_upgradeable_system_package(const std::string& pkg) {
-    return dependency_list_matches(load_upgradeable_system_packages(), pkg);
+    if (!dependency_list_matches(load_upgradeable_system_packages(), pkg)) return false;
+    return system_package_has_live_evidence(pkg);
 }
 
 bool package_is_base_system_provided(const std::string& pkg_name, std::string* reason_out) {

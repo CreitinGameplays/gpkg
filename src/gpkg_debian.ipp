@@ -2387,11 +2387,6 @@ std::vector<PackageMetadata> load_debian_index_entries_from_records(
 
             const auto& record = records[record_index];
             if (record.filename.empty() || record.sha256.empty()) continue;
-            if (record.essential &&
-                !matches_any_pattern(record.package, policy.allow_essential_packages)) {
-                if (skipped_policy) skipped.push_back(record.package + ": Essential: yes");
-                continue;
-            }
             if (matches_any_pattern(record.package, policy.skip_packages)) {
                 if (skipped_policy) skipped.push_back(record.package + ": blocked by policy");
                 continue;
@@ -2634,11 +2629,8 @@ DebianIncrementalImportResult load_debian_index_entries_from_records_incremental
                 cache_entry.record_fingerprint = fingerprint_it->second;
                 cache_entry.provided_symbols = provided_it->second;
 
-                if (!record.filename.empty() && !record.sha256.empty()) {
-                    if (record.essential &&
-                        !matches_any_pattern(record.package, policy.allow_essential_packages)) {
-                        cache_entry.skip_reason = "Essential: yes";
-                    } else if (matches_any_pattern(record.package, policy.skip_packages)) {
+                    if (!record.filename.empty() && !record.sha256.empty()) {
+                    if (matches_any_pattern(record.package, policy.skip_packages)) {
                         cache_entry.skip_reason = "blocked by policy";
                     } else {
                         PackageMetadata meta;
@@ -2930,10 +2922,7 @@ DebianIncrementalImportResult load_debian_index_entries_from_current_parsed_cach
                     }
 
                     if (!record.filename.empty() && !record.sha256.empty()) {
-                        if (record.essential &&
-                            !matches_any_pattern(record.package, policy.allow_essential_packages)) {
-                            cache_entry.skip_reason = "Essential: yes";
-                        } else if (matches_any_pattern(record.package, policy.skip_packages)) {
+                        if (matches_any_pattern(record.package, policy.skip_packages)) {
                             cache_entry.skip_reason = "blocked by policy";
                         } else {
                             PackageMetadata meta;
@@ -3913,12 +3902,6 @@ bool raw_debian_record_is_blocked_by_policy(
 ) {
     if (reason_out) reason_out->clear();
 
-    if (record.essential &&
-        !matches_any_pattern(record.package, context.policy.allow_essential_packages)) {
-        if (reason_out) *reason_out = "blocked by GeminiOS policy because the package is marked Essential: yes";
-        return true;
-    }
-
     if (matches_any_pattern(record.package, context.policy.skip_packages)) {
         if (reason_out) *reason_out = "blocked by GeminiOS import policy";
         return true;
@@ -4738,7 +4721,7 @@ std::string build_debian_parsed_record_packages_fingerprint(const std::string& p
 }
 
 std::string build_debian_compiled_record_cache_policy_fingerprint() {
-    return "phase2|" +
+    return "phase3|" +
         debian_cache_fingerprint_component(IMPORT_POLICY_PATH) + "|" +
         debian_cache_fingerprint_component(DEBIAN_CONFIG_PATH) + "|" +
         debian_cache_fingerprint_component(SYSTEM_PROVIDES_PATH) + "|" +

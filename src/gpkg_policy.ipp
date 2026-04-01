@@ -219,6 +219,74 @@ bool pattern_has_glob(const std::string& pattern) {
     return pattern.find_first_of("*?[]") != std::string::npos;
 }
 
+const std::map<std::string, std::string>& load_live_system_package_versions() {
+    static bool loaded = false;
+    static std::map<std::string, std::string> versions;
+    if (loaded) return versions;
+    loaded = true;
+
+    for (const auto& record : load_dpkg_package_status_records()) {
+        if (!package_status_is_installed_like(record.status)) continue;
+        versions[record.package] = record.version;
+    }
+
+    for (const auto& record : load_base_system_package_status_records()) {
+        if (!package_status_is_installed_like(record.status)) continue;
+        if (versions.find(record.package) == versions.end()) {
+            versions[record.package] = record.version;
+        }
+    }
+
+    return versions;
+}
+
+bool system_package_has_live_evidence(
+    const std::string& package_name,
+    const std::string& op = "",
+    const std::string& req_version = ""
+) {
+    if (package_name.empty()) return false;
+
+    const auto& versions = load_live_system_package_versions();
+    auto it = versions.find(package_name);
+    if (it == versions.end()) return false;
+    if (op.empty()) return true;
+    if (it->second.empty()) return false;
+
+    int cmp = compare_versions(it->second, req_version);
+    if (op == ">=" && cmp >= 0) return true;
+    if (op == "<=" && cmp <= 0) return true;
+    if (op == ">"  && cmp > 0) return true;
+    if (op == "<"  && cmp < 0) return true;
+    if (op == ">>" && cmp > 0) return true;
+    if (op == "<<" && cmp < 0) return true;
+    if ((op == "=" || op == "==") && cmp == 0) return true;
+    return false;
+}
+
+std::vector<std::string> filter_policy_system_claim_patterns(
+    const std::vector<std::string>& raw_entries
+) {
+    std::vector<std::string> filtered;
+    filtered.reserve(raw_entries.size());
+
+    for (auto entry : raw_entries) {
+        entry = trim(entry);
+        if (entry.empty()) continue;
+        if (pattern_has_glob(entry)) {
+            filtered.push_back(entry);
+            continue;
+        }
+
+        RelationAtom parsed = normalize_relation_atom(entry, "any");
+        if (!parsed.valid || parsed.name.empty()) continue;
+        if (!system_package_has_live_evidence(parsed.name, parsed.op, parsed.version)) continue;
+        filtered.push_back(parsed.name);
+    }
+
+    return unique_string_list(filtered);
+}
+
 struct CompactPackageAvailabilityIndex {
     std::vector<std::string> available_packages;
     std::vector<std::pair<std::string, std::vector<std::string>>> provider_map;
@@ -273,10 +341,10 @@ std::vector<std::string> build_system_drop_patterns(
 ) {
     std::vector<std::string> base_patterns = policy.system_provides.empty()
         ? load_pattern_entries_file(SYSTEM_PROVIDES_PATH)
-        : load_pattern_entries(policy.system_provides);
+        : filter_policy_system_claim_patterns(policy.system_provides);
     std::vector<std::string> upgradeable_patterns = policy.upgradeable_system.empty()
         ? load_pattern_entries_file(UPGRADEABLE_SYSTEM_PATH)
-        : load_pattern_entries(policy.upgradeable_system);
+        : filter_policy_system_claim_patterns(policy.upgradeable_system);
     std::vector<std::string> filtered;
 
     for (const auto& pattern : base_patterns) {
@@ -303,10 +371,10 @@ std::vector<std::string> build_system_drop_patterns(
 ) {
     std::vector<std::string> base_patterns = policy.system_provides.empty()
         ? load_pattern_entries_file(SYSTEM_PROVIDES_PATH)
-        : load_pattern_entries(policy.system_provides);
+        : filter_policy_system_claim_patterns(policy.system_provides);
     std::vector<std::string> upgradeable_patterns = policy.upgradeable_system.empty()
         ? load_pattern_entries_file(UPGRADEABLE_SYSTEM_PATH)
-        : load_pattern_entries(policy.upgradeable_system);
+        : filter_policy_system_claim_patterns(policy.upgradeable_system);
     std::vector<std::string> filtered;
 
     for (const auto& pattern : base_patterns) {
