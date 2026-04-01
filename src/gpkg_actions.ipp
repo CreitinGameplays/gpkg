@@ -370,7 +370,6 @@ std::vector<std::string> collect_native_dpkg_policy_seed_packages(const ImportPo
     append_exact(policy.system_provides);
     append_exact(policy.upgradeable_system);
     append_exact(policy.allow_essential_packages);
-    append_exact(policy.skip_packages);
     return packages;
 }
 
