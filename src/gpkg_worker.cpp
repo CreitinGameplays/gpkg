@@ -185,6 +185,7 @@ bool ensure_symlink_target_if_possible(
     bool replace_non_symlink
 );
 bool action_refresh_dpkg_trigger_state();
+bool action_configure(const std::string& pkg_name, const std::string& old_version);
 bool append_pending_dpkg_trigger_name(const std::string& trigger_name, std::string* error_out = nullptr);
 void mark_packages_trigger_pending(const std::vector<std::string>& trigger_names);
 std::vector<std::string> collect_shadowed_stale_runtime_provider_paths();
@@ -218,6 +219,7 @@ bool g_verbose = false;
 size_t g_parallel_jobs = 0;
 bool g_defer_runtime_linker_refresh = false;
 bool g_defer_selinux_relabel = false;
+bool g_defer_configure = false;
 bool g_unsafe_io = false;
 std::vector<PackageStatusRecord> g_status_records_cache;
 bool g_status_records_cache_loaded = false;
@@ -6061,6 +6063,13 @@ bool finalize_failed_configuration_state(
     return false;
 }
 
+bool report_configure_failure(const std::string& pkg_name, const std::string& message) {
+    std::cerr << "E: " << message << std::endl;
+    std::cerr << "E: Package " << pkg_name
+              << " remains installed in a half-configured state." << std::endl;
+    return false;
+}
+
 bool action_refresh_dpkg_trigger_state() {
     std::vector<std::string> pending = load_pending_dpkg_trigger_names();
     if (pending.empty()) {
@@ -7503,6 +7512,141 @@ bool schedule_selinux_autorelabel(
     return true;
 }
 
+bool action_configure(const std::string& pkg_name, const std::string& old_version) {
+    using InstallClock = std::chrono::steady_clock;
+    auto total_start = InstallClock::now();
+    auto phase_start = total_start;
+    double postinst_seconds = 0.0;
+    double cleanup_seconds = 0.0;
+    auto finish_phase = [&](double& bucket) {
+        auto now = InstallClock::now();
+        bucket = std::chrono::duration<double>(now - phase_start).count();
+        phase_start = now;
+    };
+
+    PackageStatusRecord record;
+    if (!get_package_status_record(pkg_name, &record)) {
+        std::cerr << "E: Package " << pkg_name << " is not registered." << std::endl;
+        return false;
+    }
+
+    std::string current_version = !record.version.empty() ? record.version : get_package_version(pkg_name);
+    if (current_version.empty()) {
+        std::cerr << "E: Package " << pkg_name << " does not have an installed version to configure."
+                  << std::endl;
+        return false;
+    }
+
+    if (record.status == "installed") return true;
+
+    std::string json_path = get_info_dir() + pkg_name + ".json";
+    if (access(json_path.c_str(), R_OK) != 0) {
+        std::cerr << "E: Installed metadata for " << pkg_name << " is missing." << std::endl;
+        return false;
+    }
+
+    std::vector<std::string> installed_files = normalize_owned_manifest_paths(read_list_file(pkg_name));
+    bool runtime_sensitive = files_touch_runtime_linker_state(installed_files);
+    bool selinux_policy_touched = file_list_touches_selinux_policy_store(installed_files);
+    bool kernel_payload = file_list_contains_kernel_payload(installed_files);
+    std::string kernel_release = kernel_release_from_file_list(installed_files);
+    std::string kernel_image_path = kernel_image_path_for_release(kernel_release);
+
+    if (!set_package_status_record(
+            pkg_name,
+            record.want.empty() ? "install" : record.want,
+            record.flag.empty() ? "ok" : record.flag,
+            "half-configured",
+            current_version)) {
+        std::cerr << "E: Failed to record half-configured package state." << std::endl;
+        return false;
+    }
+
+    if (!finalize_runtime_linker_state_for_success(runtime_sensitive)) {
+        return report_configure_failure(
+            pkg_name,
+            "ldconfig failed before configuring " + pkg_name + "."
+        );
+    }
+
+    std::string installed_postinst = get_info_dir() + pkg_name + ".postinst";
+    if (access(installed_postinst.c_str(), X_OK) == 0) {
+        std::vector<std::string> postinst_args = build_postinst_configure_arguments(old_version);
+        if (run_maintainer_script_with_args(
+                installed_postinst,
+                "postinst",
+                pkg_name,
+                json_path,
+                postinst_args
+            ) != 0) {
+            return report_configure_failure(pkg_name, "postinst failed.");
+        }
+    }
+
+    if (kernel_payload) {
+        if (!sync_kernel_boot_symlink()) {
+            return report_configure_failure(
+                pkg_name,
+                "Failed to update /boot/kernel after installing " + pkg_name + "."
+            );
+        }
+        if (!run_depmod_for_kernel_release(kernel_release, false)) {
+            return report_configure_failure(
+                pkg_name,
+                "depmod failed after installing kernel " + kernel_release + "."
+            );
+        }
+        std::vector<std::string> kernel_postinst_args =
+            build_postinst_configure_arguments(old_version);
+        if (!run_kernel_hook_directories("postinst", kernel_release, kernel_image_path, kernel_postinst_args)) {
+            return report_configure_failure(
+                pkg_name,
+                "Kernel postinst hooks failed for " + pkg_name + "."
+            );
+        }
+    }
+    finish_phase(postinst_seconds);
+
+    std::string selinux_error;
+    if (!installed_files.empty()) {
+        if (g_defer_selinux_relabel) {
+            if (!finalize_selinux_relabel_for_success(installed_files, &selinux_error)) {
+                return report_configure_failure(pkg_name, selinux_error);
+            }
+        } else if (!restorecon_transaction_paths(installed_files, &selinux_error)) {
+            return report_configure_failure(pkg_name, selinux_error);
+        }
+    }
+
+    if (selinux_policy_touched) {
+        std::vector<InstallRollbackEntry> no_rollback;
+        if (!schedule_selinux_autorelabel(no_rollback, &selinux_error)) {
+            return report_configure_failure(pkg_name, selinux_error);
+        }
+    }
+
+    if (!set_package_status_record(
+            pkg_name,
+            record.want.empty() ? "install" : record.want,
+            record.flag.empty() ? "ok" : record.flag,
+            "installed",
+            current_version)) {
+        std::cerr << "E: Failed to finalize package status after configuration." << std::endl;
+        return false;
+    }
+    finish_phase(cleanup_seconds);
+    invalidate_installed_manifest_snapshot();
+
+    if (g_verbose) {
+        double total_seconds = std::chrono::duration<double>(InstallClock::now() - total_start).count();
+        VLOG("Configure timing for " << pkg_name
+             << ": postinst=" << format_phase_seconds(postinst_seconds)
+             << ", cleanup=" << format_phase_seconds(cleanup_seconds)
+             << ", total=" << format_phase_seconds(total_seconds));
+    }
+    return true;
+}
+
 bool action_install(const std::string& pkg_file) {
     using InstallClock = std::chrono::steady_clock;
     auto total_start = InstallClock::now();
@@ -8092,6 +8236,29 @@ bool action_install(const std::string& pkg_file) {
     }
 
     // 7. Postinst
+    if (g_defer_configure) {
+        finish_phase(metadata_seconds);
+        finish_phase(postinst_seconds);
+        finish_phase(cleanup_seconds);
+        invalidate_installed_manifest_snapshot();
+        discard_install_backups(install_rollback_entries);
+        status_guard.commit();
+
+        if (g_verbose) {
+            double total_seconds = std::chrono::duration<double>(InstallClock::now() - total_start).count();
+            VLOG("Install timing for " << pkg_name
+                 << ": unpack=" << format_phase_seconds(unpack_seconds)
+                 << ", preinst=" << format_phase_seconds(preinst_seconds)
+                 << ", apply=" << format_phase_seconds(apply_seconds)
+                 << ", metadata=" << format_phase_seconds(metadata_seconds)
+                 << ", postinst=" << format_phase_seconds(postinst_seconds)
+                 << ", cleanup=" << format_phase_seconds(cleanup_seconds)
+                 << ", total=" << format_phase_seconds(total_seconds)
+                 << " (configure deferred)");
+        }
+        return true;
+    }
+
     std::string installed_postinst = get_info_dir() + pkg_name + ".postinst";
     if (!set_package_status_record(pkg_name, "install", "ok", "half-configured", new_version)) {
          rollback_install_changes(install_rollback_entries);
@@ -8386,13 +8553,14 @@ int main(int argc, char* argv[]) {
 
     if (argc < 2) {
 
-        std::cout << "Usage: gpkg-worker [options]\nOptions:\n  --install <file>\n  --remove <pkg>\n  --purge <pkg>\n  --retire <pkg>\n  --verify <pkg>\n  --hydrate-control-metadata <pkg>\n  --compat-dpkg [dpkg args...]\n  --compat-dpkg-query [dpkg-query args...]\n  --compat-dpkg-trigger [dpkg-trigger args...]\n  --compat-update-rc.d [update-rc.d args...]\n  --compat-invoke-rc.d [invoke-rc.d args...]\n  --compat-service [service args...]\n  --compat-systemctl [systemctl args...]\n  --compat-deb-systemd-invoke [args...]\n  --compat-initctl [args...]\n  --refresh-dpkg-trigger-state\n  --refresh-runtime-linker-state\n  --refresh-selinux-label-state\n  --register-file <path> --pkg <name>\n  --register-undo <cmd> --pkg <name>\n  --jobs <n>\n  --defer-runtime-linker-refresh\n  --defer-selinux-relabel\n  --unsafe-io\n";
+        std::cout << "Usage: gpkg-worker [options]\nOptions:\n  --install <file>\n  --configure <pkg> [old-version]\n  --remove <pkg>\n  --purge <pkg>\n  --retire <pkg>\n  --verify <pkg>\n  --hydrate-control-metadata <pkg>\n  --compat-dpkg [dpkg args...]\n  --compat-dpkg-query [dpkg-query args...]\n  --compat-dpkg-trigger [dpkg-trigger args...]\n  --compat-update-rc.d [update-rc.d args...]\n  --compat-invoke-rc.d [invoke-rc.d args...]\n  --compat-service [service args...]\n  --compat-systemctl [systemctl args...]\n  --compat-deb-systemd-invoke [args...]\n  --compat-initctl [args...]\n  --refresh-dpkg-trigger-state\n  --refresh-runtime-linker-state\n  --refresh-selinux-label-state\n  --register-file <path> --pkg <name>\n  --register-undo <cmd> --pkg <name>\n  --jobs <n>\n  --defer-runtime-linker-refresh\n  --defer-selinux-relabel\n  --defer-configure\n  --unsafe-io\n";
 
         return 1;
 
     }
 
     std::string mode, target, pkg_name;
+    std::string configure_old_version;
     g_unsafe_io = env_var_is_truthy(getenv("GPKG_UNSAFE_IO"));
 
     for (int i = 1; i < argc; ++i) {
@@ -8400,6 +8568,12 @@ int main(int argc, char* argv[]) {
         std::string arg = argv[i];
 
         if (arg == "--install") mode = "install", target = argv[++i];
+
+        else if (arg == "--configure") {
+            mode = "configure";
+            target = argv[++i];
+            if (i + 1 < argc && argv[i + 1][0] != '-') configure_old_version = argv[++i];
+        }
 
         else if (arg == "--remove") mode = "remove", target = argv[++i];
 
@@ -8438,6 +8612,8 @@ int main(int argc, char* argv[]) {
 
         else if (arg == "--defer-selinux-relabel") g_defer_selinux_relabel = true;
 
+        else if (arg == "--defer-configure") g_defer_configure = true;
+
         else if (arg == "--unsafe-io") g_unsafe_io = true;
 
         else if (arg == "-v" || arg == "--verbose") g_verbose = true;
@@ -8451,6 +8627,8 @@ int main(int argc, char* argv[]) {
     if (mode == "retire" && !target.empty()) return action_retire_safe(target) ? 0 : 1;
 
     if (mode == "install" && !target.empty()) return action_install(target) ? 0 : 1;
+
+    if (mode == "configure" && !target.empty()) return action_configure(target, configure_old_version) ? 0 : 1;
 
     if (mode == "verify" && !target.empty()) return action_verify(target) ? 0 : 1;
 

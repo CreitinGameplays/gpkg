@@ -92,6 +92,37 @@ Dependency parse_dependency(const std::string& dep_str) {
     return dep;
 }
 
+bool package_name_is_runtime_bootstrap_first(const std::string& pkg_name, bool verbose) {
+    static const std::set<std::string> bootstrap_first = {
+        "libc6",
+        "libc-bin",
+        "libc-gconv-modules-extra",
+        "libgcc-s1",
+        "libstdc++6",
+        "libcrypt1",
+        "zlib1g",
+        "libzstd1",
+    };
+    return bootstrap_first.count(canonicalize_package_name(pkg_name, verbose)) != 0;
+}
+
+bool package_name_is_shell_runtime_next(const std::string& pkg_name, bool verbose) {
+    static const std::set<std::string> shell_runtime_next = {
+        "libtinfo6",
+        "libncursesw6",
+        "libreadline8t64",
+        "bash",
+        "dash",
+    };
+    return shell_runtime_next.count(canonicalize_package_name(pkg_name, verbose)) != 0;
+}
+
+int package_runtime_bootstrap_rank(const std::string& pkg_name, bool verbose) {
+    if (package_name_is_runtime_bootstrap_first(pkg_name, verbose)) return 0;
+    if (package_name_is_shell_runtime_next(pkg_name, verbose)) return 1;
+    return 2;
+}
+
 bool version_satisfies(const std::string& current_ver, const std::string& op, const std::string& req_ver) {
     if (op.empty()) return true;
 
@@ -687,24 +718,6 @@ void sort_transaction_queue_for_install(
     std::vector<std::set<size_t>> incoming(n);
     std::vector<size_t> indegree(n, 0);
 
-    static const std::set<std::string> bootstrap_first = {
-        "libc6",
-        "libc-bin",
-        "libc-gconv-modules-extra",
-        "libgcc-s1",
-        "libstdc++6",
-        "libcrypt1",
-        "zlib1g",
-        "libzstd1",
-    };
-    static const std::set<std::string> shell_runtime_next = {
-        "libtinfo6",
-        "libncursesw6",
-        "libreadline8t64",
-        "bash",
-        "dash",
-    };
-
     auto add_edge = [&](size_t from, size_t to) {
         if (from == to) return;
         if (outgoing[from].insert(to).second) {
@@ -735,8 +748,7 @@ void sort_transaction_queue_for_install(
     std::set<size_t> bootstrap_closure;
     std::vector<size_t> bootstrap_stack;
     for (size_t i = 0; i < n; ++i) {
-        std::string canonical_name = canonicalize_package_name(queue[i].name, verbose);
-        if (bootstrap_first.count(canonical_name) == 0) continue;
+        if (!package_name_is_runtime_bootstrap_first(queue[i].name, verbose)) continue;
         if (bootstrap_closure.insert(i).second) bootstrap_stack.push_back(i);
     }
     while (!bootstrap_stack.empty()) {
@@ -767,10 +779,8 @@ void sort_transaction_queue_for_install(
     std::set<std::string> completed_names;
 
     auto bootstrap_rank = [&](size_t index) {
-        std::string canonical_name = canonicalize_package_name(queue[index].name, verbose);
-
-        if (bootstrap_first.count(canonical_name) != 0) return 0;
-        if (shell_runtime_next.count(canonical_name) != 0) return 1;
+        int runtime_rank = package_runtime_bootstrap_rank(queue[index].name, verbose);
+        if (runtime_rank < 2) return runtime_rank;
 
         std::string priority = trim(queue[index].priority);
         std::transform(priority.begin(), priority.end(), priority.begin(), [](unsigned char ch) {
@@ -794,8 +804,7 @@ void sort_transaction_queue_for_install(
     auto candidate_phase = [&](size_t index) {
         if (bootstrap_closure.count(index) != 0) return 0;
 
-        std::string canonical_name = canonicalize_package_name(queue[index].name, verbose);
-        if (shell_runtime_next.count(canonical_name) != 0 &&
+        if (package_name_is_shell_runtime_next(queue[index].name, verbose) &&
             completed_names.count("libc6") == 0) {
             // Do not let shell-linked runtime libraries run ahead of libc.
             return 2;

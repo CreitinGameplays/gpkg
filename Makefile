@@ -66,7 +66,7 @@ $(BINDIR)/gpkg: $(SRCDIR)/gpkg.cpp $(GPKG_FRAGMENTS)
 	$(CXX) $(CXXFLAGS) -o $@ $< $(GPKG_LDFLAGS)
 	$(STRIP) $@
 
-$(BINDIR)/gpkg-worker: $(SRCDIR)/gpkg_worker.cpp
+$(BINDIR)/gpkg-worker: $(SRCDIR)/gpkg_worker.cpp $(GPKG_FRAGMENTS)
 	$(CXX) $(CXXFLAGS) -o $@ $< $(WORKER_LDFLAGS)
 	$(STRIP) $@
 

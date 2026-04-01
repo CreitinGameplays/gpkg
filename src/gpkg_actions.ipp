@@ -781,14 +781,18 @@ std::vector<std::string> build_worker_command_argv(
     const std::string& value,
     bool verbose,
     bool defer_runtime_refresh = false,
-    bool defer_selinux_relabel = false
+    bool defer_selinux_relabel = false,
+    bool defer_configure = false,
+    const std::vector<std::string>& extra_args = {}
 ) {
     std::string worker_command = resolve_gpkg_worker_command();
     if (worker_command.empty()) worker_command = "gpkg-worker";
     std::vector<std::string> argv = {worker_command, mode, value};
+    argv.insert(argv.end(), extra_args.begin(), extra_args.end());
     if (verbose) argv.push_back("--verbose");
     if (defer_runtime_refresh) argv.push_back("--defer-runtime-linker-refresh");
     if (defer_selinux_relabel) argv.push_back("--defer-selinux-relabel");
+    if (defer_configure) argv.push_back("--defer-configure");
     if (!ROOT_PREFIX.empty()) {
         argv.push_back("--root");
         argv.push_back(ROOT_PREFIX);
@@ -796,9 +800,13 @@ std::vector<std::string> build_worker_command_argv(
     return argv;
 }
 
-InstallCommandResult install_package_from_file(const std::string& pkg_file, bool verbose) {
+InstallCommandResult install_package_from_file(
+    const std::string& pkg_file,
+    bool verbose,
+    bool defer_configure = false
+) {
     CommandCaptureResult result = run_command_captured_argv(
-        build_worker_command_argv("--install", pkg_file, verbose, true, true),
+        build_worker_command_argv("--install", pkg_file, verbose, true, true, defer_configure),
         verbose,
         "gpkg-install"
     );
@@ -812,6 +820,28 @@ InstallCommandResult hydrate_control_metadata_by_name(const std::string& pkg_nam
         verbose,
         "gpkg-hydrate-control-metadata"
     );
+    return {result.exit_code == 0, result.log_path};
+}
+
+InstallCommandResult configure_package_by_name(
+    const std::string& pkg_name,
+    const std::string& previous_version,
+    bool verbose
+) {
+    CommandCaptureResult result = run_command_captured_argv(
+        build_worker_command_argv(
+            "--configure",
+            pkg_name,
+            verbose,
+            false,
+            true,
+            false,
+            {previous_version}
+        ),
+        verbose,
+        "gpkg-configure"
+    );
+    if (result.exit_code == 0) queue_selinux_label_state_refresh();
     return {result.exit_code == 0, result.log_path};
 }
 
@@ -1136,8 +1166,31 @@ bool prepare_install_archives(
     return failures.empty();
 }
 
-InstallCommandResult install_package_v2(const PackageMetadata& meta, bool verbose) {
-    return install_package_from_file(get_install_archive_path(meta), verbose);
+InstallCommandResult install_package_v2(
+    const PackageMetadata& meta,
+    bool verbose,
+    bool defer_configure = false
+) {
+    return install_package_from_file(get_install_archive_path(meta), verbose, defer_configure);
+}
+
+struct DeferredConfigureEntry {
+    PackageMetadata meta;
+    std::string previous_version;
+};
+
+size_t runtime_bootstrap_boundary_index(
+    const std::vector<PackageMetadata>& queue,
+    bool verbose
+) {
+    size_t last_index = queue.size();
+    bool found = false;
+    for (size_t i = 0; i < queue.size(); ++i) {
+        if (package_runtime_bootstrap_rank(queue[i].name, verbose) >= 2) continue;
+        last_index = i;
+        found = true;
+    }
+    return found ? last_index : queue.size();
 }
 
 bool parse_decimal_u64(const std::string& text, uint64_t* out) {
@@ -3149,6 +3202,8 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
     std::vector<std::string> failures;
     size_t install_progress_width = 0;
     bool mutated_runtime_state = false;
+    std::vector<DeferredConfigureEntry> deferred_configures;
+    size_t bootstrap_boundary = runtime_bootstrap_boundary_index(upgrade_queue, verbose);
     std::cout << Color::CYAN << "[*] Installing " << upgrade_queue.size()
               << " package(s)..." << Color::RESET << std::endl;
     for (size_t i = 0; i < upgrade_queue.size(); ++i) {
@@ -3157,8 +3212,12 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
             continue;
         }
 
+        bool defer_configure = bootstrap_boundary != upgrade_queue.size() && i <= bootstrap_boundary;
+        std::string previous_version;
+        get_local_installed_package_version(upgrade_queue[i].name, &previous_version, &context);
+
         if (!verbose) render_package_progress("current", i, upgrade_queue.size(), upgrade_queue[i].name, &install_progress_width);
-        InstallCommandResult result = install_package_v2(upgrade_queue[i], verbose);
+        InstallCommandResult result = install_package_v2(upgrade_queue[i], verbose, defer_configure);
         if (!result.success) {
             if (!verbose) finish_progress_line(&install_progress_width);
             std::cerr << Color::RED << "E: Failed to install " << upgrade_queue[i].name
@@ -3172,47 +3231,85 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
         }
 
         mutated_runtime_state = true;
-        queue_triggers_for_package(upgrade_queue[i].name);
-        if (!update_package_auto_install_state_after_install(
-                upgrade_queue[i].name,
-                explicit_target_names.count(upgrade_queue[i].name) != 0 &&
-                    context.exact_live_packages.count(upgrade_queue[i].name) == 0,
-                context.exact_live_packages)) {
-            if (!verbose) finish_progress_line(&install_progress_width);
-            std::cerr << Color::RED << "E: Failed to update gpkg auto-install state for "
-                      << upgrade_queue[i].name << Color::RESET << std::endl;
-            failures.push_back(upgrade_queue[i].name);
-            break;
+        if (defer_configure) deferred_configures.push_back({upgrade_queue[i], previous_version});
+
+        auto finalize_package = [&](const PackageMetadata& meta) -> bool {
+            queue_triggers_for_package(meta.name);
+            if (!update_package_auto_install_state_after_install(
+                    meta.name,
+                    explicit_target_names.count(meta.name) != 0 &&
+                        context.exact_live_packages.count(meta.name) == 0,
+                    context.exact_live_packages)) {
+                if (!verbose) finish_progress_line(&install_progress_width);
+                std::cerr << Color::RED << "E: Failed to update gpkg auto-install state for "
+                          << meta.name << Color::RESET << std::endl;
+                failures.push_back(meta.name);
+                return false;
+            }
+            std::vector<std::string> retirements;
+            if (should_retire_after_install(upgrade_plan, meta.name, retirements)) {
+                for (const auto& retired_pkg : retirements) {
+                    std::vector<std::string> retired_files = read_installed_file_list(retired_pkg);
+                    InstallCommandResult retire_result = retire_package_by_name(retired_pkg, verbose);
+                    if (!retire_result.success) {
+                        if (!verbose) finish_progress_line(&install_progress_width);
+                        std::cerr << Color::RED << "E: Failed to retire replaced package " << retired_pkg
+                                  << Color::RESET;
+                        if (!verbose && !retire_result.log_path.empty()) {
+                            std::cerr << " (see " << retire_result.log_path << ")";
+                        }
+                        std::cerr << std::endl;
+                        failures.push_back(retired_pkg);
+                        return false;
+                    }
+                    check_triggers(retired_files);
+                    if (!erase_package_auto_installed_state(retired_pkg)) {
+                        if (!verbose) finish_progress_line(&install_progress_width);
+                        std::cerr << Color::RED << "E: Failed to update gpkg auto-install state for "
+                                  << retired_pkg << Color::RESET << std::endl;
+                        failures.push_back(retired_pkg);
+                        return false;
+                    }
+                    mutated_runtime_state = true;
+                }
+            }
+            ++installed_count;
+            return true;
+        };
+
+        if (!defer_configure) {
+            if (!finalize_package(upgrade_queue[i])) break;
         }
-        std::vector<std::string> retirements;
-        if (should_retire_after_install(upgrade_plan, upgrade_queue[i].name, retirements)) {
-            for (const auto& retired_pkg : retirements) {
-                std::vector<std::string> retired_files = read_installed_file_list(retired_pkg);
-                InstallCommandResult retire_result = retire_package_by_name(retired_pkg, verbose);
-                if (!retire_result.success) {
+
+        if (bootstrap_boundary != upgrade_queue.size() && i == bootstrap_boundary && failures.empty()) {
+            if (run_ldconfig_trigger(verbose, resolve_gpkg_worker_command()) != 0) {
+                if (!verbose) finish_progress_line(&install_progress_width);
+                failures.push_back("gpkg-worker --refresh-runtime-linker-state");
+                std::cerr << Color::RED
+                          << "E: Failed to refresh the runtime linker state before configuring deferred packages."
+                          << Color::RESET << std::endl;
+                break;
+            }
+            for (const auto& deferred : deferred_configures) {
+                InstallCommandResult configure_result =
+                    configure_package_by_name(deferred.meta.name, deferred.previous_version, verbose);
+                if (!configure_result.success) {
                     if (!verbose) finish_progress_line(&install_progress_width);
-                    std::cerr << Color::RED << "E: Failed to retire replaced package " << retired_pkg
+                    std::cerr << Color::RED << "E: Failed to configure " << deferred.meta.name
                               << Color::RESET;
-                    if (!verbose && !retire_result.log_path.empty()) {
-                        std::cerr << " (see " << retire_result.log_path << ")";
+                    if (!verbose && !configure_result.log_path.empty()) {
+                        std::cerr << " (see " << configure_result.log_path << ")";
                     }
                     std::cerr << std::endl;
-                    failures.push_back(retired_pkg);
+                    failures.push_back(deferred.meta.name);
                     break;
                 }
-                check_triggers(retired_files);
-                if (!erase_package_auto_installed_state(retired_pkg)) {
-                    if (!verbose) finish_progress_line(&install_progress_width);
-                    std::cerr << Color::RED << "E: Failed to update gpkg auto-install state for "
-                              << retired_pkg << Color::RESET << std::endl;
-                    failures.push_back(retired_pkg);
-                    break;
-                }
-                mutated_runtime_state = true;
+                if (!finalize_package(deferred.meta)) break;
             }
+            deferred_configures.clear();
             if (!failures.empty()) break;
         }
-        ++installed_count;
+
         if (!verbose) render_package_progress("current", i + 1, upgrade_queue.size(), upgrade_queue[i].name, &install_progress_width);
     }
     if (!verbose) {
@@ -4024,9 +4121,15 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
               << " package(s)..." << Color::RESET << std::endl;
     size_t installed_count = 0;
     size_t install_progress_width = 0;
+    std::vector<DeferredConfigureEntry> deferred_configures;
+    size_t bootstrap_boundary = runtime_bootstrap_boundary_index(install_queue, verbose);
     for (size_t i = 0; i < install_queue.size(); ++i) {
+        bool defer_configure = bootstrap_boundary != install_queue.size() && i <= bootstrap_boundary;
+        std::string previous_version;
+        get_local_installed_package_version(install_queue[i].name, &previous_version, nullptr);
+
         if (!verbose) render_package_progress("current", i, install_queue.size(), install_queue[i].name, &install_progress_width);
-        InstallCommandResult result = install_package_v2(install_queue[i], verbose);
+        InstallCommandResult result = install_package_v2(install_queue[i], verbose, defer_configure);
         if (!result.success) {
             if (!verbose) finish_progress_line(&install_progress_width);
             if (mutated_runtime_state) queue_runtime_linker_state_refresh();
@@ -4040,45 +4143,82 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
             return 1;
         }
         mutated_runtime_state = true;
-        queue_triggers_for_package(install_queue[i].name);
-        if (!update_package_auto_install_state_after_install(
-                install_queue[i].name,
-                explicit_manual_targets.count(install_queue[i].name) != 0,
-                installed_cache)) {
-            if (!verbose) finish_progress_line(&install_progress_width);
-            if (mutated_runtime_state) queue_runtime_linker_state_refresh();
-            std::cerr << Color::RED << "E: Failed to update gpkg auto-install state for "
-                      << install_queue[i].name << Color::RESET << std::endl;
-            return 1;
+        if (defer_configure) deferred_configures.push_back({install_queue[i], previous_version});
+
+        auto finalize_package = [&](const PackageMetadata& meta) -> bool {
+            queue_triggers_for_package(meta.name);
+            if (!update_package_auto_install_state_after_install(
+                    meta.name,
+                    explicit_manual_targets.count(meta.name) != 0,
+                    installed_cache)) {
+                if (!verbose) finish_progress_line(&install_progress_width);
+                if (mutated_runtime_state) queue_runtime_linker_state_refresh();
+                std::cerr << Color::RED << "E: Failed to update gpkg auto-install state for "
+                          << meta.name << Color::RESET << std::endl;
+                return false;
+            }
+            std::vector<std::string> retirements;
+            if (should_retire_after_install(install_plan, meta.name, retirements)) {
+                for (const auto& retired_pkg : retirements) {
+                    std::vector<std::string> retired_files = read_installed_file_list(retired_pkg);
+                    InstallCommandResult retire_result = retire_package_by_name(retired_pkg, verbose);
+                    if (!retire_result.success) {
+                        if (!verbose) finish_progress_line(&install_progress_width);
+                        if (mutated_runtime_state) queue_runtime_linker_state_refresh();
+                        std::cerr << Color::RED << "E: Failed to retire replaced package " << retired_pkg
+                                  << Color::RESET;
+                        if (!verbose && !retire_result.log_path.empty()) {
+                            std::cerr << " See " << retire_result.log_path << " for details.";
+                        }
+                        std::cerr << std::endl;
+                        return false;
+                    }
+                    check_triggers(retired_files);
+                    if (!erase_package_auto_installed_state(retired_pkg)) {
+                        if (!verbose) finish_progress_line(&install_progress_width);
+                        if (mutated_runtime_state) queue_runtime_linker_state_refresh();
+                        std::cerr << Color::RED << "E: Failed to update gpkg auto-install state for "
+                                  << retired_pkg << Color::RESET << std::endl;
+                        return false;
+                    }
+                    mutated_runtime_state = true;
+                }
+            }
+            ++installed_count;
+            return true;
+        };
+
+        if (!defer_configure) {
+            if (!finalize_package(install_queue[i])) return 1;
         }
-        std::vector<std::string> retirements;
-        if (should_retire_after_install(install_plan, install_queue[i].name, retirements)) {
-            for (const auto& retired_pkg : retirements) {
-                std::vector<std::string> retired_files = read_installed_file_list(retired_pkg);
-                InstallCommandResult retire_result = retire_package_by_name(retired_pkg, verbose);
-                if (!retire_result.success) {
+
+        if (bootstrap_boundary != install_queue.size() && i == bootstrap_boundary) {
+            if (run_ldconfig_trigger(verbose, resolve_gpkg_worker_command()) != 0) {
+                if (!verbose) finish_progress_line(&install_progress_width);
+                if (mutated_runtime_state) queue_runtime_linker_state_refresh();
+                std::cerr << Color::RED
+                          << "E: Failed to refresh the runtime linker state before configuring deferred packages."
+                          << Color::RESET << std::endl;
+                return 1;
+            }
+            for (const auto& deferred : deferred_configures) {
+                InstallCommandResult configure_result =
+                    configure_package_by_name(deferred.meta.name, deferred.previous_version, verbose);
+                if (!configure_result.success) {
                     if (!verbose) finish_progress_line(&install_progress_width);
                     if (mutated_runtime_state) queue_runtime_linker_state_refresh();
-                    std::cerr << Color::RED << "E: Failed to retire replaced package " << retired_pkg
+                    std::cerr << Color::RED << "E: Failed to configure " << deferred.meta.name
                               << Color::RESET;
-                    if (!verbose && !retire_result.log_path.empty()) {
-                        std::cerr << " See " << retire_result.log_path << " for details.";
+                    if (!verbose && !configure_result.log_path.empty()) {
+                        std::cerr << " See " << configure_result.log_path << " for details.";
                     }
                     std::cerr << std::endl;
                     return 1;
                 }
-                check_triggers(retired_files);
-                if (!erase_package_auto_installed_state(retired_pkg)) {
-                    if (!verbose) finish_progress_line(&install_progress_width);
-                    if (mutated_runtime_state) queue_runtime_linker_state_refresh();
-                    std::cerr << Color::RED << "E: Failed to update gpkg auto-install state for "
-                              << retired_pkg << Color::RESET << std::endl;
-                    return 1;
-                }
-                mutated_runtime_state = true;
+                if (!finalize_package(deferred.meta)) return 1;
             }
+            deferred_configures.clear();
         }
-        ++installed_count;
         if (!verbose) render_package_progress("current", i + 1, install_queue.size(), install_queue[i].name, &install_progress_width);
     }
     if (!verbose) finish_progress_line(&install_progress_width);
