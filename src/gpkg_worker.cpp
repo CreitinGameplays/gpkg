@@ -726,6 +726,17 @@ int run_executable(const std::vector<std::string>& argv) {
         }
         cargv.push_back(nullptr);
         execv(argv.front().c_str(), cargv.data());
+        if (errno == ENOEXEC && access("/bin/sh", X_OK) == 0) {
+            std::vector<char*> sh_argv;
+            sh_argv.reserve(argv.size() + 2);
+            sh_argv.push_back(const_cast<char*>("/bin/sh"));
+            sh_argv.push_back(const_cast<char*>(argv.front().c_str()));
+            for (size_t i = 1; i < argv.size(); ++i) {
+                sh_argv.push_back(const_cast<char*>(argv[i].c_str()));
+            }
+            sh_argv.push_back(nullptr);
+            execv("/bin/sh", sh_argv.data());
+        }
         _exit(127);
     }
 
@@ -2360,6 +2371,76 @@ std::string current_worker_executable_path() {
     return std::string(buffer.data(), static_cast<size_t>(len));
 }
 
+std::string render_maintainer_script_params(const std::vector<std::string>& args) {
+    std::ostringstream rendered;
+    for (size_t i = 0; i < args.size(); ++i) {
+        if (i != 0) rendered << " ";
+        rendered << shell_quote(args[i]);
+    }
+    return rendered.str();
+}
+
+std::string maintscript_default_home() {
+    if (g_root_prefix.empty()) return "/root";
+    std::string candidate = g_root_prefix + "/root";
+    struct stat st {};
+    if (stat(candidate.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) return candidate;
+    return g_root_prefix + "/";
+}
+
+std::string maintscript_default_tmpdir() {
+    const std::string candidate = g_root_prefix + "/tmp";
+    struct stat st {};
+    if (stat(candidate.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) return candidate;
+    return "/tmp";
+}
+
+std::string compat_dpkg_admindir() {
+    return g_root_prefix + "/var/lib/gpkg";
+}
+
+std::string compat_dpkg_running_version() {
+    return "1.22.21+gpkg1";
+}
+
+std::string build_maintscript_search_path(const std::string& wrapper_dir) {
+    std::vector<std::string> parts;
+    std::set<std::string> seen;
+
+    auto append = [&](const std::string& entry) {
+        std::string value = trim(entry);
+        if (value.empty()) return;
+        if (!seen.insert(value).second) return;
+        parts.push_back(value);
+    };
+
+    append(wrapper_dir);
+
+    const char* current_path = getenv("PATH");
+    if (current_path && *current_path) {
+        for (const auto& segment : split_preserve_empty_local(current_path, ':')) {
+            append(segment);
+        }
+    }
+
+    const char* standard_paths[] = {
+        "/usr/local/sbin",
+        "/usr/local/bin",
+        "/usr/sbin",
+        "/usr/bin",
+        "/sbin",
+        "/bin",
+    };
+    for (const char* standard_path : standard_paths) append(standard_path);
+
+    std::ostringstream rendered;
+    for (size_t i = 0; i < parts.size(); ++i) {
+        if (i != 0) rendered << ":";
+        rendered << parts[i];
+    }
+    return rendered.str();
+}
+
 bool maintscript_dialog_frontend_available() {
     if (!g_root_prefix.empty()) return false;
     const char* candidates[] = {
@@ -2405,10 +2486,14 @@ struct ScopedMaintainerScriptCompat {
         };
 
         const CompatWrapperSpec wrappers[] = {
+            {"dpkg", "--compat-dpkg"},
             {"dpkg-query", "--compat-dpkg-query"},
             {"update-rc.d", "--compat-update-rc.d"},
             {"invoke-rc.d", "--compat-invoke-rc.d"},
             {"service", "--compat-service"},
+            {"systemctl", "--compat-systemctl"},
+            {"deb-systemd-invoke", "--compat-deb-systemd-invoke"},
+            {"initctl", "--compat-initctl"},
         };
 
         bool wrappers_ok = true;
@@ -2434,10 +2519,7 @@ struct ScopedMaintainerScriptCompat {
             return;
         }
 
-        const char* current_path = getenv("PATH");
-        std::string updated_path = wrapper_dir;
-        if (current_path && *current_path) updated_path += ":" + std::string(current_path);
-        env.set("PATH", updated_path);
+        env.set("PATH", build_maintscript_search_path(wrapper_dir));
     }
 
     ~ScopedMaintainerScriptCompat() {
@@ -2464,6 +2546,7 @@ int run_maintainer_script_with_args(
         read_maintscript_package_name_from_metadata_path(metadata_path, fallback_pkg_name);
     if (maintscript_package.empty()) maintscript_package = fallback_pkg_name;
     std::string maintscript_arch = read_maintscript_package_arch_from_metadata_path(metadata_path);
+    std::string maintscript_version = read_json_string_from_metadata_path(metadata_path, "version");
 
     ScopedEnvOverrides env;
     ScopedMaintainerScriptCompat compat(current_worker_executable_path(), g_root_prefix, g_verbose);
@@ -2473,11 +2556,76 @@ int run_maintainer_script_with_args(
     }
     if (!maintscript_arch.empty()) env.set("DPKG_MAINTSCRIPT_ARCH", maintscript_arch);
     env.set("DPKG_MAINTSCRIPT_PACKAGE_REFCOUNT", "1");
+    env.set("DPKG_ADMINDIR", compat_dpkg_admindir());
+    env.set("DPKG_RUNNING_VERSION", compat_dpkg_running_version());
     if (!g_root_prefix.empty()) env.set("DPKG_ROOT", g_root_prefix);
+    env.set("DEB_MAINT_PARAMS", render_maintainer_script_params(args));
     std::string debconf_frontend = default_maintscript_debian_frontend();
     if (!debconf_frontend.empty()) env.set("DEBIAN_FRONTEND", debconf_frontend);
+    if (!maintscript_version.empty()) env.set("GPKG_MAINTSCRIPT_VERSION", maintscript_version);
+    if (!getenv("SHELL") || !*getenv("SHELL")) env.set("SHELL", "/bin/sh");
+    if (!getenv("HOME") || !*getenv("HOME")) env.set("HOME", maintscript_default_home());
+    if (!getenv("TMPDIR") || !*getenv("TMPDIR")) env.set("TMPDIR", maintscript_default_tmpdir());
 
     return run_path_with_args(script_path, args);
+}
+
+std::string installed_maintainer_script_path(
+    const std::string& pkg_name,
+    const std::string& script_name
+) {
+    return get_info_dir() + pkg_name + "." + script_name;
+}
+
+std::string extracted_maintainer_script_path(const std::string& script_name) {
+    return g_tmp_extract_path + "scripts/" + script_name;
+}
+
+int run_optional_maintainer_script_with_args(
+    const std::string& script_path,
+    const std::string& script_name,
+    const std::string& fallback_pkg_name,
+    const std::string& metadata_path,
+    const std::vector<std::string>& args = {}
+) {
+    if (access(script_path.c_str(), X_OK) != 0) return 0;
+    return run_maintainer_script_with_args(
+        script_path,
+        script_name,
+        fallback_pkg_name,
+        metadata_path,
+        args
+    );
+}
+
+bool run_optional_maintainer_script_with_reporting(
+    const std::string& script_path,
+    const std::string& script_name,
+    const std::string& fallback_pkg_name,
+    const std::string& metadata_path,
+    const std::vector<std::string>& args,
+    const std::string& label,
+    bool best_effort,
+    int* rc_out = nullptr
+) {
+    if (rc_out) *rc_out = 0;
+    if (access(script_path.c_str(), X_OK) != 0) return true;
+
+    int rc = run_maintainer_script_with_args(
+        script_path,
+        script_name,
+        fallback_pkg_name,
+        metadata_path,
+        args
+    );
+    if (rc_out) *rc_out = rc;
+    if (rc == 0) return true;
+
+    std::cerr << (best_effort ? "W: " : "E: ")
+              << label << " failed";
+    if (!fallback_pkg_name.empty()) std::cerr << " for " << fallback_pkg_name;
+    std::cerr << "." << std::endl;
+    return false;
 }
 
 bool compat_status_is_installed_like(const std::string& status) {
@@ -3315,6 +3463,170 @@ std::vector<std::string> compat_package_control_names(const CompatDpkgPackageInf
     return names;
 }
 
+struct CompatDebianVersion {
+    long long epoch = 0;
+    std::string upstream;
+    std::string revision;
+};
+
+int compat_debian_char_order(char c) {
+    if (c == '~') return -1;
+    if (c == '\0') return 0;
+    if (std::isalpha(static_cast<unsigned char>(c))) return static_cast<unsigned char>(c);
+    return static_cast<unsigned char>(c) + 256;
+}
+
+int compat_compare_debian_part(const std::string& left, const std::string& right) {
+    size_t i = 0;
+    size_t j = 0;
+
+    while (i < left.size() || j < right.size()) {
+        while ((i < left.size() && !std::isdigit(static_cast<unsigned char>(left[i]))) ||
+               (j < right.size() && !std::isdigit(static_cast<unsigned char>(right[j])))) {
+            char lc = (i < left.size() && !std::isdigit(static_cast<unsigned char>(left[i])))
+                ? left[i]
+                : '\0';
+            char rc = (j < right.size() && !std::isdigit(static_cast<unsigned char>(right[j])))
+                ? right[j]
+                : '\0';
+            int lo = compat_debian_char_order(lc);
+            int ro = compat_debian_char_order(rc);
+            if (lo < ro) return -1;
+            if (lo > ro) return 1;
+            if (lc != '\0') ++i;
+            if (rc != '\0') ++j;
+        }
+
+        while (i < left.size() && left[i] == '0') ++i;
+        while (j < right.size() && right[j] == '0') ++j;
+
+        size_t left_digits_start = i;
+        size_t right_digits_start = j;
+        while (i < left.size() && std::isdigit(static_cast<unsigned char>(left[i]))) ++i;
+        while (j < right.size() && std::isdigit(static_cast<unsigned char>(right[j]))) ++j;
+
+        size_t left_digits_len = i - left_digits_start;
+        size_t right_digits_len = j - right_digits_start;
+        if (left_digits_len < right_digits_len) return -1;
+        if (left_digits_len > right_digits_len) return 1;
+
+        for (size_t k = 0; k < left_digits_len; ++k) {
+            char lc = left[left_digits_start + k];
+            char rc = right[right_digits_start + k];
+            if (lc < rc) return -1;
+            if (lc > rc) return 1;
+        }
+    }
+
+    return 0;
+}
+
+CompatDebianVersion compat_parse_debian_version(const std::string& version) {
+    CompatDebianVersion parsed;
+    std::string remainder = version;
+
+    size_t epoch_sep = version.find(':');
+    if (epoch_sep != std::string::npos) {
+        std::string epoch_str = version.substr(0, epoch_sep);
+        if (!epoch_str.empty()) parsed.epoch = std::strtoll(epoch_str.c_str(), nullptr, 10);
+        remainder = version.substr(epoch_sep + 1);
+    }
+
+    size_t revision_sep = remainder.rfind('-');
+    if (revision_sep != std::string::npos) {
+        parsed.upstream = remainder.substr(0, revision_sep);
+        parsed.revision = remainder.substr(revision_sep + 1);
+    } else {
+        parsed.upstream = remainder;
+        parsed.revision.clear();
+    }
+
+    return parsed;
+}
+
+int compat_compare_versions(const std::string& left, const std::string& right) {
+    if (left == right) return 0;
+
+    CompatDebianVersion parsed_left = compat_parse_debian_version(left);
+    CompatDebianVersion parsed_right = compat_parse_debian_version(right);
+    if (parsed_left.epoch < parsed_right.epoch) return -1;
+    if (parsed_left.epoch > parsed_right.epoch) return 1;
+
+    int upstream_cmp = compat_compare_debian_part(parsed_left.upstream, parsed_right.upstream);
+    if (upstream_cmp != 0) return upstream_cmp;
+    return compat_compare_debian_part(parsed_left.revision, parsed_right.revision);
+}
+
+bool compat_version_relation_matches(int cmp, const std::string& relation) {
+    if (relation == "lt" || relation == "<<") return cmp < 0;
+    if (relation == "le" || relation == "<=") return cmp <= 0;
+    if (relation == "eq" || relation == "=") return cmp == 0;
+    if (relation == "ne") return cmp != 0;
+    if (relation == "ge" || relation == ">=") return cmp >= 0;
+    if (relation == "gt" || relation == ">>") return cmp > 0;
+    return false;
+}
+
+std::string resolve_real_dpkg_path() {
+    const char* candidates[] = {
+        "/usr/bin/dpkg",
+        "/bin/dpkg",
+        "/usr/sbin/dpkg",
+        "/sbin/dpkg",
+    };
+    for (const char* candidate : candidates) {
+        if (access(candidate, X_OK) == 0) return candidate;
+    }
+    return "";
+}
+
+int run_real_dpkg_with_args(const std::vector<std::string>& args) {
+    std::string real_path = resolve_real_dpkg_path();
+    if (real_path.empty()) return 1;
+
+    std::vector<std::string> argv;
+    argv.reserve(args.size() + 1);
+    argv.push_back(real_path);
+    argv.insert(argv.end(), args.begin(), args.end());
+    return decode_command_exit_status(run_executable(argv));
+}
+
+int action_compat_dpkg(const std::vector<std::string>& raw_args) {
+    if (raw_args.empty()) return run_real_dpkg_with_args(raw_args);
+
+    std::vector<std::string> args;
+    args.reserve(raw_args.size());
+    for (size_t i = 0; i < raw_args.size(); ++i) {
+        const std::string& arg = raw_args[i];
+        if ((arg == "--admindir" || arg == "--root") && i + 1 < raw_args.size()) {
+            ++i;
+            continue;
+        }
+        if (arg.rfind("--admindir=", 0) == 0 || arg.rfind("--root=", 0) == 0) continue;
+        args.push_back(arg);
+    }
+
+    if (args.empty()) return run_real_dpkg_with_args(raw_args);
+
+    if (args.size() == 1 && args[0] == "--print-architecture") {
+        std::cout << compat_debian_architecture_for_package_arch(native_package_architecture()) << std::endl;
+        return 0;
+    }
+    if (args.size() == 1 && args[0] == "--print-foreign-architectures") {
+        return 0;
+    }
+    if (args.size() >= 1 &&
+        (args[0] == "--assert-multi-arch" || args[0] == "--assert-support-predepends")) {
+        return 0;
+    }
+    if (args.size() >= 4 && args[0] == "--compare-versions") {
+        int cmp = compat_compare_versions(args[1], args[3]);
+        return compat_version_relation_matches(cmp, args[2]) ? 0 : 1;
+    }
+
+    return run_real_dpkg_with_args(raw_args);
+}
+
 std::string resolve_real_dpkg_query_path() {
     const char* candidates[] = {
         "/usr/bin/dpkg-query",
@@ -3902,6 +4214,54 @@ bool compat_parse_service_invocation(
     return true;
 }
 
+struct CompatInvokeRcOptions {
+    bool disclose_deny = false;
+    bool query = false;
+};
+
+CompatInvokeRcOptions parse_compat_invoke_rc_options(const std::vector<std::string>& raw_args) {
+    CompatInvokeRcOptions options;
+    for (const auto& arg : raw_args) {
+        if (arg == "--disclose-deny") options.disclose_deny = true;
+        if (arg == "--query") {
+            options.query = true;
+            options.disclose_deny = true;
+        }
+    }
+    return options;
+}
+
+int compat_service_denied_exit_code(const CompatInvokeRcOptions& options) {
+    return options.disclose_deny ? 101 : 0;
+}
+
+std::string resolve_first_executable(const std::vector<std::string>& candidates) {
+    for (const auto& candidate : candidates) {
+        if (access(candidate.c_str(), X_OK) == 0) return candidate;
+    }
+    return "";
+}
+
+int run_real_executable_with_args(
+    const std::vector<std::string>& candidates,
+    const std::vector<std::string>& args
+) {
+    std::string path = resolve_first_executable(candidates);
+    if (path.empty()) return 1;
+
+    std::vector<std::string> argv;
+    argv.reserve(args.size() + 1);
+    argv.push_back(path);
+    argv.insert(argv.end(), args.begin(), args.end());
+    return decode_command_exit_status(run_executable(argv));
+}
+
+bool compat_system_service_action_is_mutating(const std::string& action) {
+    return compat_is_service_action_suppressed(action) ||
+           action == "stop" ||
+           action == "kill";
+}
+
 int action_compat_update_rc_d(const std::vector<std::string>& raw_args) {
     bool force = false;
     std::vector<std::string> operands;
@@ -3964,6 +4324,7 @@ int action_compat_update_rc_d(const std::vector<std::string>& raw_args) {
 }
 
 int action_compat_service_like(const std::vector<std::string>& raw_args) {
+    CompatInvokeRcOptions options = parse_compat_invoke_rc_options(raw_args);
     std::string service_name;
     std::string action;
     std::vector<std::string> script_args;
@@ -3972,18 +4333,22 @@ int action_compat_service_like(const std::vector<std::string>& raw_args) {
         return 1;
     }
 
-    if (!g_root_prefix.empty()) return 0;
+    if (!g_root_prefix.empty()) {
+        return options.query ? 101 : compat_service_denied_exit_code(options);
+    }
 
     if (compat_is_service_action_suppressed(action) &&
         env_var_is_truthy(getenv("GPKG_DEFER_SERVICES"))) {
-        return 0;
+        return options.query ? 101 : compat_service_denied_exit_code(options);
     }
 
     std::string script_path = compat_init_script_path(service_name);
     struct stat st {};
     if (lstat(script_path.c_str(), &st) != 0 || S_ISDIR(st.st_mode)) {
-        return 0;
+        return options.query ? 100 : 0;
     }
+
+    if (options.query) return 104;
 
     const char* shell_path = access("/bin/sh", X_OK) == 0 ? "/bin/sh" : nullptr;
     if (!shell_path) {
@@ -4005,6 +4370,53 @@ int action_compat_invoke_rc_d(const std::vector<std::string>& raw_args) {
 
 int action_compat_service(const std::vector<std::string>& raw_args) {
     return action_compat_service_like(raw_args);
+}
+
+std::string compat_extract_first_non_option(const std::vector<std::string>& raw_args) {
+    for (const auto& arg : raw_args) {
+        if (!arg.empty() && arg[0] == '-') continue;
+        return arg;
+    }
+    return "";
+}
+
+int action_compat_systemctl_like(
+    const std::vector<std::string>& raw_args,
+    const std::vector<std::string>& real_candidates
+) {
+    std::string action = compat_extract_first_non_option(raw_args);
+    bool suppressed =
+        g_root_prefix.empty()
+            ? (compat_system_service_action_is_mutating(action) &&
+               env_var_is_truthy(getenv("GPKG_DEFER_SERVICES")))
+            : true;
+
+    if (suppressed) return 0;
+
+    int real_rc = run_real_executable_with_args(real_candidates, raw_args);
+    if (real_rc == 1 && resolve_first_executable(real_candidates).empty()) return 0;
+    return real_rc;
+}
+
+int action_compat_systemctl(const std::vector<std::string>& raw_args) {
+    return action_compat_systemctl_like(
+        raw_args,
+        {"/usr/bin/systemctl", "/bin/systemctl"}
+    );
+}
+
+int action_compat_deb_systemd_invoke(const std::vector<std::string>& raw_args) {
+    return action_compat_systemctl_like(
+        raw_args,
+        {"/usr/bin/deb-systemd-invoke", "/bin/deb-systemd-invoke"}
+    );
+}
+
+int action_compat_initctl(const std::vector<std::string>& raw_args) {
+    return action_compat_systemctl_like(
+        raw_args,
+        {"/sbin/initctl", "/usr/sbin/initctl", "/bin/initctl", "/usr/bin/initctl"}
+    );
 }
 
 void populate_base_system_owner_map(std::map<std::string, std::string>& owner_by_path) {
@@ -5388,6 +5800,50 @@ bool run_registered_undo_commands_reverse(
         return false;
     }
     return true;
+}
+
+bool package_status_is_config_files_like(const std::string& status) {
+    return status == "config-files";
+}
+
+bool package_status_has_installed_history(const std::string& status) {
+    return status == "installed" ||
+           status == "half-installed" ||
+           status == "unpacked" ||
+           status == "half-configured" ||
+           status == "triggers-awaited" ||
+           status == "triggers-pending";
+}
+
+std::vector<std::string> build_preinst_arguments(
+    const std::string& previous_status,
+    const std::string& old_version,
+    const std::string& new_version
+) {
+    if (old_version.empty()) return {"install"};
+    if (package_status_is_config_files_like(previous_status)) {
+        return {"install", old_version, new_version};
+    }
+    return {"upgrade", old_version, new_version};
+}
+
+std::vector<std::string> build_postinst_configure_arguments(const std::string& old_version) {
+    return {"configure", old_version};
+}
+
+bool finalize_failed_configuration_state(
+    const std::string& pkg_name,
+    std::vector<InstallRollbackEntry>& rollback_entries,
+    PackageStatusRollbackGuard& status_guard,
+    const std::string& message
+) {
+    invalidate_installed_manifest_snapshot();
+    discard_install_backups(rollback_entries);
+    status_guard.commit();
+    std::cerr << "E: " << message << std::endl;
+    std::cerr << "E: Package " << pkg_name
+              << " remains installed in a half-configured state." << std::endl;
+    return false;
 }
 
 bool run_postinst_abort_remove(const std::string& pkg_name, bool best_effort = true) {
@@ -6858,33 +7314,125 @@ bool action_install(const std::string& pkg_file) {
         old_files_set = build_normalized_owned_path_set(read_list_file(pkg_name));
     }
 
-    if (!set_package_status_record(pkg_name, "install", "ok", "half-installed", new_version)) {
-        std::cerr << "E: Failed to record package status before installation." << std::endl;
-        return false;
-    }
-
     std::vector<ReplacedSystemFile> replaced_system_files =
         collect_replaced_system_files(pkg_name, new_files, old_files_set);
     std::vector<InstallRollbackEntry> install_rollback_entries;
     bool kernel_payload = file_list_contains_kernel_payload(new_files);
     std::string kernel_release = kernel_release_from_file_list(new_files);
     std::string kernel_image_path = kernel_image_path_for_release(kernel_release);
+    std::string previous_status =
+        status_guard.had_record ? status_guard.record.status : "not-installed";
+    bool upgrade_from_installed =
+        !old_version.empty() && package_status_has_installed_history(previous_status);
+    std::string existing_metadata_path = get_info_dir() + pkg_name + ".json";
+    std::string extracted_metadata_path = g_tmp_extract_path + "control.json";
+
+    auto run_installed_script = [&](const std::string& script_name,
+                                    const std::vector<std::string>& args) {
+        return run_optional_maintainer_script_with_args(
+            installed_maintainer_script_path(pkg_name, script_name),
+            script_name,
+            pkg_name,
+            existing_metadata_path,
+            args
+        );
+    };
+
+    auto report_installed_script = [&](const std::string& script_name,
+                                       const std::vector<std::string>& args,
+                                       const std::string& label,
+                                       bool best_effort) {
+        return run_optional_maintainer_script_with_reporting(
+            installed_maintainer_script_path(pkg_name, script_name),
+            script_name,
+            pkg_name,
+            existing_metadata_path,
+            args,
+            label,
+            best_effort
+        );
+    };
+
+    auto run_new_script = [&](const std::string& script_name,
+                              const std::vector<std::string>& args) {
+        return run_optional_maintainer_script_with_args(
+            extracted_maintainer_script_path(script_name),
+            script_name,
+            pkg_name,
+            extracted_metadata_path,
+            args
+        );
+    };
+
+    auto report_new_script = [&](const std::string& script_name,
+                                 const std::vector<std::string>& args,
+                                 const std::string& label,
+                                 bool best_effort) {
+        return run_optional_maintainer_script_with_reporting(
+            extracted_maintainer_script_path(script_name),
+            script_name,
+            pkg_name,
+            extracted_metadata_path,
+            args,
+            label,
+            best_effort
+        );
+    };
+
+    if (upgrade_from_installed) {
+        if (run_installed_script("prerm", {"upgrade", new_version}) != 0) {
+            if (!report_new_script(
+                    "prerm",
+                    {"failed-upgrade", old_version, new_version},
+                    "new prerm failed-upgrade",
+                    true)) {
+                report_installed_script(
+                    "postinst",
+                    {"abort-upgrade", new_version},
+                    "old postinst abort-upgrade",
+                    true);
+                std::cerr << "E: prerm upgrade failed." << std::endl;
+                return false;
+            }
+        }
+    }
 
     // 4. Preinst
-    std::string preinst = g_tmp_extract_path + "scripts/preinst";
-    if (access(preinst.c_str(), X_OK) == 0) {
-        std::vector<std::string> preinst_args = {is_upgrade ? "upgrade" : "install"};
-        if (is_upgrade) preinst_args.push_back(old_version);
-        if (run_maintainer_script_with_args(
-                preinst,
-                "preinst",
-                pkg_name,
-                g_tmp_extract_path + "control.json",
-                preinst_args
-            ) != 0) {
-             std::cerr << "E: preinst failed." << std::endl;
-             return false;
+    std::vector<std::string> preinst_args =
+        build_preinst_arguments(previous_status, old_version, new_version);
+    if (run_new_script("preinst", preinst_args) != 0) {
+        if (upgrade_from_installed) {
+            bool abort_upgrade_ok = report_new_script(
+                "postrm",
+                {"abort-upgrade", old_version, new_version},
+                "new postrm abort-upgrade",
+                true);
+            if (abort_upgrade_ok) {
+                report_installed_script(
+                    "postinst",
+                    {"abort-upgrade", new_version},
+                    "old postinst abort-upgrade",
+                    true);
+            }
+        } else if (!old_version.empty() && package_status_is_config_files_like(previous_status)) {
+            report_new_script(
+                "postrm",
+                {"abort-install", old_version, new_version},
+                "new postrm abort-install",
+                true);
+        } else {
+            report_new_script(
+                "postrm",
+                {"abort-install"},
+                "new postrm abort-install",
+                true);
         }
+        std::cerr << "E: preinst failed." << std::endl;
+        return false;
+    }
+    if (!set_package_status_record(pkg_name, "install", "ok", "half-installed", new_version)) {
+        std::cerr << "E: Failed to record package status before unpacking." << std::endl;
+        return false;
     }
     finish_phase(preinst_seconds);
 
@@ -6993,6 +7541,39 @@ bool action_install(const std::string& pkg_file) {
         return false;
     }
     finish_phase(apply_seconds);
+
+    if (upgrade_from_installed) {
+        if (run_installed_script("postrm", {"upgrade", new_version}) != 0) {
+            if (!report_new_script(
+                    "postrm",
+                    {"failed-upgrade", old_version, new_version},
+                    "new postrm failed-upgrade",
+                    true)) {
+                report_installed_script(
+                    "preinst",
+                    {"abort-upgrade", new_version},
+                    "old preinst abort-upgrade",
+                    true);
+                report_new_script(
+                    "postrm",
+                    {"abort-upgrade", old_version, new_version},
+                    "new postrm abort-upgrade",
+                    true);
+                report_installed_script(
+                    "postinst",
+                    {"abort-upgrade", new_version},
+                    "old postinst abort-upgrade",
+                    true);
+                rollback_install_changes(install_rollback_entries);
+                if (runtime_sensitive) {
+                    sync_multiarch_runtime_aliases();
+                    refresh_linker_cache_if_available();
+                }
+                std::cerr << "E: postrm upgrade failed." << std::endl;
+                return false;
+            }
+        }
+    }
 
     std::vector<std::string> installed_files = normalize_owned_manifest_paths(new_files);
     apply_preserved_config_metadata(installed_files, preserved_configs);
@@ -7191,76 +7772,6 @@ bool action_install(const std::string& pkg_file) {
         return false;
     }
 
-    // 7. Postinst
-    std::string installed_postinst = get_info_dir() + pkg_name + ".postinst";
-    if (!set_package_status_record(pkg_name, "install", "ok", "half-configured", new_version)) {
-         rollback_install_changes(install_rollback_entries);
-         if (runtime_sensitive) {
-             sync_multiarch_runtime_aliases();
-             refresh_linker_cache_if_available();
-         }
-         std::cerr << "E: Failed to record half-configured package state." << std::endl;
-         return false;
-    }
-    finish_phase(metadata_seconds);
-    if (access(installed_postinst.c_str(), X_OK) == 0) {
-         std::vector<std::string> postinst_args = {"configure"};
-         if (is_upgrade) postinst_args.push_back(old_version);
-         if (run_maintainer_script_with_args(
-                 installed_postinst,
-                 "postinst",
-                 pkg_name,
-                 g_tmp_extract_path + "control.json",
-                 postinst_args
-             ) != 0) {
-             std::vector<std::string> undo_cmds = load_registered_undo_commands(pkg_name);
-             if (!undo_cmds.empty()) {
-                 run_registered_undo_commands_reverse(undo_cmds, "failed postinst rollback", true);
-             }
-             rollback_install_changes(install_rollback_entries);
-             if (runtime_sensitive) {
-                 sync_multiarch_runtime_aliases();
-                 refresh_linker_cache_if_available();
-             }
-             std::cerr << "E: postinst failed." << std::endl;
-             return false;
-         }
-    }
-
-    if (kernel_payload) {
-        if (!sync_kernel_boot_symlink()) {
-            rollback_install_changes(install_rollback_entries);
-            if (runtime_sensitive) {
-                sync_multiarch_runtime_aliases();
-                refresh_linker_cache_if_available();
-            }
-            std::cerr << "E: Failed to update /boot/kernel after installing " << pkg_name << "." << std::endl;
-            return false;
-        }
-        if (!run_depmod_for_kernel_release(kernel_release, false)) {
-            rollback_install_changes(install_rollback_entries);
-            if (runtime_sensitive) {
-                sync_multiarch_runtime_aliases();
-                refresh_linker_cache_if_available();
-            }
-            std::cerr << "E: depmod failed after installing kernel " << kernel_release << "." << std::endl;
-            return false;
-        }
-        std::vector<std::string> kernel_postinst_args = {"configure"};
-        if (is_upgrade) kernel_postinst_args.push_back(old_version);
-        if (!run_kernel_hook_directories("postinst", kernel_release, kernel_image_path, kernel_postinst_args)) {
-            rollback_install_changes(install_rollback_entries);
-            if (runtime_sensitive) {
-                sync_multiarch_runtime_aliases();
-                refresh_linker_cache_if_available();
-            }
-            std::cerr << "E: Kernel postinst hooks failed for " << pkg_name << "." << std::endl;
-            return false;
-        }
-    }
-    finish_phase(postinst_seconds);
-
-    // 8. Cleanup Orphans (Upgrade only)
     if (is_upgrade) {
         std::set<std::string> new_files_set(installed_files.begin(), installed_files.end());
         std::set<std::string> preserved_original_paths;
@@ -7274,10 +7785,8 @@ bool action_install(const std::string& pkg_file) {
                 orphans.push_back(old);
             }
         }
-        
-        // Remove orphans in reverse order (deepest first)
-        std::sort(orphans.rbegin(), orphans.rend()); 
-        
+
+        std::sort(orphans.rbegin(), orphans.rend());
         if (!orphans.empty()) {
             VLOG("Cleaning up " << orphans.size() << " orphaned files...");
             for (const auto& orphan : orphans) {
@@ -7285,6 +7794,66 @@ bool action_install(const std::string& pkg_file) {
             }
         }
     }
+
+    // 7. Postinst
+    std::string installed_postinst = get_info_dir() + pkg_name + ".postinst";
+    if (!set_package_status_record(pkg_name, "install", "ok", "half-configured", new_version)) {
+         rollback_install_changes(install_rollback_entries);
+         if (runtime_sensitive) {
+             sync_multiarch_runtime_aliases();
+             refresh_linker_cache_if_available();
+         }
+         std::cerr << "E: Failed to record half-configured package state." << std::endl;
+         return false;
+    }
+    finish_phase(metadata_seconds);
+    if (access(installed_postinst.c_str(), X_OK) == 0) {
+         std::vector<std::string> postinst_args = build_postinst_configure_arguments(old_version);
+         if (run_maintainer_script_with_args(
+                 installed_postinst,
+                 "postinst",
+                 pkg_name,
+                 json_path,
+                 postinst_args
+             ) != 0) {
+             return finalize_failed_configuration_state(
+                 pkg_name,
+                 install_rollback_entries,
+                 status_guard,
+                 "postinst failed."
+             );
+         }
+    }
+
+    if (kernel_payload) {
+        if (!sync_kernel_boot_symlink()) {
+            return finalize_failed_configuration_state(
+                pkg_name,
+                install_rollback_entries,
+                status_guard,
+                "Failed to update /boot/kernel after installing " + pkg_name + "."
+            );
+        }
+        if (!run_depmod_for_kernel_release(kernel_release, false)) {
+            return finalize_failed_configuration_state(
+                pkg_name,
+                install_rollback_entries,
+                status_guard,
+                "depmod failed after installing kernel " + kernel_release + "."
+            );
+        }
+        std::vector<std::string> kernel_postinst_args =
+            build_postinst_configure_arguments(old_version);
+        if (!run_kernel_hook_directories("postinst", kernel_release, kernel_image_path, kernel_postinst_args)) {
+            return finalize_failed_configuration_state(
+                pkg_name,
+                install_rollback_entries,
+                status_guard,
+                "Kernel postinst hooks failed for " + pkg_name + "."
+            );
+        }
+    }
+    finish_phase(postinst_seconds);
 
     std::vector<std::string> postinstall_selinux_delta =
         collect_postinstall_relabel_delta(pkg_name, initial_selinux_relabel_paths);
@@ -7296,23 +7865,21 @@ bool action_install(const std::string& pkg_file) {
             postinstall_selinux_delta.end()
         );
         if (!finalize_selinux_relabel_for_success(deferred_selinux_paths, &selinux_error)) {
-            rollback_install_changes(install_rollback_entries);
-            if (runtime_sensitive) {
-                sync_multiarch_runtime_aliases();
-                refresh_linker_cache_if_available();
-            }
-            std::cerr << "E: " << selinux_error << std::endl;
-            return false;
+            return finalize_failed_configuration_state(
+                pkg_name,
+                install_rollback_entries,
+                status_guard,
+                selinux_error
+            );
         }
     } else if (!postinstall_selinux_delta.empty()) {
         if (!restorecon_transaction_paths(postinstall_selinux_delta, &selinux_error)) {
-            rollback_install_changes(install_rollback_entries);
-            if (runtime_sensitive) {
-                sync_multiarch_runtime_aliases();
-                refresh_linker_cache_if_available();
-            }
-            std::cerr << "E: " << selinux_error << std::endl;
-            return false;
+            return finalize_failed_configuration_state(
+                pkg_name,
+                install_rollback_entries,
+                status_guard,
+                selinux_error
+            );
         }
     }
 
@@ -7320,13 +7887,12 @@ bool action_install(const std::string& pkg_file) {
         std::string autorelabel_path = g_root_prefix + "/.autorelabel";
         if (!prepare_path_for_transaction_write(autorelabel_path, "/.autorelabel", install_rollback_entries) ||
             !write_text_file_atomic(autorelabel_path, "", 0644)) {
-            rollback_install_changes(install_rollback_entries);
-            if (runtime_sensitive) {
-                sync_multiarch_runtime_aliases();
-                refresh_linker_cache_if_available();
-            }
-            std::cerr << "E: Failed to schedule SELinux autorelabel after updating policy files." << std::endl;
-            return false;
+            return finalize_failed_configuration_state(
+                pkg_name,
+                install_rollback_entries,
+                status_guard,
+                "Failed to schedule SELinux autorelabel after updating policy files."
+            );
         }
     }
 
@@ -7480,6 +8046,11 @@ int main(int argc, char* argv[]) {
             for (int j = i + 1; j < argc; ++j) compat_args.push_back(argv[j]);
             return action_compat_dpkg_query(compat_args);
         }
+        if (arg == "--compat-dpkg") {
+            std::vector<std::string> compat_args;
+            for (int j = i + 1; j < argc; ++j) compat_args.push_back(argv[j]);
+            return action_compat_dpkg(compat_args);
+        }
         if (arg == "--compat-update-rc.d") {
             std::vector<std::string> compat_args;
             for (int j = i + 1; j < argc; ++j) compat_args.push_back(argv[j]);
@@ -7495,11 +8066,26 @@ int main(int argc, char* argv[]) {
             for (int j = i + 1; j < argc; ++j) compat_args.push_back(argv[j]);
             return action_compat_service(compat_args);
         }
+        if (arg == "--compat-systemctl") {
+            std::vector<std::string> compat_args;
+            for (int j = i + 1; j < argc; ++j) compat_args.push_back(argv[j]);
+            return action_compat_systemctl(compat_args);
+        }
+        if (arg == "--compat-deb-systemd-invoke") {
+            std::vector<std::string> compat_args;
+            for (int j = i + 1; j < argc; ++j) compat_args.push_back(argv[j]);
+            return action_compat_deb_systemd_invoke(compat_args);
+        }
+        if (arg == "--compat-initctl") {
+            std::vector<std::string> compat_args;
+            for (int j = i + 1; j < argc; ++j) compat_args.push_back(argv[j]);
+            return action_compat_initctl(compat_args);
+        }
     }
 
     if (argc < 2) {
 
-        std::cout << "Usage: gpkg-worker [options]\nOptions:\n  --install <file>\n  --remove <pkg>\n  --purge <pkg>\n  --retire <pkg>\n  --verify <pkg>\n  --hydrate-control-metadata <pkg>\n  --compat-dpkg-query [dpkg-query args...]\n  --compat-update-rc.d [update-rc.d args...]\n  --compat-invoke-rc.d [invoke-rc.d args...]\n  --compat-service [service args...]\n  --refresh-runtime-linker-state\n  --refresh-selinux-label-state\n  --register-file <path> --pkg <name>\n  --register-undo <cmd> --pkg <name>\n  --jobs <n>\n  --defer-runtime-linker-refresh\n  --defer-selinux-relabel\n  --unsafe-io\n";
+        std::cout << "Usage: gpkg-worker [options]\nOptions:\n  --install <file>\n  --remove <pkg>\n  --purge <pkg>\n  --retire <pkg>\n  --verify <pkg>\n  --hydrate-control-metadata <pkg>\n  --compat-dpkg [dpkg args...]\n  --compat-dpkg-query [dpkg-query args...]\n  --compat-update-rc.d [update-rc.d args...]\n  --compat-invoke-rc.d [invoke-rc.d args...]\n  --compat-service [service args...]\n  --compat-systemctl [systemctl args...]\n  --compat-deb-systemd-invoke [args...]\n  --compat-initctl [args...]\n  --refresh-runtime-linker-state\n  --refresh-selinux-label-state\n  --register-file <path> --pkg <name>\n  --register-undo <cmd> --pkg <name>\n  --jobs <n>\n  --defer-runtime-linker-refresh\n  --defer-selinux-relabel\n  --unsafe-io\n";
 
         return 1;
 
