@@ -29,6 +29,7 @@ bool inspect_debian_archive_payload_for_disk_estimate(
     const std::string& archive_path,
     CachedArchivePayloadInfo* out_info
 );
+bool native_dpkg_package_looks_synthetic(const std::string& pkg_name);
 InstallCommandResult install_native_debian_batch(
     const std::vector<PackageMetadata>& batch,
     bool verbose,
@@ -254,6 +255,33 @@ bool write_text_file_atomically(const std::string& path, const std::string& cont
     return true;
 }
 
+bool package_has_present_base_registry_entry_exact(const std::string& pkg_name) {
+    if (pkg_name.empty()) return false;
+    for (const auto& entry : load_base_system_registry_entries()) {
+        if (entry.package != pkg_name) continue;
+        if (base_system_registry_entry_looks_present(entry)) return true;
+    }
+    return false;
+}
+
+std::string resolve_native_dpkg_bootstrap_name(
+    const std::string& source_pkg_name,
+    PackageMetadata* meta_out = nullptr
+) {
+    if (meta_out) *meta_out = PackageMetadata{};
+    if (source_pkg_name.empty()) return "";
+
+    PackageMetadata meta;
+    if (get_installed_package_metadata(source_pkg_name, meta) ||
+        get_repo_package_info(source_pkg_name, meta)) {
+        if (meta_out) *meta_out = meta;
+        std::string candidate = debian_backend_package_name(meta);
+        if (!candidate.empty()) return candidate;
+    }
+
+    return source_pkg_name;
+}
+
 void merge_bootstrap_relation_list(std::vector<std::string>& dest, const std::vector<std::string>& src) {
     for (const auto& entry : src) {
         std::string normalized = trim(entry);
@@ -470,10 +498,14 @@ bool repair_native_dpkg_status_database(bool verbose, std::string* error_out) {
     if (!current.empty()) paragraphs.push_back(current);
 
     bool changed = false;
+    std::vector<std::pair<std::string, std::string>> list_renames;
+    std::set<std::string> emitted_packages;
     std::ostringstream rebuilt;
     for (auto paragraph : paragraphs) {
         std::string pkg_name;
         std::string version;
+        std::string original_pkg_name;
+        ssize_t package_index = -1;
         ssize_t version_index = -1;
         for (size_t i = 0; i < paragraph.size(); ++i) {
             const std::string& raw = paragraph[i];
@@ -483,6 +515,8 @@ bool repair_native_dpkg_status_database(bool verbose, std::string* error_out) {
             std::string value = trim(raw.substr(colon + 1));
             if (key == "Package") {
                 pkg_name = value;
+                original_pkg_name = value;
+                package_index = static_cast<ssize_t>(i);
             } else if (key == "Version") {
                 version = value;
                 version_index = static_cast<ssize_t>(i);
@@ -490,6 +524,23 @@ bool repair_native_dpkg_status_database(bool verbose, std::string* error_out) {
         }
 
         if (!pkg_name.empty()) {
+            if (native_dpkg_package_looks_synthetic(pkg_name)) {
+                std::string target_pkg_name = resolve_native_dpkg_bootstrap_name(pkg_name);
+                if (!target_pkg_name.empty() &&
+                    target_pkg_name != pkg_name &&
+                    package_index >= 0) {
+                    paragraph[static_cast<size_t>(package_index)] = "Package: " + target_pkg_name;
+                    list_renames.push_back({pkg_name, target_pkg_name});
+                    if (verbose) {
+                        std::cout << "[DEBUG] Canonicalized synthetic native dpkg package "
+                                  << pkg_name << " -> " << target_pkg_name
+                                  << " during status repair." << std::endl;
+                    }
+                    pkg_name = target_pkg_name;
+                    changed = true;
+                }
+            }
+
             std::string normalized_version =
                 normalize_dpkg_compatible_version(pkg_name, version, policy);
             if (version_index >= 0) {
@@ -501,6 +552,19 @@ bool repair_native_dpkg_status_database(bool verbose, std::string* error_out) {
                 paragraph.push_back("Version: " + normalized_version);
                 changed = true;
             }
+        }
+
+        if (!pkg_name.empty() && !emitted_packages.insert(pkg_name).second) {
+            changed = true;
+            if (verbose) {
+                std::cout << "[DEBUG] Dropped duplicate synthetic native dpkg status paragraph for "
+                          << pkg_name;
+                if (!original_pkg_name.empty() && original_pkg_name != pkg_name) {
+                    std::cout << " (from " << original_pkg_name << ")";
+                }
+                std::cout << "." << std::endl;
+            }
+            continue;
         }
 
         for (const auto& entry_line : paragraph) {
@@ -524,11 +588,59 @@ bool repair_native_dpkg_status_database(bool verbose, std::string* error_out) {
         }
     }
 
+    for (const auto& rename_pair : list_renames) {
+        const std::string& old_pkg = rename_pair.first;
+        const std::string& new_pkg = rename_pair.second;
+        if (old_pkg.empty() || new_pkg.empty() || old_pkg == new_pkg) continue;
+
+        std::string old_list_path = DPKG_INFO_DIR + "/" + old_pkg + ".list";
+        std::string new_list_path = DPKG_INFO_DIR + "/" + new_pkg + ".list";
+
+        std::set<std::string> merged_paths;
+        for (const auto& raw_path : load_dependency_entries(new_list_path)) {
+            std::string normalized = trim(raw_path);
+            if (normalized.empty()) continue;
+            if (normalized.front() != '/') normalized = "/" + normalized;
+            merged_paths.insert(normalized);
+        }
+        for (const auto& raw_path : load_dependency_entries(old_list_path)) {
+            std::string normalized = trim(raw_path);
+            if (normalized.empty()) continue;
+            if (normalized.front() != '/') normalized = "/" + normalized;
+            merged_paths.insert(normalized);
+        }
+
+        if (!merged_paths.empty()) {
+            std::ostringstream list_stream;
+            for (const auto& path : merged_paths) {
+                list_stream << path << "\n";
+            }
+            if (!write_text_file_atomically(new_list_path, list_stream.str())) {
+                if (error_out) *error_out = "failed to migrate " + old_list_path + " to "
+                    + new_list_path + ": " + std::strerror(errno);
+                return false;
+            }
+        }
+
+        if (old_list_path != new_list_path && access(old_list_path.c_str(), F_OK) == 0) {
+            if (unlink(old_list_path.c_str()) != 0 && errno != ENOENT) {
+                if (error_out) *error_out = "failed to remove stale " + old_list_path + ": "
+                    + std::strerror(errno);
+                return false;
+            }
+        }
+    }
+
     std::map<std::string, std::vector<std::string>> base_files_by_package;
     for (const auto& entry : load_base_system_registry_entries()) {
         if (entry.package.empty() || entry.files.empty()) continue;
-        if (base_files_by_package.count(entry.package) != 0) continue;
-        base_files_by_package[entry.package] = entry.files;
+        auto remember_files = [&](const std::string& pkg_name) {
+            if (pkg_name.empty()) return;
+            if (base_files_by_package.count(pkg_name) != 0) return;
+            base_files_by_package[pkg_name] = entry.files;
+        };
+        remember_files(entry.package);
+        remember_files(resolve_native_dpkg_bootstrap_name(entry.package));
     }
 
     for (const auto& record : load_dpkg_package_status_records()) {
@@ -592,6 +704,7 @@ bool repair_native_dpkg_status_database(bool verbose, std::string* error_out) {
 bool native_dpkg_package_looks_synthetic(const std::string& pkg_name) {
     if (pkg_name.empty()) return false;
     if (package_is_base_system_provided(pkg_name)) return true;
+    if (package_has_present_base_registry_entry_exact(pkg_name)) return true;
 
     // Legacy gpkg-managed packages may only have status/list artifacts. Treat
     // them as synthetic dpkg owners so overlap pruning can prevent file
@@ -621,6 +734,10 @@ std::vector<std::string> get_base_system_registry_files_for_package(const std::s
     if (pkg_name.empty()) return {};
     for (const auto& entry : load_base_system_registry_entries()) {
         if (entry.package != pkg_name) continue;
+        return entry.files;
+    }
+    for (const auto& entry : load_base_system_registry_entries()) {
+        if (resolve_native_dpkg_bootstrap_name(entry.package) != pkg_name) continue;
         return entry.files;
     }
     return {};
