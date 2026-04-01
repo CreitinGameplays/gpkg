@@ -17,6 +17,7 @@ bool prepare_install_archives(
 std::vector<std::string> build_dpkg_command_argv(const std::vector<std::string>& args);
 std::string debian_backend_package_name(const PackageMetadata& meta);
 bool package_uses_native_dpkg_backend(const PackageMetadata& meta);
+bool ensure_native_dpkg_backend_ready(bool verbose, std::string* error_out = nullptr);
 InstallCommandResult install_native_debian_batch(
     const std::vector<PackageMetadata>& batch,
     bool verbose
@@ -185,8 +186,451 @@ std::vector<std::string> collect_registered_package_names_from_status_records(
     return std::vector<std::string>(package_names.begin(), package_names.end());
 }
 
+struct NativeDpkgBootstrapEntry {
+    std::string package;
+    PackageStatusRecord status;
+    PackageMetadata meta;
+    std::set<std::string> files;
+};
+
+std::string normalize_dpkg_architecture_name(const std::string& raw_arch) {
+    std::string arch = ascii_lower_copy(trim(raw_arch));
+    if (arch.empty()) return "amd64";
+    if (arch == "x86_64" || arch == "x86-64") return "amd64";
+    if (arch == "noarch") return "all";
+    return arch;
+}
+
+bool write_text_file_atomically(const std::string& path, const std::string& content) {
+    if (!mkdir_parent(path)) return false;
+
+    std::string pattern = path + ".XXXXXX";
+    std::vector<char> tmpl(pattern.begin(), pattern.end());
+    tmpl.push_back('\0');
+
+    int fd = mkstemp(tmpl.data());
+    if (fd < 0) return false;
+
+    bool ok = true;
+    ssize_t remaining = static_cast<ssize_t>(content.size());
+    const char* cursor = content.data();
+    while (remaining > 0) {
+        ssize_t written = write(fd, cursor, static_cast<size_t>(remaining));
+        if (written < 0) {
+            ok = false;
+            break;
+        }
+        remaining -= written;
+        cursor += written;
+    }
+    if (ok && fsync(fd) != 0) ok = false;
+    if (fchmod(fd, 0644) != 0) ok = false;
+    close(fd);
+
+    if (!ok) {
+        unlink(tmpl.data());
+        return false;
+    }
+
+    if (rename(tmpl.data(), path.c_str()) != 0) {
+        unlink(tmpl.data());
+        return false;
+    }
+
+    return true;
+}
+
+void merge_bootstrap_relation_list(std::vector<std::string>& dest, const std::vector<std::string>& src) {
+    for (const auto& entry : src) {
+        std::string normalized = trim(entry);
+        if (normalized.empty()) continue;
+        if (std::find(dest.begin(), dest.end(), normalized) != dest.end()) continue;
+        dest.push_back(normalized);
+    }
+}
+
+void merge_bootstrap_metadata(
+    NativeDpkgBootstrapEntry& entry,
+    const PackageMetadata& meta,
+    const std::string& source_pkg_name
+) {
+    if (entry.package.empty()) {
+        std::string package_name = debian_backend_package_name(meta);
+        entry.package = package_name.empty() ? source_pkg_name : package_name;
+    }
+
+    if (entry.meta.name.empty()) entry.meta.name = source_pkg_name;
+    if (entry.meta.version.empty()) entry.meta.version = meta.version;
+    if (entry.meta.arch.empty()) entry.meta.arch = meta.arch;
+    if (entry.meta.description.empty()) entry.meta.description = meta.description;
+    if (entry.meta.maintainer.empty()) entry.meta.maintainer = meta.maintainer;
+    if (entry.meta.section.empty()) entry.meta.section = meta.section;
+    if (entry.meta.priority.empty()) entry.meta.priority = meta.priority;
+    if (entry.meta.filename.empty()) entry.meta.filename = meta.filename;
+    if (entry.meta.sha256.empty()) entry.meta.sha256 = meta.sha256;
+    if (entry.meta.sha512.empty()) entry.meta.sha512 = meta.sha512;
+    if (entry.meta.source_url.empty()) entry.meta.source_url = meta.source_url;
+    if (entry.meta.source_kind.empty()) entry.meta.source_kind = meta.source_kind;
+    if (entry.meta.debian_package.empty()) entry.meta.debian_package = meta.debian_package;
+    if (entry.meta.debian_version.empty()) entry.meta.debian_version = meta.debian_version;
+    if (entry.meta.package_scope.empty()) entry.meta.package_scope = meta.package_scope;
+    if (entry.meta.installed_from.empty()) entry.meta.installed_from = meta.installed_from;
+    if (entry.meta.size.empty()) entry.meta.size = meta.size;
+    if (entry.meta.installed_size_bytes.empty()) entry.meta.installed_size_bytes = meta.installed_size_bytes;
+
+    merge_bootstrap_relation_list(entry.meta.depends, meta.depends);
+    merge_bootstrap_relation_list(entry.meta.recommends, meta.recommends);
+    merge_bootstrap_relation_list(entry.meta.suggests, meta.suggests);
+    merge_bootstrap_relation_list(entry.meta.conflicts, meta.conflicts);
+    merge_bootstrap_relation_list(entry.meta.provides, meta.provides);
+    merge_bootstrap_relation_list(entry.meta.replaces, meta.replaces);
+}
+
+bool native_dpkg_seed_prefers_high_compat_version(const std::string& pkg_name, const ImportPolicy& policy) {
+    if (pkg_name == "base-files") return true;
+    if (matches_any_pattern(pkg_name, policy.skip_packages)) return true;
+    return !matches_any_pattern(pkg_name, policy.upgradeable_system);
+}
+
+NativeDpkgBootstrapEntry& ensure_native_dpkg_bootstrap_entry(
+    std::map<std::string, NativeDpkgBootstrapEntry>& entries,
+    const std::string& pkg_name
+) {
+    NativeDpkgBootstrapEntry& entry = entries[pkg_name];
+    if (entry.package.empty()) {
+        entry.package = pkg_name;
+        entry.status.package = pkg_name;
+        entry.status.want = "install";
+        entry.status.flag = "ok";
+        entry.status.status = "installed";
+        entry.meta.name = pkg_name;
+    }
+    return entry;
+}
+
+void seed_native_dpkg_bootstrap_entry(
+    std::map<std::string, NativeDpkgBootstrapEntry>& entries,
+    const std::string& source_pkg_name,
+    const PackageMetadata* meta,
+    const PackageStatusRecord* status_record,
+    const std::vector<std::string>* files,
+    const std::string& fallback_version = ""
+) {
+    std::string dpkg_name = source_pkg_name;
+    if (meta) {
+        std::string candidate = debian_backend_package_name(*meta);
+        if (!candidate.empty()) dpkg_name = candidate;
+    }
+    if (dpkg_name.empty()) return;
+
+    NativeDpkgBootstrapEntry& entry = ensure_native_dpkg_bootstrap_entry(entries, dpkg_name);
+    if (meta) merge_bootstrap_metadata(entry, *meta, source_pkg_name);
+
+    if (status_record && package_status_is_installed_like(status_record->status)) {
+        entry.status.want = status_record->want.empty() ? "install" : status_record->want;
+        entry.status.flag = status_record->flag.empty() ? "ok" : status_record->flag;
+        entry.status.status = status_record->status;
+        if (entry.status.version.empty()) entry.status.version = status_record->version;
+    }
+
+    if (entry.status.version.empty() && meta && !meta->version.empty()) {
+        entry.status.version = meta->version;
+    }
+    if (entry.status.version.empty() && meta && !meta->debian_version.empty()) {
+        entry.status.version = meta->debian_version;
+    }
+    if (entry.status.version.empty() && !fallback_version.empty()) {
+        entry.status.version = fallback_version;
+    }
+
+    if (files) {
+        for (const auto& file : *files) {
+            std::string normalized = trim(file);
+            if (normalized.empty()) continue;
+            if (normalized[0] != '/') normalized = "/" + normalized;
+            entry.files.insert(normalized);
+        }
+    }
+}
+
+std::vector<std::string> collect_native_dpkg_policy_seed_packages(const ImportPolicy& policy) {
+    std::vector<std::string> packages;
+    auto append_exact = [&](const std::vector<std::string>& entries) {
+        for (const auto& raw : entries) {
+            std::string normalized = trim(raw);
+            if (normalized.empty() || pattern_has_glob(normalized)) continue;
+            Dependency dep = parse_dependency(normalized);
+            std::string package_name = dep.name.empty() ? canonicalize_package_name(normalized) : canonicalize_package_name(dep.name);
+            if (package_name.empty()) continue;
+            if (std::find(packages.begin(), packages.end(), package_name) != packages.end()) continue;
+            packages.push_back(package_name);
+        }
+    };
+
+    append_exact(policy.system_provides);
+    append_exact(policy.upgradeable_system);
+    append_exact(policy.allow_essential_packages);
+    append_exact(policy.skip_packages);
+    return packages;
+}
+
+bool ensure_native_dpkg_admin_layout(std::string* error_out) {
+    if (error_out) error_out->clear();
+
+    const std::vector<std::string> directories = {
+        DPKG_ADMIN_DIR,
+        DPKG_INFO_DIR,
+        DPKG_ADMIN_DIR + "/alternatives",
+        DPKG_ADMIN_DIR + "/parts",
+        DPKG_ADMIN_DIR + "/updates",
+    };
+    for (const auto& dir : directories) {
+        if (mkdir_p(dir)) continue;
+        if (error_out) *error_out = "failed to create " + dir + ": " + std::strerror(errno);
+        return false;
+    }
+
+    const std::vector<std::string> empty_files = {
+        DPKG_ADMIN_DIR + "/arch",
+        DPKG_ADMIN_DIR + "/available",
+        DPKG_ADMIN_DIR + "/diversions",
+        DPKG_ADMIN_DIR + "/statoverride",
+    };
+    for (const auto& path : empty_files) {
+        if (access(path.c_str(), F_OK) == 0) continue;
+        if (write_text_file_atomically(path, "")) continue;
+        if (error_out) *error_out = "failed to initialize " + path + ": " + std::strerror(errno);
+        return false;
+    }
+
+    return true;
+}
+
+bool bootstrap_native_dpkg_status_database(bool verbose, std::string* error_out) {
+    if (error_out) error_out->clear();
+
+    if (!ensure_native_dpkg_admin_layout(error_out)) return false;
+
+    std::map<std::string, NativeDpkgBootstrapEntry> entries;
+    const ImportPolicy& policy = get_import_policy(verbose);
+
+    std::vector<PackageStatusRecord> registered_status_records = load_package_status_records();
+    std::map<std::string, PackageStatusRecord> registered_status_by_package;
+    for (const auto& record : registered_status_records) {
+        if (record.package.empty()) continue;
+        registered_status_by_package[record.package] = record;
+    }
+
+    for (const auto& pkg_name : collect_registered_package_names_from_status_records(registered_status_records)) {
+        PackageMetadata meta;
+        bool have_meta = get_installed_package_metadata(pkg_name, meta);
+        bool should_seed = false;
+        if (have_meta) {
+            should_seed = package_is_debian_source(meta) ||
+                          !meta.debian_package.empty() ||
+                          meta.source_kind == "base_image" ||
+                          meta.installed_from == "GeminiOS base image";
+        }
+        if (!should_seed) {
+            should_seed =
+                matches_any_pattern(pkg_name, policy.system_provides) ||
+                matches_any_pattern(pkg_name, policy.upgradeable_system) ||
+                matches_any_pattern(pkg_name, policy.allow_essential_packages);
+        }
+        if (!should_seed) continue;
+
+        auto status_it = registered_status_by_package.find(pkg_name);
+        const PackageStatusRecord* record_ptr =
+            status_it == registered_status_by_package.end() ? nullptr : &status_it->second;
+        if (record_ptr && !package_status_is_installed_like(record_ptr->status)) continue;
+
+        std::vector<std::string> files = read_installed_file_list(pkg_name);
+        seed_native_dpkg_bootstrap_entry(
+            entries,
+            pkg_name,
+            have_meta ? &meta : nullptr,
+            record_ptr,
+            &files
+        );
+    }
+
+    for (const auto& base_entry : load_base_system_registry_entries()) {
+        if (base_entry.package.empty()) continue;
+        if (!base_system_registry_entry_looks_present(base_entry)) continue;
+
+        PackageMetadata meta;
+        bool have_meta = get_installed_package_metadata(base_entry.package, meta);
+        if (!have_meta) have_meta = get_repo_package_info(base_entry.package, meta);
+
+        PackageStatusRecord record;
+        record.package = base_entry.package;
+        record.want = "install";
+        record.flag = "ok";
+        record.status = "installed";
+        record.version = base_entry.version;
+
+        seed_native_dpkg_bootstrap_entry(
+            entries,
+            base_entry.package,
+            have_meta ? &meta : nullptr,
+            &record,
+            &base_entry.files,
+            base_entry.version
+        );
+    }
+
+    for (const auto& pkg_name : collect_native_dpkg_policy_seed_packages(policy)) {
+        if (entries.find(pkg_name) != entries.end()) continue;
+
+        PackageMetadata meta;
+        bool have_meta = get_installed_package_metadata(pkg_name, meta);
+        if (!have_meta) have_meta = get_repo_package_info(pkg_name, meta);
+
+        std::vector<std::string> files = read_installed_file_list(pkg_name);
+        std::string fallback_version;
+        if (have_meta && !meta.version.empty()) {
+            fallback_version = meta.version;
+        } else if (have_meta && !meta.debian_version.empty()) {
+            fallback_version = meta.debian_version;
+        } else if (native_dpkg_seed_prefers_high_compat_version(pkg_name, policy)) {
+            fallback_version = "9999";
+        } else {
+            fallback_version = "0";
+        }
+
+        seed_native_dpkg_bootstrap_entry(
+            entries,
+            pkg_name,
+            have_meta ? &meta : nullptr,
+            nullptr,
+            &files,
+            fallback_version
+        );
+    }
+
+    if (entries.empty()) {
+        if (error_out) *error_out = "no live GeminiOS packages were available to seed " + DPKG_STATUS_FILE;
+        return false;
+    }
+
+    std::ostringstream status_stream;
+    for (const auto& pair : entries) {
+        const NativeDpkgBootstrapEntry& entry = pair.second;
+
+        std::string package_name = entry.package.empty() ? pair.first : entry.package;
+        std::string version = !entry.status.version.empty()
+            ? entry.status.version
+            : (!entry.meta.version.empty() ? entry.meta.version : entry.meta.debian_version);
+        if (version.empty()) {
+            version = native_dpkg_seed_prefers_high_compat_version(package_name, policy) ? "9999" : "0";
+        }
+
+        std::string priority = trim(entry.meta.priority);
+        if (priority.empty()) {
+            priority = matches_any_pattern(package_name, policy.allow_essential_packages) ? "required" : "optional";
+        }
+
+        std::string section = trim(entry.meta.section);
+        if (section.empty()) {
+            section = matches_any_pattern(package_name, policy.allow_essential_packages) ? "admin" : "misc";
+        }
+
+        std::string maintainer = trim(entry.meta.maintainer);
+        if (maintainer.empty()) maintainer = "GeminiOS";
+
+        std::string architecture = normalize_dpkg_architecture_name(entry.meta.arch);
+        if (package_name == "base-files" && entry.meta.arch.empty()) architecture = "all";
+
+        std::string description = description_summary(entry.meta.description, 200);
+        if (description.empty()) {
+            description = "Synthetic native dpkg bootstrap record managed by gpkg";
+        }
+
+        status_stream << "Package: " << package_name << "\n";
+        status_stream << "Status: "
+                      << (entry.status.want.empty() ? "install" : entry.status.want) << " "
+                      << (entry.status.flag.empty() ? "ok" : entry.status.flag) << " "
+                      << (entry.status.status.empty() ? "installed" : entry.status.status) << "\n";
+        status_stream << "Priority: " << priority << "\n";
+        status_stream << "Section: " << section << "\n";
+        status_stream << "Maintainer: " << maintainer << "\n";
+        status_stream << "Architecture: " << architecture << "\n";
+        status_stream << "Version: " << version << "\n";
+        if (!entry.meta.installed_size_bytes.empty()) {
+            status_stream << "Installed-Size: " << entry.meta.installed_size_bytes << "\n";
+        }
+        if (!entry.meta.depends.empty()) {
+            status_stream << "Depends: " << join_strings(entry.meta.depends) << "\n";
+        }
+        if (!entry.meta.provides.empty()) {
+            status_stream << "Provides: " << join_strings(entry.meta.provides) << "\n";
+        }
+        if (!entry.meta.conflicts.empty()) {
+            status_stream << "Conflicts: " << join_strings(entry.meta.conflicts) << "\n";
+        }
+        if (!entry.meta.replaces.empty()) {
+            status_stream << "Replaces: " << join_strings(entry.meta.replaces) << "\n";
+        }
+        status_stream << "Description: " << description << "\n\n";
+    }
+
+    if (!write_text_file_atomically(DPKG_STATUS_FILE, status_stream.str())) {
+        if (error_out) {
+            *error_out = "failed to write " + DPKG_STATUS_FILE + ": " + std::strerror(errno);
+        }
+        return false;
+    }
+    if (!write_text_file_atomically(DPKG_ADMIN_DIR + "/status-old", status_stream.str())) {
+        if (verbose) {
+            std::cout << "[DEBUG] Failed to refresh " << DPKG_ADMIN_DIR + "/status-old"
+                      << " during native dpkg bootstrap." << std::endl;
+        }
+    }
+
+    for (const auto& pair : entries) {
+        const NativeDpkgBootstrapEntry& entry = pair.second;
+        std::ostringstream list_stream;
+        for (const auto& file : entry.files) {
+            list_stream << file << "\n";
+        }
+        if (!write_text_file_atomically(DPKG_INFO_DIR + "/" + pair.first + ".list", list_stream.str())) {
+            if (error_out) {
+                *error_out = "failed to write " + DPKG_INFO_DIR + "/" + pair.first + ".list"
+                    + ": " + std::strerror(errno);
+            }
+            return false;
+        }
+    }
+
+    VLOG(verbose, "Bootstrapped real native dpkg state at " << DPKG_STATUS_FILE
+                  << " with " << entries.size() << " installed package record(s).");
+    return true;
+}
+
+bool ensure_native_dpkg_backend_ready(bool verbose, std::string* error_out) {
+    if (error_out) error_out->clear();
+
+    if (access("/bin/dpkg", X_OK) != 0) {
+        if (error_out) *error_out = "/bin/dpkg is missing";
+        return false;
+    }
+
+    struct stat status_st {};
+    if (stat(DPKG_STATUS_FILE.c_str(), &status_st) == 0 && status_st.st_size > 0) {
+        return true;
+    }
+
+    return bootstrap_native_dpkg_status_database(verbose, error_out);
+}
+
 UpgradeContext build_upgrade_context(bool verbose) {
-    (void)verbose;
+    if (access("/bin/dpkg", X_OK) == 0) {
+        std::string dpkg_bootstrap_error;
+        if (!ensure_native_dpkg_backend_ready(verbose, &dpkg_bootstrap_error) && verbose) {
+            std::cout << "[DEBUG] Native dpkg state bootstrap was skipped: "
+                      << dpkg_bootstrap_error << std::endl;
+        }
+    }
 
     UpgradeContext context;
     context.registered_status_records = load_package_status_records();
@@ -867,7 +1311,10 @@ InstallCommandResult retire_package_by_name(
 
 InstallCommandResult remove_package_by_name(const std::string& pkg_name, bool verbose) {
     PackageStatusRecord dpkg_record;
+    std::string dpkg_bootstrap_error;
+    bool have_native_dpkg = ensure_native_dpkg_backend_ready(verbose, &dpkg_bootstrap_error);
     if (!is_installed(pkg_name) &&
+        have_native_dpkg &&
         get_dpkg_package_status_record(pkg_name, &dpkg_record) &&
         package_status_is_installed_like(dpkg_record.status)) {
         ScopedMaintscriptShellOverride maintscript_shell(true, verbose);
@@ -890,7 +1337,10 @@ InstallCommandResult remove_package_by_name(const std::string& pkg_name, bool ve
 
 InstallCommandResult purge_package_by_name(const std::string& pkg_name, bool verbose) {
     PackageStatusRecord dpkg_record;
+    std::string dpkg_bootstrap_error;
+    bool have_native_dpkg = ensure_native_dpkg_backend_ready(verbose, &dpkg_bootstrap_error);
     if (!is_installed(pkg_name) &&
+        have_native_dpkg &&
         get_dpkg_package_status_record(pkg_name, &dpkg_record) &&
         (package_status_is_installed_like(dpkg_record.status) || dpkg_record.status == "config-files")) {
         ScopedMaintscriptShellOverride maintscript_shell(true, verbose);
@@ -1066,12 +1516,11 @@ InstallCommandResult install_native_debian_batch(
     bool verbose
 ) {
     if (batch.empty()) return {true, "", "", 0, ""};
-    if (access("/bin/dpkg", X_OK) != 0 || access(DPKG_STATUS_FILE.c_str(), F_OK) != 0) {
+    std::string dpkg_bootstrap_error;
+    if (!ensure_native_dpkg_backend_ready(verbose, &dpkg_bootstrap_error)) {
         std::cerr << "E: Native Debian backend is unavailable";
-        if (access("/bin/dpkg", X_OK) != 0) {
-            std::cerr << ": /bin/dpkg is missing";
-        } else {
-            std::cerr << ": " << DPKG_STATUS_FILE << " is missing";
+        if (!dpkg_bootstrap_error.empty()) {
+            std::cerr << ": " << dpkg_bootstrap_error;
         }
         std::cerr << std::endl;
         return {false, "", batch.front().name, 0, ""};
