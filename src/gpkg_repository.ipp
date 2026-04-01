@@ -8,6 +8,18 @@ bool g_repo_package_cache_loaded = false;
 
 const char REPO_CATALOG_MAGIC[8] = {'G','P','K','C','A','T','1','\0'};
 
+struct RepoIndexCacheState {
+    std::string index_url;
+    std::string etag;
+    std::string last_modified;
+    long content_length = -1;
+    size_t package_count = 0;
+};
+
+struct RepoCatalogState {
+    std::string fingerprint;
+};
+
 struct PackageUniverseResult {
     bool found = false;
     bool installable = false;
@@ -17,6 +29,10 @@ struct PackageUniverseResult {
 };
 
 bool ensure_repo_package_cache_loaded(bool verbose);
+bool build_current_repo_catalog(bool verbose, std::string* error_out = nullptr);
+bool ensure_current_upgrade_catalog(bool verbose, std::string* error_out = nullptr);
+bool ensure_repo_index_available();
+void invalidate_repo_package_cache();
 bool should_prefer_repo_candidate(const PackageMetadata& candidate, const PackageMetadata& current);
 void populate_package_metadata_from_json(const std::string& obj, PackageMetadata& meta);
 bool query_full_universe_exact_package(
@@ -46,6 +62,315 @@ std::string get_repo_catalog_path() {
 
 std::string get_legacy_repo_index_path() {
     return REPO_CACHE_PATH + "Packages.json";
+}
+
+std::string get_repo_catalog_state_path() {
+    return REPO_CACHE_PATH + "Packages.catalog.state";
+}
+
+std::string get_repo_source_cache_root(const std::string& repo_url) {
+    std::string normalized = normalize_repo_base_url(repo_url);
+    std::string suffix = sha256_hex_digest(normalized);
+    if (suffix.size() > 16) suffix = suffix.substr(0, 16);
+    return REPO_CACHE_PATH + "sources/" + cache_safe_component(normalized) + "_" + suffix + "/";
+}
+
+std::string get_repo_source_index_zst_path(const std::string& repo_url) {
+    return get_repo_source_cache_root(repo_url) + "Packages.json.zst";
+}
+
+std::string get_repo_source_index_json_path(const std::string& repo_url) {
+    return get_repo_source_cache_root(repo_url) + "Packages.json";
+}
+
+std::string get_repo_source_state_path(const std::string& repo_url) {
+    return get_repo_source_cache_root(repo_url) + "Packages.state";
+}
+
+bool load_repo_index_cache_state(const std::string& path, RepoIndexCacheState& state) {
+    std::ifstream f(path);
+    if (!f) return false;
+
+    state = {};
+    std::string line;
+    while (std::getline(f, line)) {
+        line = trim(line);
+        if (line.empty() || line[0] == '#') continue;
+
+        size_t eq = line.find('=');
+        if (eq == std::string::npos) continue;
+
+        std::string key = trim(line.substr(0, eq));
+        std::string value = line.substr(eq + 1);
+        if (key == "INDEX_URL") state.index_url = value;
+        else if (key == "ETAG") state.etag = value;
+        else if (key == "LAST_MODIFIED") state.last_modified = value;
+        else if (key == "CONTENT_LENGTH") state.content_length = std::atol(value.c_str());
+        else if (key == "PACKAGE_COUNT") {
+            state.package_count = static_cast<size_t>(std::strtoull(value.c_str(), nullptr, 10));
+        }
+    }
+
+    return !state.index_url.empty();
+}
+
+bool save_repo_index_cache_state(const std::string& path, const RepoIndexCacheState& state) {
+    if (!mkdir_parent(path)) return false;
+
+    std::string temp_path = path + ".tmp";
+    std::ofstream out(temp_path, std::ios::trunc);
+    if (!out) return false;
+
+    out << "INDEX_URL=" << state.index_url << "\n";
+    out << "ETAG=" << state.etag << "\n";
+    out << "LAST_MODIFIED=" << state.last_modified << "\n";
+    out << "CONTENT_LENGTH=" << state.content_length << "\n";
+    out << "PACKAGE_COUNT=" << state.package_count << "\n";
+    out.close();
+
+    if (!out) {
+        remove(temp_path.c_str());
+        return false;
+    }
+
+    if (rename(temp_path.c_str(), path.c_str()) != 0) {
+        remove(temp_path.c_str());
+        return false;
+    }
+
+    return true;
+}
+
+bool load_repo_catalog_state(const std::string& path, RepoCatalogState& state) {
+    std::ifstream f(path);
+    if (!f) return false;
+
+    state = {};
+    std::string line;
+    while (std::getline(f, line)) {
+        line = trim(line);
+        if (line.empty() || line[0] == '#') continue;
+
+        size_t eq = line.find('=');
+        if (eq == std::string::npos) continue;
+
+        std::string key = trim(line.substr(0, eq));
+        std::string value = line.substr(eq + 1);
+        if (key == "FINGERPRINT") state.fingerprint = value;
+    }
+
+    return !state.fingerprint.empty();
+}
+
+bool save_repo_catalog_state(const std::string& path, const RepoCatalogState& state) {
+    if (!mkdir_parent(path)) return false;
+
+    std::string temp_path = path + ".tmp";
+    std::ofstream out(temp_path, std::ios::trunc);
+    if (!out) return false;
+
+    out << "FINGERPRINT=" << state.fingerprint << "\n";
+    out.close();
+
+    if (!out) {
+        remove(temp_path.c_str());
+        return false;
+    }
+
+    if (rename(temp_path.c_str(), path.c_str()) != 0) {
+        remove(temp_path.c_str());
+        return false;
+    }
+
+    return true;
+}
+
+bool fetch_remote_repo_index_state(
+    const std::string& url,
+    RepoIndexCacheState& state,
+    bool verbose,
+    std::string* error_out = nullptr
+) {
+    if (error_out) error_out->clear();
+
+    HttpOptions opts;
+    opts.method = "HEAD";
+    opts.include_headers = true;
+    opts.follow_location = true;
+    opts.show_progress = false;
+    opts.verbose = verbose;
+
+    std::stringstream response;
+    if (!HttpRequest(url, response, opts, error_out)) return false;
+
+    std::string headers = response.str();
+    std::string lower_headers = lowercase_copy(headers);
+
+    state = {};
+    state.index_url = url;
+    state.etag = extract_http_header_value(headers, lower_headers, "etag: ");
+    state.last_modified = extract_http_header_value(headers, lower_headers, "last-modified: ");
+
+    std::string content_length = extract_http_header_value(headers, lower_headers, "content-length: ");
+    if (!content_length.empty()) state.content_length = std::atol(content_length.c_str());
+
+    return true;
+}
+
+bool remote_repo_index_matches_cache(
+    const RepoIndexCacheState& cached,
+    const RepoIndexCacheState& remote
+) {
+    if (cached.index_url.empty() || remote.index_url.empty()) return false;
+    if (cached.index_url != remote.index_url) return false;
+
+    if (!cached.etag.empty() && !remote.etag.empty()) {
+        return cached.etag == remote.etag;
+    }
+
+    if (!cached.last_modified.empty() && !remote.last_modified.empty()) {
+        if (cached.last_modified != remote.last_modified) return false;
+        if (cached.content_length > 0 && remote.content_length > 0) {
+            return cached.content_length == remote.content_length;
+        }
+        return true;
+    }
+
+    return false;
+}
+
+size_t count_repo_index_packages(const std::string& path) {
+    size_t count = 0;
+    foreach_json_object(path, [&](const std::string& obj) {
+        PackageMetadata candidate;
+        populate_package_metadata_from_json(obj, candidate);
+        candidate.name = trim(candidate.name);
+        if (!candidate.name.empty()) ++count;
+        return true;
+    });
+    return count;
+}
+
+bool sync_repo_source_index(
+    const std::string& repo_url,
+    bool verbose,
+    bool* changed_out = nullptr,
+    size_t* package_count_out = nullptr,
+    std::string* result_out = nullptr
+) {
+    if (changed_out) *changed_out = false;
+    if (package_count_out) *package_count_out = 0;
+    if (result_out) result_out->clear();
+
+    std::string normalized = normalize_repo_base_url(repo_url);
+    std::string index_url = build_repo_index_url(normalized);
+    std::string cached_json = get_repo_source_index_json_path(normalized);
+    std::string cached_zst = get_repo_source_index_zst_path(normalized);
+    std::string state_path = get_repo_source_state_path(normalized);
+    if (!mkdir_parent(cached_json)) return false;
+
+    RepoIndexCacheState cached_state;
+    bool have_cached_state = load_repo_index_cache_state(state_path, cached_state);
+    bool have_cached_json = access(cached_json.c_str(), F_OK) == 0;
+
+    RepoIndexCacheState remote_state;
+    std::string probe_error;
+    bool have_remote_state = fetch_remote_repo_index_state(index_url, remote_state, verbose, &probe_error);
+
+    if (have_cached_json && have_cached_state && have_remote_state &&
+        remote_repo_index_matches_cache(cached_state, remote_state)) {
+        if (package_count_out) *package_count_out = cached_state.package_count;
+        if (result_out) {
+            *result_out = "✓ Reused cached index from " + normalized +
+                          " (" + std::to_string(cached_state.package_count) + " packages)";
+        }
+        return true;
+    }
+
+    std::string download_error;
+    if (!DownloadFile(index_url, cached_zst, verbose, &download_error)) {
+        if (have_cached_json) {
+            size_t cached_count = have_cached_state ? cached_state.package_count : count_repo_index_packages(cached_json);
+            if (package_count_out) *package_count_out = cached_count;
+            if (result_out) {
+                *result_out = "✓ Reused cached index from " + normalized +
+                              " (" + std::to_string(cached_count) + " packages)";
+            }
+            return true;
+        }
+        if (result_out) {
+            *result_out = "W: Failed to fetch index from " + normalized +
+                          (download_error.empty() ? "" : " (" + download_error + ")");
+        }
+        return false;
+    }
+
+    std::string decompress_error;
+    if (!GpkgArchive::decompress_zstd_file(cached_zst, cached_json, &decompress_error)) {
+        remove(cached_zst.c_str());
+        if (have_cached_json) {
+            size_t cached_count = have_cached_state ? cached_state.package_count : count_repo_index_packages(cached_json);
+            if (package_count_out) *package_count_out = cached_count;
+            if (result_out) {
+                *result_out = "✓ Reused cached index from " + normalized +
+                              " (" + std::to_string(cached_count) + " packages)";
+            }
+            return true;
+        }
+        if (result_out) {
+            *result_out = "W: Failed to decompress index from " + normalized +
+                          (decompress_error.empty() ? "" : " (" + decompress_error + ")");
+        }
+        return false;
+    }
+
+    size_t package_count = count_repo_index_packages(cached_json);
+    RepoIndexCacheState state_to_save = have_remote_state ? remote_state : RepoIndexCacheState{};
+    state_to_save.index_url = index_url;
+    state_to_save.package_count = package_count;
+    if (!save_repo_index_cache_state(state_path, state_to_save)) {
+        remove(state_path.c_str());
+    }
+
+    remove(cached_zst.c_str());
+    if (changed_out) *changed_out = true;
+    if (package_count_out) *package_count_out = package_count;
+    if (result_out) {
+        *result_out = "✓ Updated index from " + normalized +
+                      " (" + std::to_string(package_count) + " packages)";
+    }
+    return true;
+}
+
+std::string build_repo_catalog_fingerprint(const std::vector<std::string>& urls) {
+    std::vector<std::string> fields = {"repo-catalog-v1"};
+
+    std::string packages_txt = get_debian_packages_cache_path();
+    if (access(packages_txt.c_str(), F_OK) == 0) {
+        fields.push_back(build_debian_imported_index_cache_fingerprint(packages_txt));
+    } else {
+        fields.push_back("debian:missing");
+    }
+
+    for (const auto& url : urls) {
+        std::string normalized = normalize_repo_base_url(url);
+        fields.push_back(normalized);
+        fields.push_back(debian_cache_fingerprint_component(get_repo_source_index_json_path(normalized)));
+    }
+
+    return fnv1a64_hex_digest(fields);
+}
+
+bool repo_catalog_matches_current_sources(const std::vector<std::string>& urls) {
+    std::string catalog_path = get_repo_catalog_path();
+    std::string state_path = get_repo_catalog_state_path();
+    if (access(catalog_path.c_str(), F_OK) != 0 || access(state_path.c_str(), F_OK) != 0) {
+        return false;
+    }
+
+    RepoCatalogState state;
+    if (!load_repo_catalog_state(state_path, state)) return false;
+    return state.fingerprint == build_repo_catalog_fingerprint(urls);
 }
 
 bool read_repo_catalog_entry_at_offset(
@@ -774,6 +1099,41 @@ bool write_upgrade_catalog(
     return true;
 }
 
+bool ensure_current_upgrade_catalog(bool verbose, std::string* error_out) {
+    if (error_out) error_out->clear();
+
+    if (!ensure_repo_index_available()) {
+        if (error_out) *error_out = "repository package index could not be loaded";
+        return false;
+    }
+
+    std::string expected_fingerprint = build_upgrade_catalog_fingerprint();
+    JsonValue root;
+    if (load_json_document(UPGRADE_CATALOG_PATH, root)) {
+        std::string current_fingerprint = json_string_or(json_object_get(root, "fingerprint"));
+        if (!current_fingerprint.empty() && current_fingerprint == expected_fingerprint) {
+            return true;
+        }
+    }
+
+    ResolvedUpgradeCatalog catalog;
+    std::string catalog_error;
+    if (!build_resolved_upgrade_catalog(catalog, verbose, &catalog_error)) {
+        if (error_out) *error_out = catalog_error.empty()
+            ? "failed to build the runtime upgrade catalog"
+            : catalog_error;
+        return false;
+    }
+    if (!write_upgrade_catalog(catalog, &catalog_error)) {
+        if (error_out) *error_out = catalog_error.empty()
+            ? "failed to write the runtime upgrade catalog"
+            : catalog_error;
+        return false;
+    }
+
+    return true;
+}
+
 bool load_upgrade_catalog(
     ResolvedUpgradeCatalog& out_catalog,
     std::string* problem_out,
@@ -785,26 +1145,57 @@ bool load_upgrade_catalog(
 
     JsonValue root;
     if (!load_json_document(UPGRADE_CATALOG_PATH, root)) {
-        if (problem_out) {
-            if (access(UPGRADE_CATALOG_PATH.c_str(), F_OK) == 0) {
-                *problem_out = "upgrade catalog is unreadable; run 'gpkg update'";
-            } else {
-                *problem_out = "upgrade catalog is missing; run 'gpkg update'";
+        std::string rebuild_error;
+        if (ensure_current_upgrade_catalog(verbose, &rebuild_error) &&
+            load_json_document(UPGRADE_CATALOG_PATH, root)) {
+            // Rebuilt on demand.
+        } else {
+            if (problem_out) {
+                if (!rebuild_error.empty()) {
+                    *problem_out = rebuild_error;
+                } else if (access(UPGRADE_CATALOG_PATH.c_str(), F_OK) == 0) {
+                    *problem_out = "upgrade catalog is unreadable; run 'gpkg update'";
+                } else {
+                    *problem_out = "upgrade catalog is missing; run 'gpkg update'";
+                }
             }
+            return false;
         }
-        return false;
     }
 
     out_catalog.fingerprint = json_string_or(json_object_get(root, "fingerprint"));
     if (out_catalog.fingerprint.empty()) {
-        if (problem_out) *problem_out = "upgrade catalog is missing its fingerprint; run 'gpkg update'";
-        return false;
+        std::string rebuild_error;
+        if (!ensure_current_upgrade_catalog(verbose, &rebuild_error) ||
+            !load_json_document(UPGRADE_CATALOG_PATH, root)) {
+            if (problem_out) {
+                *problem_out = rebuild_error.empty()
+                    ? "upgrade catalog is missing its fingerprint; run 'gpkg update'"
+                    : rebuild_error;
+            }
+            return false;
+        }
+        out_catalog.fingerprint = json_string_or(json_object_get(root, "fingerprint"));
     }
 
     std::string expected_fingerprint = build_upgrade_catalog_fingerprint();
     if (out_catalog.fingerprint != expected_fingerprint) {
-        if (problem_out) *problem_out = "upgrade catalog is stale; run 'gpkg update'";
-        return false;
+        std::string rebuild_error;
+        if (!ensure_current_upgrade_catalog(verbose, &rebuild_error) ||
+            !load_json_document(UPGRADE_CATALOG_PATH, root)) {
+            if (problem_out) {
+                *problem_out = rebuild_error.empty()
+                    ? "upgrade catalog is stale; run 'gpkg update'"
+                    : rebuild_error;
+            }
+            return false;
+        }
+
+        out_catalog.fingerprint = json_string_or(json_object_get(root, "fingerprint"));
+        if (out_catalog.fingerprint != expected_fingerprint) {
+            if (problem_out) *problem_out = "upgrade catalog is stale; run 'gpkg update'";
+            return false;
+        }
     }
 
     out_catalog.resolved_roots = json_string_array(json_object_get(root, "resolved_roots"));
@@ -892,7 +1283,8 @@ bool ensure_repo_urls(const std::vector<std::string>& urls) {
 }
 
 bool ensure_repo_index_available() {
-    if (access(get_repo_catalog_path().c_str(), F_OK) == 0) return true;
+    auto urls = get_repo_urls();
+    if (repo_catalog_matches_current_sources(urls)) return true;
     if (access(get_legacy_repo_index_path().c_str(), F_OK) == 0) {
         std::string migration_error;
         if (migrate_legacy_repo_index_to_catalog(false, &migration_error)) return true;
@@ -903,8 +1295,12 @@ bool ensure_repo_index_available() {
         return false;
     }
 
+    std::string build_error;
+    if (build_current_repo_catalog(false, &build_error)) return true;
+
     std::cerr << Color::RED
-              << "E: No package index available. Run 'gpkg update' first."
+              << "E: No package index available. "
+              << (build_error.empty() ? "Run 'gpkg update' first." : build_error)
               << Color::RESET << std::endl;
     return false;
 }
@@ -1054,7 +1450,10 @@ void populate_package_metadata_from_json(const std::string& obj, PackageMetadata
 }
 
 bool ensure_repo_package_cache_loaded(bool verbose) {
-    if (g_repo_package_cache_loaded) return true;
+    if (g_repo_package_cache_loaded) {
+        if (repo_catalog_matches_current_sources(get_repo_urls())) return true;
+        invalidate_repo_package_cache();
+    }
     if (!ensure_repo_index_available()) return false;
 
     std::map<std::string, uint64_t> offsets;
@@ -1349,12 +1748,8 @@ bool append_cached_debian_imported_catalog(
 
     std::string cache_path = get_debian_imported_index_binary_cache_path();
     std::string state_path = get_debian_imported_index_state_path();
-    std::string preview_binary_path = get_debian_search_preview_binary_cache_path();
-    std::string preview_json_path = get_debian_search_preview_path();
     if (access(cache_path.c_str(), F_OK) != 0 ||
-        access(state_path.c_str(), F_OK) != 0 ||
-        (access(preview_binary_path.c_str(), F_OK) != 0 &&
-         access(preview_json_path.c_str(), F_OK) != 0)) {
+        access(state_path.c_str(), F_OK) != 0) {
         return false;
     }
 
@@ -1383,6 +1778,67 @@ bool append_cached_debian_imported_catalog(
 
     if (appended_count_out) *appended_count_out = appended_count;
     return appended_count > 0;
+}
+
+bool build_current_repo_catalog(bool verbose, std::string* error_out) {
+    if (error_out) error_out->clear();
+
+    auto urls = get_repo_urls();
+    std::string fingerprint = build_repo_catalog_fingerprint(urls);
+    std::map<std::string, PackageMetadata> packages;
+    int success_count = 0;
+
+    for (const auto& url : urls) {
+        std::string source_json = get_repo_source_index_json_path(url);
+        if (access(source_json.c_str(), F_OK) != 0) continue;
+
+        foreach_json_object(source_json, [&](const std::string& obj) {
+            PackageMetadata candidate;
+            populate_package_metadata_from_json(obj, candidate);
+            candidate.name = trim(candidate.name);
+            if (candidate.name.empty()) return true;
+            if (candidate.source_url.empty()) candidate.source_url = normalize_repo_base_url(url);
+            if (candidate.source_kind.empty()) candidate.source_kind = "gpkg_repo";
+            merge_repo_catalog_candidate(packages, candidate);
+            return true;
+        });
+        ++success_count;
+    }
+
+    std::string debian_error;
+    std::string packages_txt = get_debian_packages_cache_path();
+    if (access(packages_txt.c_str(), F_OK) == 0 &&
+        ensure_current_debian_imported_index_cache(verbose, &debian_error)) {
+        std::string import_cache_fingerprint =
+            build_debian_imported_index_cache_fingerprint(packages_txt);
+        int debian_package_count = 0;
+        if (append_cached_debian_imported_catalog(
+                packages,
+                import_cache_fingerprint,
+                verbose,
+                &debian_package_count
+            )) {
+            ++success_count;
+        }
+    } else if (verbose && !debian_error.empty()) {
+        VLOG(verbose, "Skipping Debian imported catalog while rebuilding the repo catalog: "
+                     << debian_error);
+    }
+
+    if (success_count == 0) {
+        if (error_out) *error_out = "no cached package sources are available; run 'gpkg update'";
+        return false;
+    }
+
+    if (!write_repo_catalog(packages, error_out)) return false;
+    RepoCatalogState state;
+    state.fingerprint = fingerprint;
+    if (!save_repo_catalog_state(get_repo_catalog_state_path(), state)) {
+        if (error_out) *error_out = "failed to persist repo catalog state";
+        return false;
+    }
+    remove_optional_cache_export(get_legacy_repo_index_path());
+    return true;
 }
 
 bool update_debian_backend_catalog(
@@ -1604,125 +2060,185 @@ bool update_debian_backend_catalog(
     return true;
 }
 
+bool sync_debian_testing_index(
+    bool verbose,
+    bool* changed_out = nullptr,
+    std::string* result_out = nullptr
+) {
+    if (changed_out) *changed_out = false;
+    if (result_out) result_out->clear();
+
+    DebianBackendConfig config = load_debian_backend_config(verbose);
+    std::string packages_gz = get_debian_packages_gz_cache_path();
+    std::string packages_txt = get_debian_packages_cache_path();
+    std::string packages_state = get_debian_packages_state_path();
+    if (!mkdir_parent(packages_gz)) return false;
+
+    DebianPackagesCacheState cached_state;
+    bool have_cached_state = load_debian_packages_cache_state(packages_state, cached_state);
+    bool have_packages_txt = access(packages_txt.c_str(), F_OK) == 0;
+
+    DebianPackagesCacheState remote_state;
+    std::string probe_error;
+    bool have_remote_state = fetch_remote_packages_index_state(
+        config.packages_url,
+        remote_state,
+        verbose,
+        &probe_error
+    );
+
+    if (have_packages_txt && have_cached_state && have_remote_state &&
+        remote_packages_index_matches_cache(cached_state, remote_state)) {
+        if (result_out) *result_out = "✓ Reused cached Debian testing Packages index";
+        return true;
+    } else if (verbose && !have_remote_state && !probe_error.empty()) {
+        VLOG(verbose, "Unable to probe Debian Packages metadata; falling back to cached state: "
+                     << probe_error);
+    }
+
+    if (have_packages_txt) {
+        bool pdiff_changed = false;
+        size_t pdiff_patches_applied = 0;
+        std::string pdiff_error;
+        if (try_update_debian_packages_with_pdiff(
+                config,
+                packages_txt,
+                verbose,
+                pdiff_changed,
+                pdiff_patches_applied,
+                &pdiff_error
+            )) {
+            if (have_remote_state) save_debian_packages_cache_state(packages_state, remote_state);
+            else remove(packages_state.c_str());
+
+            if (changed_out) *changed_out = pdiff_changed;
+            if (result_out) {
+                if (pdiff_changed) {
+                    *result_out = "✓ Updated Debian testing Packages index via PDiff (" +
+                                  std::to_string(pdiff_patches_applied) + " patch" +
+                                  (pdiff_patches_applied == 1 ? "" : "es") + ")";
+                } else {
+                    *result_out = "✓ Reused cached Debian testing Packages index";
+                }
+            }
+            return true;
+        } else if (verbose && !pdiff_error.empty()) {
+            VLOG(verbose, "Unable to apply Debian PDiffs; falling back to full Packages download: "
+                         << pdiff_error);
+        }
+    }
+
+    std::string download_error;
+    if (!DownloadFile(config.packages_url, packages_gz, verbose, &download_error)) {
+        if (have_packages_txt) {
+            if (result_out) *result_out = "✓ Reused cached Debian testing Packages index";
+            return true;
+        }
+        if (result_out) {
+            *result_out = "W: Failed to fetch Debian Packages index from " + config.packages_url +
+                          (download_error.empty() ? "" : " (" + download_error + ")");
+        }
+        return false;
+    }
+
+    std::string unpack_error;
+    if (!GpkgArchive::decompress_gzip_file(packages_gz, packages_txt, &unpack_error)) {
+        if (have_packages_txt) {
+            if (result_out) *result_out = "✓ Reused cached Debian testing Packages index";
+            return true;
+        }
+        if (result_out) {
+            *result_out = "W: Failed to unpack Debian Packages index" +
+                          (unpack_error.empty() ? "" : " (" + unpack_error + ")");
+        }
+        return false;
+    }
+
+    if (have_remote_state) save_debian_packages_cache_state(packages_state, remote_state);
+    else remove(packages_state.c_str());
+
+    if (changed_out) *changed_out = true;
+    if (result_out) *result_out = "✓ Updated Debian testing Packages index";
+    return true;
+}
+
 int handle_update(bool verbose) {
     auto urls = get_repo_urls();
     VLOG(verbose, "Found " << urls.size() << " repository URLs.");
     std::cout << Color::BLUE << "Updating package indices (this may take a while)..." << Color::RESET << std::endl;
     run_command("mkdir -p " + REPO_CACHE_PATH, verbose);
 
-    std::map<std::string, PackageMetadata> packages;
     int success_count = 0;
+    bool repo_sources_changed = false;
 
-    for (size_t i = 0; i < urls.size(); ++i) {
-        const std::string& url = urls[i];
+    for (const auto& url : urls) {
         std::string full_url = build_repo_index_url(url);
-        std::string dest_zst = REPO_CACHE_PATH + "repo_index_" + std::to_string(i) + ".json.zst";
-        std::string dest_json = REPO_CACHE_PATH + "repo_index_" + std::to_string(i) + ".json";
-
-        VLOG(verbose, "Fetching index from: " << full_url);
+        VLOG(verbose, "Refreshing cached index from: " << full_url);
         std::cout << "Get: " << full_url << std::endl;
 
-        std::string download_error;
-        if (!DownloadFile(full_url, dest_zst, verbose, &download_error)) {
-            std::cerr << Color::YELLOW << "W: Failed to fetch index from " << url;
-            if (!download_error.empty()) std::cerr << " (" << download_error << ")";
-            std::cerr << Color::RESET << std::endl;
-            continue;
-        }
-
-        std::string decompress_error;
-        if (!GpkgArchive::decompress_zstd_file(dest_zst, dest_json, &decompress_error)) {
-            std::cerr << Color::YELLOW << "W: Failed to decompress index from " << url << Color::RESET << std::endl;
-            if (verbose && !decompress_error.empty()) {
-                std::cerr << "[DEBUG] Repo index decompress error: " << decompress_error << std::endl;
+        bool source_changed = false;
+        size_t package_count = 0;
+        std::string result;
+        if (!sync_repo_source_index(url, verbose, &source_changed, &package_count, &result)) {
+            if (!result.empty()) {
+                std::cerr << Color::YELLOW << result << Color::RESET << std::endl;
             }
-            remove(dest_zst.c_str());
             continue;
         }
 
-        int repo_package_count = 0;
-        foreach_json_object(dest_json, [&](const std::string& obj) {
-            PackageMetadata candidate;
-            populate_package_metadata_from_json(obj, candidate);
-            candidate.name = trim(candidate.name);
-            if (candidate.name.empty()) return true;
-            if (candidate.source_url.empty()) candidate.source_url = normalize_repo_base_url(url);
-            if (candidate.source_kind.empty()) candidate.source_kind = "gpkg_repo";
-            merge_repo_catalog_candidate(packages, candidate);
-            ++repo_package_count;
-            return true;
-        });
-
-        remove(dest_zst.c_str());
-        remove(dest_json.c_str());
-
+        repo_sources_changed = repo_sources_changed || source_changed;
         ++success_count;
-        std::cout << Color::GREEN << "✓ Updated index from " << url
-                  << " (" << repo_package_count << " packages)" << Color::RESET << std::endl;
+        if (!result.empty()) {
+            std::cout << Color::GREEN << result << Color::RESET << std::endl;
+        }
     }
 
-    int debian_package_count = 0;
-    if (update_debian_backend_catalog(packages, debian_package_count, verbose)) {
+    bool debian_changed = false;
+    std::string debian_result;
+    if (sync_debian_testing_index(verbose, &debian_changed, &debian_result)) {
         ++success_count;
+        if (!debian_result.empty()) {
+            std::cout << Color::GREEN << debian_result << Color::RESET << std::endl;
+        }
+    } else if (!debian_result.empty()) {
+        std::cerr << Color::YELLOW << debian_result << Color::RESET << std::endl;
     }
-    VLOG(verbose, "Selected " << debian_package_count
-         << " Debian-backed package records for the binary catalog.");
 
     if (success_count == 0) {
         std::cerr << Color::RED << "E: Failed to update any package indices." << Color::RESET << std::endl;
         return 1;
     }
 
-    std::string write_error;
-    if (!write_repo_catalog(packages, &write_error)) {
-        std::cerr << Color::RED << "E: Failed to write the binary package catalog";
-        if (!write_error.empty()) std::cerr << ": " << write_error;
-        std::cerr << Color::RESET << std::endl;
-        return 1;
-    }
-    remove_optional_cache_export(get_legacy_repo_index_path());
-
-    invalidate_repo_package_cache();
-    if (!ensure_repo_package_cache_loaded(verbose)) {
-        std::cerr << Color::RED << "E: Failed to reload the binary package catalog after update."
-                  << Color::RESET << std::endl;
-        return 1;
+    bool debian_views_stale = false;
+    std::string packages_txt = get_debian_packages_cache_path();
+    if (access(packages_txt.c_str(), F_OK) == 0) {
+        debian_views_stale =
+            !debian_imported_index_cache_is_current(packages_txt) ||
+            !debian_compiled_record_cache_is_current();
     }
 
-    ResolvedUpgradeCatalog upgrade_catalog;
-    std::string catalog_error;
-    if (!build_resolved_upgrade_catalog(upgrade_catalog, verbose, &catalog_error)) {
-        std::cerr << Color::RED << "E: Failed to build the runtime upgrade catalog";
-        if (!catalog_error.empty()) std::cerr << ": " << catalog_error;
-        std::cerr << Color::RESET << std::endl;
-        return 1;
-    }
-    if (!write_upgrade_catalog(upgrade_catalog, &catalog_error)) {
-        std::cerr << Color::RED << "E: Failed to write the runtime upgrade catalog";
-        if (!catalog_error.empty()) std::cerr << ": " << catalog_error;
-        std::cerr << Color::RESET << std::endl;
-        return 1;
+    if (debian_changed || debian_views_stale) {
+        invalidate_debian_derived_metadata_caches(verbose);
     }
 
-    std::cout << Color::GREEN << "✓ Merged " << packages.size() << " packages from "
-              << success_count << " sources." << Color::RESET << std::endl;
-    std::cout << Color::GREEN << "✓ Wrote validated upgrade catalog for "
-              << upgrade_catalog.resolved_roots.size() << " upgrade "
-              << (upgrade_catalog.resolved_roots.size() == 1 ? "root" : "roots")
+    if (repo_sources_changed || debian_changed || debian_views_stale) {
+        remove(get_repo_catalog_path().c_str());
+        remove(get_repo_catalog_state_path().c_str());
+        remove(get_legacy_repo_index_path().c_str());
+        remove(UPGRADE_CATALOG_PATH.c_str());
+        invalidate_repo_package_cache();
+    }
+
+    std::cout << Color::GREEN << "✓ Synced raw package indices from "
+              << success_count << " source"
+              << (success_count == 1 ? "" : "s")
               << Color::RESET << std::endl;
-    if (!upgrade_catalog.skipped_entries.empty()) {
-        std::cout << Color::YELLOW << "W: Skipped "
-                  << upgrade_catalog.skipped_entries.size()
-                  << " configured runtime upgrade entr"
-                  << (upgrade_catalog.skipped_entries.size() == 1 ? "y" : "ies")
-                  << " during catalog validation:" << Color::RESET << std::endl;
-        for (const auto& entry : upgrade_catalog.skipped_entries) {
-            std::cout << "  " << Color::YELLOW << entry.kind << " "
-                      << entry.configured_name;
-            if (!entry.trigger.empty()) std::cout << " (trigger " << entry.trigger << ")";
-            std::cout << ": " << entry.reason << Color::RESET << std::endl;
-        }
+    if (repo_sources_changed || debian_changed || debian_views_stale) {
+        std::cout << Color::BLUE
+                  << "Derived package catalogs will be rebuilt on demand."
+                  << Color::RESET << std::endl;
     }
+
     return 0;
 }
 

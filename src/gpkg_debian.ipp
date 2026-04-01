@@ -283,6 +283,24 @@ bool load_debian_compiled_record_cache(
     std::map<std::string, DebianCompiledRecordCacheEntry>& entries_by_package,
     std::string* error_out = nullptr
 );
+bool load_debian_imported_index_cache_state(
+    const std::string& path,
+    DebianImportedIndexCacheState& state
+);
+bool load_debian_compiled_record_cache_state(
+    const std::string& path,
+    DebianCompiledRecordCacheState& state
+);
+bool debian_imported_index_cache_is_current(
+    const std::string& packages_path,
+    std::string* fingerprint_out = nullptr
+);
+bool debian_compiled_record_cache_is_current();
+void invalidate_debian_derived_metadata_caches(bool verbose = false);
+bool ensure_current_debian_imported_index_cache(
+    bool verbose,
+    std::string* error_out = nullptr
+);
 
 std::string sanitize_section_name(const std::string& raw_section) {
     std::string top_level = raw_section;
@@ -3077,6 +3095,29 @@ std::string get_debian_raw_context_index_state_path() {
     return REPO_CACHE_PATH + "debian/Packages.compiled.index.state";
 }
 
+void invalidate_debian_derived_metadata_caches(bool verbose) {
+    const std::vector<std::string> paths = {
+        get_debian_search_preview_binary_cache_path(),
+        get_debian_search_preview_path(),
+        get_debian_imported_index_binary_cache_path(),
+        get_debian_imported_index_cache_path(),
+        get_debian_imported_index_state_path(),
+        get_debian_compiled_record_cache_path(),
+        get_debian_compiled_record_state_path(),
+        get_debian_raw_context_index_path(),
+        get_debian_raw_context_index_state_path(),
+    };
+
+    for (const auto& path : paths) {
+        if (remove(path.c_str()) != 0 && errno != ENOENT) {
+            VLOG(verbose, "Failed to remove stale Debian cache artifact " << path
+                 << ": " << strerror(errno));
+        }
+    }
+
+    invalidate_debian_search_preview_cache();
+}
+
 std::string strip_debian_index_compression_suffix(const std::string& path) {
     static const char* kSuffixes[] = {".gz", ".xz", ".bz2", ".lzma", ".zst", ".zstd"};
     for (const char* suffix : kSuffixes) {
@@ -4185,6 +4226,15 @@ bool ensure_raw_debian_context_loaded(
     context.policy = get_import_policy(verbose);
     context.compiled_cache_path = get_debian_compiled_record_cache_path();
 
+    std::string import_prepare_error;
+    if (!ensure_current_debian_imported_index_cache(verbose, &import_prepare_error)) {
+        context.problem = import_prepare_error.empty()
+            ? "cached Debian metadata is stale or incomplete; run 'gpkg update'"
+            : import_prepare_error;
+        if (error_out) *error_out = context.problem;
+        return false;
+    }
+
     std::string index_error;
     if (!load_debian_raw_context_index(
             context.raw_package_offsets,
@@ -4494,6 +4544,27 @@ std::string build_debian_imported_index_cache_fingerprint(
         debian_cache_fingerprint_component(UPGRADEABLE_SYSTEM_PATH);
 }
 
+bool debian_imported_index_cache_is_current(
+    const std::string& packages_path,
+    std::string* fingerprint_out
+) {
+    if (fingerprint_out) fingerprint_out->clear();
+
+    std::string cache_path = get_debian_imported_index_binary_cache_path();
+    std::string state_path = get_debian_imported_index_state_path();
+    if (access(cache_path.c_str(), F_OK) != 0 || access(state_path.c_str(), F_OK) != 0) {
+        return false;
+    }
+
+    std::string fingerprint = build_debian_imported_index_cache_fingerprint(packages_path);
+    DebianImportedIndexCacheState state;
+    if (!load_debian_imported_index_cache_state(state_path, state)) return false;
+    if (state.fingerprint != fingerprint) return false;
+
+    if (fingerprint_out) *fingerprint_out = fingerprint;
+    return true;
+}
+
 uint64_t fnv1a64_update_bytes(uint64_t hash, const void* data, size_t size) {
     const unsigned char* bytes = static_cast<const unsigned char*>(data);
     for (size_t i = 0; i < size; ++i) {
@@ -4672,6 +4743,18 @@ std::string build_debian_compiled_record_cache_policy_fingerprint() {
         debian_cache_fingerprint_component(DEBIAN_CONFIG_PATH) + "|" +
         debian_cache_fingerprint_component(SYSTEM_PROVIDES_PATH) + "|" +
         debian_cache_fingerprint_component(UPGRADEABLE_SYSTEM_PATH);
+}
+
+bool debian_compiled_record_cache_is_current() {
+    std::string cache_path = get_debian_compiled_record_cache_path();
+    std::string state_path = get_debian_compiled_record_state_path();
+    if (access(cache_path.c_str(), F_OK) != 0 || access(state_path.c_str(), F_OK) != 0) {
+        return false;
+    }
+
+    DebianCompiledRecordCacheState state;
+    if (!load_debian_compiled_record_cache_state(state_path, state)) return false;
+    return state.policy_fingerprint == build_debian_compiled_record_cache_policy_fingerprint();
 }
 
 std::string describe_debian_cache_rebuild_reason(
@@ -6172,6 +6255,99 @@ bool finish_debian_compiled_record_cache_stream(
     return true;
 }
 
+bool ensure_current_debian_imported_index_cache(
+    bool verbose,
+    std::string* error_out
+) {
+    if (error_out) error_out->clear();
+
+    DebianBackendConfig config = load_debian_backend_config(verbose);
+    std::string packages_txt = get_debian_packages_cache_path();
+    if (access(packages_txt.c_str(), F_OK) != 0) {
+        if (error_out) *error_out = "cached Debian Packages index is unavailable; run 'gpkg update'";
+        return false;
+    }
+
+    std::string import_cache_fingerprint;
+    if (debian_imported_index_cache_is_current(packages_txt, &import_cache_fingerprint) &&
+        debian_compiled_record_cache_is_current()) {
+        return true;
+    }
+    if (import_cache_fingerprint.empty()) {
+        import_cache_fingerprint = build_debian_imported_index_cache_fingerprint(packages_txt);
+    }
+
+    ImportPolicy policy = get_import_policy(verbose);
+    DebianParsedRecordCacheState parsed_cache_state;
+    CompactPackageAvailabilityIndex prepared_compact_index;
+    const CompactPackageAvailabilityIndex* prepared_compact_index_ptr = nullptr;
+    std::string parsed_cache_error;
+    if (!ensure_current_debian_parsed_record_cache(
+            packages_txt,
+            config,
+            verbose,
+            &parsed_cache_state,
+            &prepared_compact_index,
+            &parsed_cache_error
+        )) {
+        VLOG(verbose, "Failed to prepare the Debian parsed-record cache: " << parsed_cache_error);
+    } else if (!prepared_compact_index.available_packages.empty()) {
+        prepared_compact_index_ptr = &prepared_compact_index;
+    }
+
+    DebianIncrementalImportResult incremental_import =
+        parsed_cache_error.empty()
+            ? load_debian_index_entries_from_current_parsed_cache_incremental(
+                  packages_txt,
+                  config,
+                  policy,
+                  prepared_compact_index_ptr,
+                  verbose
+              )
+            : DebianIncrementalImportResult{};
+    if (parsed_cache_error.empty() && incremental_import.processed_records == 0 &&
+        parsed_cache_state.record_count > 0) {
+        VLOG(verbose, "Streaming Debian import produced no compiled entries; falling back to the in-memory path.");
+        std::vector<DebianPackageRecord> records = parse_debian_packages_file(packages_txt, config, verbose);
+        incremental_import =
+            load_debian_index_entries_from_records_incremental(records, config, policy, verbose);
+    } else if (!parsed_cache_error.empty()) {
+        std::vector<DebianPackageRecord> records = parse_debian_packages_file(packages_txt, config, verbose);
+        incremental_import =
+            load_debian_index_entries_from_records_incremental(records, config, policy, verbose);
+    }
+
+    std::vector<PackageMetadata>& entries = incremental_import.entries;
+    std::string compiled_cache_error;
+    bool compiled_cache_available = incremental_import.compiled_record_cache_written;
+    if (!compiled_cache_available) {
+        compiled_cache_available = write_debian_compiled_record_cache(
+            incremental_import.compiled_record_entries,
+            build_debian_compiled_record_cache_policy_fingerprint(),
+            &compiled_cache_error
+        );
+        if (!compiled_cache_available) {
+            std::cerr << Color::YELLOW
+                      << "W: Failed to write Debian compiled record cache";
+            if (!compiled_cache_error.empty()) std::cerr << " (" << compiled_cache_error << ")";
+            std::cerr << ". On-demand Debian lookups may be slower."
+                      << Color::RESET << std::endl;
+        }
+    }
+
+    std::string import_cache_error;
+    if (!write_debian_imported_index_cache(entries, import_cache_fingerprint, &import_cache_error)) {
+        if (error_out) {
+            *error_out = import_cache_error.empty()
+                ? "failed to write imported Debian index cache"
+                : import_cache_error;
+        }
+        return false;
+    }
+
+    return true;
+}
+
 bool materialize_imported_entries_from_compiled_cache(
     const std::map<std::string, ImportedPackageDependencyState>& selected,
     std::vector<PackageMetadata>& entries_out,
@@ -6240,10 +6416,8 @@ bool append_cached_debian_imported_index(
 ) {
     std::string cache_path = get_debian_imported_index_binary_cache_path();
     std::string state_path = get_debian_imported_index_state_path();
-    std::string preview_path = get_debian_search_preview_binary_cache_path();
     if (access(cache_path.c_str(), F_OK) != 0 ||
-        access(state_path.c_str(), F_OK) != 0 ||
-        access(preview_path.c_str(), F_OK) != 0) {
+        access(state_path.c_str(), F_OK) != 0) {
         return false;
     }
 

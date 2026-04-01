@@ -2399,16 +2399,36 @@ struct ScopedMaintainerScriptCompat {
         if (!wrapper_root) return;
         wrapper_dir = wrapper_root;
 
-        std::ostringstream script;
-        script << "#!/bin/sh\n"
-               << "worker=" << shell_quote(worker_path) << "\n"
-               << "exec \"$worker\"";
-        if (!root_prefix.empty()) script << " --root " << shell_quote(root_prefix);
-        if (verbose) script << " --verbose";
-        script << " --compat-dpkg-query \"$@\"\n";
+        struct CompatWrapperSpec {
+            const char* name;
+            const char* action;
+        };
 
-        std::string wrapper_path = wrapper_dir + "/dpkg-query";
-        if (!write_executable_script_local(wrapper_path, script.str())) {
+        const CompatWrapperSpec wrappers[] = {
+            {"dpkg-query", "--compat-dpkg-query"},
+            {"update-rc.d", "--compat-update-rc.d"},
+            {"invoke-rc.d", "--compat-invoke-rc.d"},
+            {"service", "--compat-service"},
+        };
+
+        bool wrappers_ok = true;
+        for (const auto& spec : wrappers) {
+            std::ostringstream script;
+            script << "#!/bin/sh\n"
+                   << "worker=" << shell_quote(worker_path) << "\n"
+                   << "exec \"$worker\"";
+            if (!root_prefix.empty()) script << " --root " << shell_quote(root_prefix);
+            if (verbose) script << " --verbose";
+            script << " " << spec.action << " \"$@\"\n";
+
+            std::string wrapper_path = wrapper_dir + "/" + spec.name;
+            if (!write_executable_script_local(wrapper_path, script.str())) {
+                wrappers_ok = false;
+                break;
+            }
+        }
+
+        if (!wrappers_ok) {
             remove_tree_no_follow(wrapper_dir);
             wrapper_dir.clear();
             return;
@@ -3546,6 +3566,415 @@ int action_compat_dpkg_query(const std::vector<std::string>& raw_args) {
     }
 
     return run_real_dpkg_query_with_args(raw_args);
+}
+
+std::string compat_etc_directory() {
+    return g_root_prefix + "/etc";
+}
+
+std::string compat_init_script_path(const std::string& service_name) {
+    return compat_etc_directory() + "/init.d/" + service_name;
+}
+
+std::vector<std::string> compat_rc_directories() {
+    const char* suffixes[] = {"0", "1", "2", "3", "4", "5", "6", "S"};
+    std::vector<std::string> dirs;
+    dirs.reserve(sizeof(suffixes) / sizeof(suffixes[0]));
+    for (const char* suffix : suffixes) {
+        dirs.push_back(compat_etc_directory() + "/rc" + std::string(suffix) + ".d");
+    }
+    return dirs;
+}
+
+bool compat_is_service_action_suppressed(const std::string& action) {
+    return action == "start" ||
+           action == "restart" ||
+           action == "try-restart" ||
+           action == "reload" ||
+           action == "force-reload" ||
+           action == "reload-or-restart" ||
+           action == "reload-or-try-restart" ||
+           action == "condrestart";
+}
+
+bool compat_is_runlevel_token(const std::string& token) {
+    if (token.size() != 1) return false;
+    char runlevel = token[0];
+    return (runlevel >= '0' && runlevel <= '6') || runlevel == 'S';
+}
+
+bool compat_rc_entry_matches_service(const std::string& entry_name, const std::string& service_name) {
+    return entry_name.size() == service_name.size() + 3 &&
+           (entry_name[0] == 'S' || entry_name[0] == 'K') &&
+           std::isdigit(static_cast<unsigned char>(entry_name[1])) &&
+           std::isdigit(static_cast<unsigned char>(entry_name[2])) &&
+           entry_name.substr(3) == service_name;
+}
+
+bool compat_service_has_registered_links(const std::string& service_name) {
+    for (const auto& dir_path : compat_rc_directories()) {
+        DIR* dir = opendir(dir_path.c_str());
+        if (!dir) continue;
+
+        struct dirent* entry = nullptr;
+        while ((entry = readdir(dir)) != nullptr) {
+            std::string name = entry->d_name;
+            if (name == "." || name == "..") continue;
+            if (compat_rc_entry_matches_service(name, service_name)) {
+                closedir(dir);
+                return true;
+            }
+        }
+        closedir(dir);
+    }
+    return false;
+}
+
+bool compat_remove_registered_links(const std::string& service_name) {
+    for (const auto& dir_path : compat_rc_directories()) {
+        DIR* dir = opendir(dir_path.c_str());
+        if (!dir) continue;
+
+        std::vector<std::string> to_remove;
+        struct dirent* entry = nullptr;
+        while ((entry = readdir(dir)) != nullptr) {
+            std::string name = entry->d_name;
+            if (name == "." || name == "..") continue;
+            if (compat_rc_entry_matches_service(name, service_name)) {
+                to_remove.push_back(dir_path + "/" + name);
+            }
+        }
+        closedir(dir);
+
+        for (const auto& full_path : to_remove) {
+            if (unlink(full_path.c_str()) != 0 && errno != ENOENT) {
+                std::cerr << "update-rc.d: unable to remove " << full_path
+                          << ": " << strerror(errno) << std::endl;
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool compat_service_init_script_exists(const std::string& service_name) {
+    struct stat st {};
+    return lstat(compat_init_script_path(service_name).c_str(), &st) == 0 && !S_ISDIR(st.st_mode);
+}
+
+std::string compat_rc_entry_name(char kind, int priority, const std::string& service_name) {
+    std::ostringstream name;
+    name << kind << std::setw(2) << std::setfill('0') << priority << service_name;
+    return name.str();
+}
+
+bool compat_install_rc_link(
+    char runlevel,
+    char kind,
+    int priority,
+    const std::string& service_name
+) {
+    std::string dir_path = compat_etc_directory() + "/rc" + std::string(1, runlevel) + ".d";
+    if (!mkdir_p(dir_path)) {
+        std::cerr << "update-rc.d: unable to create " << dir_path
+                  << ": " << strerror(errno) << std::endl;
+        return false;
+    }
+
+    std::string entry_name = compat_rc_entry_name(kind, priority, service_name);
+    std::string entry_path = dir_path + "/" + entry_name;
+    std::string expected_target = "../init.d/" + service_name;
+
+    struct stat st {};
+    if (lstat(entry_path.c_str(), &st) == 0) {
+        if (S_ISLNK(st.st_mode) && read_symlink_target(entry_path) == expected_target) {
+            return true;
+        }
+        if (!remove_tree_no_follow(entry_path)) {
+            std::cerr << "update-rc.d: unable to replace " << entry_path
+                      << ": " << strerror(errno) << std::endl;
+            return false;
+        }
+    } else if (errno != ENOENT) {
+        std::cerr << "update-rc.d: unable to inspect " << entry_path
+                  << ": " << strerror(errno) << std::endl;
+        return false;
+    }
+
+    if (symlink(expected_target.c_str(), entry_path.c_str()) != 0) {
+        std::cerr << "update-rc.d: unable to create " << entry_path
+                  << ": " << strerror(errno) << std::endl;
+        return false;
+    }
+    return true;
+}
+
+// Native maintainer-script shims keep Debian service helpers working even when
+// the image does not ship the traditional SysV management utilities.
+struct CompatUpdateRcLinkSpec {
+    char kind = 'S';
+    int priority = 20;
+    std::vector<char> runlevels;
+};
+
+std::vector<CompatUpdateRcLinkSpec> compat_default_update_rc_specs(bool disabled) {
+    std::vector<CompatUpdateRcLinkSpec> specs;
+
+    CompatUpdateRcLinkSpec start_spec;
+    start_spec.kind = disabled ? 'K' : 'S';
+    start_spec.priority = disabled ? 80 : 20;
+    start_spec.runlevels = {'2', '3', '4', '5'};
+    specs.push_back(start_spec);
+
+    CompatUpdateRcLinkSpec stop_spec;
+    stop_spec.kind = 'K';
+    stop_spec.priority = 20;
+    stop_spec.runlevels = {'0', '1', '6'};
+    specs.push_back(stop_spec);
+
+    return specs;
+}
+
+bool compat_apply_update_rc_specs(
+    const std::string& service_name,
+    const std::vector<CompatUpdateRcLinkSpec>& specs
+) {
+    for (const auto& spec : specs) {
+        if (spec.priority < 0 || spec.priority > 99) {
+            std::cerr << "update-rc.d: unsupported sequence " << spec.priority << std::endl;
+            return false;
+        }
+        for (char runlevel : spec.runlevels) {
+            if (!compat_install_rc_link(runlevel, spec.kind, spec.priority, service_name)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool compat_parse_update_rc_explicit_specs(
+    const std::vector<std::string>& operands,
+    size_t start_index,
+    std::vector<CompatUpdateRcLinkSpec>* specs_out
+) {
+    if (!specs_out) return false;
+    specs_out->clear();
+
+    size_t index = start_index;
+    while (index < operands.size()) {
+        CompatUpdateRcLinkSpec spec;
+        if (operands[index] == "start") spec.kind = 'S';
+        else if (operands[index] == "stop") spec.kind = 'K';
+        else return false;
+        ++index;
+
+        if (index >= operands.size() || !parse_small_int_local(operands[index], &spec.priority) ||
+            spec.priority > 99) {
+            return false;
+        }
+        ++index;
+
+        while (index < operands.size() && operands[index] != ".") {
+            if (!compat_is_runlevel_token(operands[index])) return false;
+            spec.runlevels.push_back(operands[index][0]);
+            ++index;
+        }
+
+        if (spec.runlevels.empty() || index >= operands.size() || operands[index] != ".") {
+            return false;
+        }
+        ++index;
+        specs_out->push_back(spec);
+    }
+
+    return !specs_out->empty();
+}
+
+bool compat_toggle_registered_service_links(const std::string& service_name, bool enable) {
+    for (const auto& dir_path : compat_rc_directories()) {
+        std::string dir_name = path_basename(dir_path);
+        if (dir_name.size() != 5 || dir_name.rfind("rc", 0) != 0 || dir_name.substr(3) != ".d") continue;
+        char runlevel = dir_name[2];
+        if (runlevel == '0' || runlevel == '1' || runlevel == '6') continue;
+
+        DIR* dir = opendir(dir_path.c_str());
+        if (!dir) continue;
+
+        std::vector<std::pair<std::string, std::string>> renames;
+        struct dirent* entry = nullptr;
+        while ((entry = readdir(dir)) != nullptr) {
+            std::string current_name = entry->d_name;
+            if (!compat_rc_entry_matches_service(current_name, service_name)) continue;
+
+            char current_kind = current_name[0];
+            if ((enable && current_kind != 'K') || (!enable && current_kind != 'S')) continue;
+
+            int current_priority =
+                (current_name[1] - '0') * 10 +
+                (current_name[2] - '0');
+            int new_priority = 100 - current_priority;
+            if (new_priority < 0) new_priority = 0;
+            if (new_priority > 99) new_priority = 99;
+
+            std::string new_name = compat_rc_entry_name(enable ? 'S' : 'K', new_priority, service_name);
+            if (new_name == current_name) continue;
+            renames.push_back({dir_path + "/" + current_name, dir_path + "/" + new_name});
+        }
+        closedir(dir);
+
+        for (const auto& rename_pair : renames) {
+            remove_tree_no_follow(rename_pair.second);
+            if (rename(rename_pair.first.c_str(), rename_pair.second.c_str()) != 0) {
+                std::cerr << "update-rc.d: unable to rename " << rename_pair.first
+                          << " to " << rename_pair.second << ": "
+                          << strerror(errno) << std::endl;
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool compat_parse_service_invocation(
+    const std::vector<std::string>& raw_args,
+    std::string* service_name_out,
+    std::string* action_out,
+    std::vector<std::string>* script_args_out
+) {
+    if (service_name_out) service_name_out->clear();
+    if (action_out) action_out->clear();
+    if (script_args_out) script_args_out->clear();
+
+    std::vector<std::string> positional;
+    for (const auto& arg : raw_args) {
+        if (!arg.empty() && arg[0] == '-') continue;
+        positional.push_back(arg);
+    }
+
+    if (positional.size() < 2) return false;
+
+    std::string service_name = positional[0];
+    std::string action = positional[1];
+    if (service_name.empty() || action.empty()) return false;
+
+    if (service_name_out) *service_name_out = service_name;
+    if (action_out) *action_out = action;
+
+    if (script_args_out) {
+        script_args_out->push_back(action);
+        for (size_t i = 2; i < positional.size(); ++i) {
+            script_args_out->push_back(positional[i]);
+        }
+    }
+
+    return true;
+}
+
+int action_compat_update_rc_d(const std::vector<std::string>& raw_args) {
+    bool force = false;
+    std::vector<std::string> operands;
+    operands.reserve(raw_args.size());
+
+    for (const auto& arg : raw_args) {
+        if (arg == "-f" || arg == "--force") {
+            force = true;
+            continue;
+        }
+        if (!arg.empty() && arg[0] == '-') continue;
+        operands.push_back(arg);
+    }
+
+    if (operands.size() < 2) {
+        std::cerr << "update-rc.d: missing service name or command" << std::endl;
+        return 1;
+    }
+
+    const std::string& service_name = operands[0];
+    const std::string& command = operands[1];
+    bool requires_init_script =
+        command != "remove";
+
+    if (requires_init_script && !compat_service_init_script_exists(service_name)) {
+        std::cerr << "update-rc.d: /etc/init.d/" << service_name << " is missing" << std::endl;
+        return 1;
+    }
+    if (!requires_init_script && !force && !compat_service_init_script_exists(service_name)) {
+        std::cerr << "update-rc.d: refusing to remove " << service_name
+                  << " without -f because /etc/init.d/" << service_name << " is missing"
+                  << std::endl;
+        return 1;
+    }
+
+    if (command == "remove") {
+        return compat_remove_registered_links(service_name) ? 0 : 1;
+    }
+
+    if (command == "defaults" || command == "defaults-disabled") {
+        if (compat_service_has_registered_links(service_name)) return 0;
+        return compat_apply_update_rc_specs(
+            service_name,
+            compat_default_update_rc_specs(command == "defaults-disabled")
+        ) ? 0 : 1;
+    }
+
+    if (command == "disable" || command == "enable") {
+        return compat_toggle_registered_service_links(service_name, command == "enable") ? 0 : 1;
+    }
+
+    std::vector<CompatUpdateRcLinkSpec> specs;
+    if (!compat_parse_update_rc_explicit_specs(operands, 1, &specs)) {
+        std::cerr << "update-rc.d: unsupported arguments";
+        for (const auto& arg : raw_args) std::cerr << " " << arg;
+        std::cerr << std::endl;
+        return 1;
+    }
+    if (compat_service_has_registered_links(service_name)) return 0;
+    return compat_apply_update_rc_specs(service_name, specs) ? 0 : 1;
+}
+
+int action_compat_service_like(const std::vector<std::string>& raw_args) {
+    std::string service_name;
+    std::string action;
+    std::vector<std::string> script_args;
+    if (!compat_parse_service_invocation(raw_args, &service_name, &action, &script_args)) {
+        std::cerr << "invoke-rc.d: missing service name or action" << std::endl;
+        return 1;
+    }
+
+    if (!g_root_prefix.empty()) return 0;
+
+    if (compat_is_service_action_suppressed(action) &&
+        env_var_is_truthy(getenv("GPKG_DEFER_SERVICES"))) {
+        return 0;
+    }
+
+    std::string script_path = compat_init_script_path(service_name);
+    struct stat st {};
+    if (lstat(script_path.c_str(), &st) != 0 || S_ISDIR(st.st_mode)) {
+        return 0;
+    }
+
+    const char* shell_path = access("/bin/sh", X_OK) == 0 ? "/bin/sh" : nullptr;
+    if (!shell_path) {
+        std::cerr << "invoke-rc.d: unable to execute /bin/sh for " << service_name << std::endl;
+        return 1;
+    }
+
+    std::vector<std::string> argv;
+    argv.reserve(script_args.size() + 2);
+    argv.push_back(shell_path);
+    argv.push_back(script_path);
+    argv.insert(argv.end(), script_args.begin(), script_args.end());
+    return decode_command_exit_status(run_executable(argv));
+}
+
+int action_compat_invoke_rc_d(const std::vector<std::string>& raw_args) {
+    return action_compat_service_like(raw_args);
+}
+
+int action_compat_service(const std::vector<std::string>& raw_args) {
+    return action_compat_service_like(raw_args);
 }
 
 void populate_base_system_owner_map(std::map<std::string, std::string>& owner_by_path) {
@@ -7021,11 +7450,26 @@ int main(int argc, char* argv[]) {
             for (int j = i + 1; j < argc; ++j) compat_args.push_back(argv[j]);
             return action_compat_dpkg_query(compat_args);
         }
+        if (arg == "--compat-update-rc.d") {
+            std::vector<std::string> compat_args;
+            for (int j = i + 1; j < argc; ++j) compat_args.push_back(argv[j]);
+            return action_compat_update_rc_d(compat_args);
+        }
+        if (arg == "--compat-invoke-rc.d") {
+            std::vector<std::string> compat_args;
+            for (int j = i + 1; j < argc; ++j) compat_args.push_back(argv[j]);
+            return action_compat_invoke_rc_d(compat_args);
+        }
+        if (arg == "--compat-service") {
+            std::vector<std::string> compat_args;
+            for (int j = i + 1; j < argc; ++j) compat_args.push_back(argv[j]);
+            return action_compat_service(compat_args);
+        }
     }
 
     if (argc < 2) {
 
-        std::cout << "Usage: gpkg-worker [options]\nOptions:\n  --install <file>\n  --remove <pkg>\n  --purge <pkg>\n  --retire <pkg>\n  --verify <pkg>\n  --hydrate-control-metadata <pkg>\n  --compat-dpkg-query [dpkg-query args...]\n  --refresh-runtime-linker-state\n  --refresh-selinux-label-state\n  --register-file <path> --pkg <name>\n  --register-undo <cmd> --pkg <name>\n  --jobs <n>\n  --defer-runtime-linker-refresh\n  --defer-selinux-relabel\n  --unsafe-io\n";
+        std::cout << "Usage: gpkg-worker [options]\nOptions:\n  --install <file>\n  --remove <pkg>\n  --purge <pkg>\n  --retire <pkg>\n  --verify <pkg>\n  --hydrate-control-metadata <pkg>\n  --compat-dpkg-query [dpkg-query args...]\n  --compat-update-rc.d [update-rc.d args...]\n  --compat-invoke-rc.d [invoke-rc.d args...]\n  --compat-service [service args...]\n  --refresh-runtime-linker-state\n  --refresh-selinux-label-state\n  --register-file <path> --pkg <name>\n  --register-undo <cmd> --pkg <name>\n  --jobs <n>\n  --defer-runtime-linker-refresh\n  --defer-selinux-relabel\n  --unsafe-io\n";
 
         return 1;
 
