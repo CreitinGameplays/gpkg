@@ -15,6 +15,7 @@ struct DebianPackageRecord {
     std::string package;
     std::string version;
     std::string architecture;
+    std::string multi_arch;
     std::string maintainer;
     std::string section;
     std::string priority;
@@ -730,6 +731,7 @@ std::string* get_debian_record_field_storage(
     if (key == "Package") return &record.package;
     if (key == "Version") return &record.version;
     if (key == "Architecture") return &record.architecture;
+    if (key == "Multi-Arch") return &record.multi_arch;
     if (key == "Maintainer") return &record.maintainer;
     if (key == "Section") return &record.section;
     if (key == "Priority") return &record.priority;
@@ -1206,6 +1208,7 @@ bool write_debian_package_record_binary(std::ostream& out, const DebianPackageRe
         write_binary_string(out, record.package) &&
         write_binary_string(out, record.version) &&
         write_binary_string(out, record.architecture) &&
+        write_binary_string(out, record.multi_arch) &&
         write_binary_string(out, record.maintainer) &&
         write_binary_string(out, record.section) &&
         write_binary_string(out, record.priority) &&
@@ -1231,6 +1234,7 @@ bool read_debian_package_record_binary(std::istream& in, DebianPackageRecord& re
         read_binary_string(in, record.package) &&
         read_binary_string(in, record.version) &&
         read_binary_string(in, record.architecture) &&
+        read_binary_string(in, record.multi_arch) &&
         read_binary_string(in, record.maintainer) &&
         read_binary_string(in, record.section) &&
         read_binary_string(in, record.priority) &&
@@ -4739,6 +4743,7 @@ std::string fingerprint_debian_package_record(const DebianPackageRecord& record)
         record.package,
         record.version,
         record.architecture,
+        record.multi_arch,
         record.maintainer,
         record.section,
         record.priority,
@@ -4870,7 +4875,7 @@ bool dependency_watch_symbols_intersect(
 }
 
 std::string build_debian_parsed_record_cache_schema_fingerprint(const DebianBackendConfig& config) {
-    return "phase1|" +
+    return "phase2|" +
         debian_cache_fingerprint_component(DEBIAN_CONFIG_PATH) + "|" +
         config.packages_url + "|" +
         config.apt_arch;

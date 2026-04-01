@@ -206,6 +206,7 @@ struct NativeDpkgBootstrapEntry {
     std::string package;
     PackageStatusRecord status;
     PackageMetadata meta;
+    std::string multi_arch;
     std::set<std::string> files;
 };
 
@@ -293,6 +294,53 @@ std::string resolve_native_dpkg_bootstrap_name(
     return source_pkg_name;
 }
 
+const std::map<std::string, std::string>& native_dpkg_bootstrap_multi_arch_index(bool verbose) {
+    static bool loaded = false;
+    static std::map<std::string, std::string> index;
+    if (loaded) return index;
+    loaded = true;
+
+    DebianBackendConfig config = load_debian_backend_config(false);
+    std::string packages_path = get_debian_packages_cache_path();
+    if (packages_path.empty() || access(packages_path.c_str(), F_OK) != 0) return index;
+
+    DebianParsedRecordLoadResult parsed = load_debian_package_records_incremental(packages_path, config, false);
+    for (const auto& record : parsed.records) {
+        if (record.package.empty()) continue;
+        std::string multi_arch = trim(record.multi_arch);
+        if (multi_arch.empty()) continue;
+        index[record.package] = multi_arch;
+    }
+
+    if (verbose && !index.empty()) {
+        std::cout << "[DEBUG] Loaded Debian Multi-Arch metadata for "
+                  << index.size() << " package(s) for native dpkg bootstrap." << std::endl;
+    }
+    return index;
+}
+
+std::string resolve_native_dpkg_bootstrap_multi_arch(
+    const std::string& dpkg_name,
+    const PackageMetadata* meta,
+    bool verbose
+) {
+    const auto& index = native_dpkg_bootstrap_multi_arch_index(verbose);
+    auto find_multi_arch = [&](const std::string& key) -> std::string {
+        if (key.empty()) return "";
+        auto it = index.find(key);
+        return it == index.end() ? std::string() : it->second;
+    };
+
+    if (meta) {
+        std::string candidate = find_multi_arch(meta->debian_package);
+        if (!candidate.empty()) return candidate;
+        candidate = find_multi_arch(meta->name);
+        if (!candidate.empty()) return candidate;
+    }
+
+    return find_multi_arch(dpkg_name);
+}
+
 void merge_bootstrap_relation_list(std::vector<std::string>& dest, const std::vector<std::string>& src) {
     for (const auto& entry : src) {
         std::string normalized = trim(entry);
@@ -378,6 +426,9 @@ void seed_native_dpkg_bootstrap_entry(
 
     NativeDpkgBootstrapEntry& entry = ensure_native_dpkg_bootstrap_entry(entries, dpkg_name);
     if (meta) merge_bootstrap_metadata(entry, *meta, source_pkg_name);
+    if (entry.multi_arch.empty()) {
+        entry.multi_arch = resolve_native_dpkg_bootstrap_multi_arch(dpkg_name, meta, false);
+    }
 
     if (status_record && package_status_is_installed_like(status_record->status)) {
         entry.status.want = status_record->want.empty() ? "install" : status_record->want;
@@ -532,6 +583,7 @@ bool repair_native_dpkg_status_database(bool verbose, std::string* error_out) {
         std::string original_pkg_name;
         ssize_t package_index = -1;
         ssize_t version_index = -1;
+        ssize_t multi_arch_index = -1;
         for (size_t i = 0; i < paragraph.size(); ++i) {
             const std::string& raw = paragraph[i];
             size_t colon = raw.find(':');
@@ -545,6 +597,8 @@ bool repair_native_dpkg_status_database(bool verbose, std::string* error_out) {
             } else if (key == "Version") {
                 version = value;
                 version_index = static_cast<ssize_t>(i);
+            } else if (key == "Multi-Arch") {
+                multi_arch_index = static_cast<ssize_t>(i);
             }
         }
 
@@ -588,6 +642,21 @@ bool repair_native_dpkg_status_database(bool verbose, std::string* error_out) {
                 if (!resolved_version.empty() &&
                     is_native_dpkg_compat_placeholder_version(pkg_name, effective_version, policy)) {
                     effective_version = resolved_version;
+                }
+            }
+
+            std::string resolved_multi_arch =
+                resolve_native_dpkg_bootstrap_multi_arch(pkg_name, have_resolved_meta ? &resolved_meta : nullptr, false);
+            if (!resolved_multi_arch.empty()) {
+                if (multi_arch_index >= 0) {
+                    if (trim(paragraph[static_cast<size_t>(multi_arch_index)].substr(
+                            paragraph[static_cast<size_t>(multi_arch_index)].find(':') + 1)) != resolved_multi_arch) {
+                        paragraph[static_cast<size_t>(multi_arch_index)] = "Multi-Arch: " + resolved_multi_arch;
+                        changed = true;
+                    }
+                } else {
+                    paragraph.push_back("Multi-Arch: " + resolved_multi_arch);
+                    changed = true;
                 }
             }
 
@@ -1036,6 +1105,10 @@ bool bootstrap_native_dpkg_status_database(bool verbose, std::string* error_out)
 
         std::string architecture = normalize_dpkg_architecture_name(entry.meta.arch);
         if (package_name == "base-files" && entry.meta.arch.empty()) architecture = "all";
+        std::string multi_arch = trim(entry.multi_arch);
+        if (multi_arch.empty()) {
+            multi_arch = resolve_native_dpkg_bootstrap_multi_arch(package_name, &entry.meta, false);
+        }
 
         std::string description = description_summary(entry.meta.description, 200);
         if (description.empty()) {
@@ -1063,6 +1136,9 @@ bool bootstrap_native_dpkg_status_database(bool verbose, std::string* error_out)
         status_stream << "Section: " << section << "\n";
         status_stream << "Maintainer: " << maintainer << "\n";
         status_stream << "Architecture: " << architecture << "\n";
+        if (!multi_arch.empty()) {
+            status_stream << "Multi-Arch: " << multi_arch << "\n";
+        }
         status_stream << "Version: " << version << "\n";
         if (!installed_size_field.empty()) {
             status_stream << "Installed-Size: " << installed_size_field << "\n";
