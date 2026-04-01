@@ -16,15 +16,16 @@ Build both binaries:
 
 ```bash
 cd gpkg
-make
+make -j"$(nproc)"
 ```
 
 Install into a rootfs:
 
 ```bash
 cd gpkg
-make install DESTDIR=/path/to/rootfs
+make -j"$(nproc)" install DESTDIR=/path/to/rootfs
 ```
 
 Within the full GeminiOS build, `ports/geminios_complex/build.sh` is the single
-integration point that compiles and installs `gpkg`.
+integration point that compiles and installs `gpkg`, and it now invokes the
+module build with `-j"$(nproc)"`.
