@@ -272,8 +272,18 @@ std::string resolve_native_dpkg_bootstrap_name(
     if (source_pkg_name.empty()) return "";
 
     PackageMetadata meta;
-    if (get_installed_package_metadata(source_pkg_name, meta) ||
-        get_repo_package_info(source_pkg_name, meta)) {
+    if (get_installed_package_metadata(source_pkg_name, meta)) {
+        if (meta_out) *meta_out = meta;
+        std::string candidate = debian_backend_package_name(meta);
+        if (!candidate.empty()) return candidate;
+    }
+
+    PackageUniverseResult result;
+    if (query_full_universe_exact_package(source_pkg_name, result, false, nullptr) &&
+        result.found &&
+        result.installable &&
+        !result.meta.name.empty()) {
+        meta = result.meta;
         if (meta_out) *meta_out = meta;
         std::string candidate = debian_backend_package_name(meta);
         if (!candidate.empty()) return candidate;
@@ -834,7 +844,13 @@ bool bootstrap_native_dpkg_status_database(bool verbose, std::string* error_out)
 
     for (const auto& pkg_name : collect_registered_package_names_from_status_records(registered_status_records)) {
         PackageMetadata meta;
-        bool have_meta = get_installed_package_metadata(pkg_name, meta);
+        bool have_meta = false;
+        std::string bootstrap_name = resolve_native_dpkg_bootstrap_name(pkg_name, &meta);
+        if (!bootstrap_name.empty() && !meta.name.empty()) {
+            have_meta = true;
+        } else {
+            have_meta = get_installed_package_metadata(pkg_name, meta);
+        }
         bool should_seed = false;
         if (have_meta) {
             should_seed = package_is_debian_source(meta) ||
@@ -870,8 +886,13 @@ bool bootstrap_native_dpkg_status_database(bool verbose, std::string* error_out)
         if (!base_system_registry_entry_looks_present(base_entry)) continue;
 
         PackageMetadata meta;
-        bool have_meta = get_installed_package_metadata(base_entry.package, meta);
-        if (!have_meta) have_meta = get_repo_package_info(base_entry.package, meta);
+        bool have_meta = false;
+        std::string bootstrap_name = resolve_native_dpkg_bootstrap_name(base_entry.package, &meta);
+        if (!bootstrap_name.empty() && !meta.name.empty()) {
+            have_meta = true;
+        } else {
+            have_meta = get_installed_package_metadata(base_entry.package, meta);
+        }
 
         PackageStatusRecord record;
         record.package = base_entry.package;
@@ -894,8 +915,14 @@ bool bootstrap_native_dpkg_status_database(bool verbose, std::string* error_out)
         if (entries.find(pkg_name) != entries.end()) continue;
 
         PackageMetadata meta;
-        bool have_meta = get_installed_package_metadata(pkg_name, meta);
-        if (!have_meta) have_meta = get_repo_package_info(pkg_name, meta);
+        bool have_meta = false;
+        std::string bootstrap_name = resolve_native_dpkg_bootstrap_name(pkg_name, &meta);
+        if (!bootstrap_name.empty() && !meta.name.empty()) {
+            have_meta = true;
+            if (entries.find(bootstrap_name) != entries.end()) continue;
+        } else {
+            have_meta = get_installed_package_metadata(pkg_name, meta);
+        }
 
         std::vector<std::string> files = read_installed_file_list(pkg_name);
         std::string fallback_version;
