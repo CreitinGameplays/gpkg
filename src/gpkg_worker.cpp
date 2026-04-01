@@ -21,6 +21,9 @@
 #include <fnmatch.h>
 #include <mutex>
 #include <thread>
+#include <sys/mount.h>
+#include <sys/xattr.h>
+#include <sys/sysmacros.h>
 #include "gpkg_archive.ipp"
 
 // Configuration
@@ -186,6 +189,9 @@ bool ensure_symlink_target_if_possible(
 );
 bool action_refresh_dpkg_trigger_state();
 bool action_configure(const std::string& pkg_name, const std::string& old_version);
+bool action_prepare_transaction_root(const std::string& txn_dir);
+bool action_commit_transaction_root(const std::string& txn_dir);
+bool action_cleanup_transaction_root(const std::string& txn_dir);
 bool append_pending_dpkg_trigger_name(const std::string& trigger_name, std::string* error_out = nullptr);
 void mark_packages_trigger_pending(const std::vector<std::string>& trigger_names);
 std::vector<std::string> collect_shadowed_stale_runtime_provider_paths();
@@ -213,6 +219,8 @@ const InstalledManifestSnapshot& ensure_installed_manifest_snapshot();
 void invalidate_installed_manifest_snapshot();
 std::string find_cached_file_owner(const std::string& pkg_name, const std::string& file_path);
 std::string find_cached_base_file_owner(const std::string& file_path);
+std::string normalize_logical_absolute_path(const std::string& path);
+std::string logical_path_from_rooted_path(const std::string& full_path);
 
 // Logging
 bool g_verbose = false;
@@ -732,18 +740,33 @@ int run_executable(const std::vector<std::string>& argv) {
     pid_t pid = fork();
     if (pid < 0) return -1;
     if (pid == 0) {
+        bool rooted_exec = false;
+        std::string rooted_path;
+        if (!g_root_prefix.empty()) {
+            rooted_path = logical_path_from_rooted_path(argv.front());
+            rooted_exec = !rooted_path.empty();
+        }
+
         std::vector<char*> cargv;
         cargv.reserve(argv.size() + 1);
-        for (const auto& arg : argv) {
-            cargv.push_back(const_cast<char*>(arg.c_str()));
+        if (rooted_exec) {
+            if (chroot(g_root_prefix.c_str()) != 0 || chdir("/") != 0) _exit(127);
+            cargv.push_back(const_cast<char*>(rooted_path.c_str()));
+            for (size_t i = 1; i < argv.size(); ++i) {
+                cargv.push_back(const_cast<char*>(argv[i].c_str()));
+            }
+        } else {
+            for (const auto& arg : argv) {
+                cargv.push_back(const_cast<char*>(arg.c_str()));
+            }
         }
         cargv.push_back(nullptr);
-        execv(argv.front().c_str(), cargv.data());
+        execv(rooted_exec ? rooted_path.c_str() : argv.front().c_str(), cargv.data());
         if (errno == ENOEXEC && access("/bin/sh", X_OK) == 0) {
             std::vector<char*> sh_argv;
             sh_argv.reserve(argv.size() + 2);
             sh_argv.push_back(const_cast<char*>("/bin/sh"));
-            sh_argv.push_back(const_cast<char*>(argv.front().c_str()));
+            sh_argv.push_back(const_cast<char*>((rooted_exec ? rooted_path : argv.front()).c_str()));
             for (size_t i = 1; i < argv.size(); ++i) {
                 sh_argv.push_back(const_cast<char*>(argv[i].c_str()));
             }
@@ -1828,6 +1851,18 @@ std::string canonical_existing_path(const std::string& path) {
     return std::string(resolved);
 }
 
+std::string logical_path_from_rooted_path(const std::string& full_path) {
+    if (g_root_prefix.empty()) return "";
+    if (full_path == g_root_prefix) return "/";
+    std::string normalized_root = g_root_prefix;
+    while (normalized_root.size() > 1 && normalized_root.back() == '/') normalized_root.pop_back();
+    if (normalized_root.empty()) normalized_root = "/";
+    if (full_path == normalized_root) return "/";
+    std::string prefix = normalized_root + "/";
+    if (full_path.rfind(prefix, 0) != 0) return "";
+    return normalize_logical_absolute_path(full_path.substr(normalized_root.size()));
+}
+
 std::string normalize_logical_absolute_path(const std::string& path) {
     if (path.empty() || path[0] != '/') return "";
 
@@ -2397,19 +2432,16 @@ std::string maintscript_default_home() {
     if (g_root_prefix.empty()) return "/root";
     std::string candidate = g_root_prefix + "/root";
     struct stat st {};
-    if (stat(candidate.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) return candidate;
-    return g_root_prefix + "/";
+    if (stat(candidate.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) return "/root";
+    return "/";
 }
 
 std::string maintscript_default_tmpdir() {
-    const std::string candidate = g_root_prefix + "/tmp";
-    struct stat st {};
-    if (stat(candidate.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) return candidate;
     return "/tmp";
 }
 
 std::string compat_dpkg_admindir() {
-    return g_root_prefix + "/var/lib/gpkg";
+    return "/var/lib/gpkg";
 }
 
 std::string compat_dpkg_running_version() {
@@ -2480,6 +2512,7 @@ std::string default_maintscript_debian_frontend() {
 struct ScopedMaintainerScriptCompat {
     ScopedEnvOverrides env;
     std::string wrapper_dir;
+    std::string logical_wrapper_dir;
 
     ScopedMaintainerScriptCompat(
         const std::string& worker_path,
@@ -2488,10 +2521,39 @@ struct ScopedMaintainerScriptCompat {
     ) {
         if (worker_path.empty()) return;
 
-        char wrapper_template[] = "/tmp/gpkg-maintscript-compat-XXXXXX";
-        char* wrapper_root = mkdtemp(wrapper_template);
+        std::string base_template = root_prefix.empty()
+            ? "/tmp/gpkg-maintscript-compat-XXXXXX"
+            : root_prefix + "/tmp/gpkg-maintscript-compat-XXXXXX";
+        std::vector<char> wrapper_template(base_template.begin(), base_template.end());
+        wrapper_template.push_back('\0');
+        char* wrapper_root = mkdtemp(wrapper_template.data());
         if (!wrapper_root) return;
         wrapper_dir = wrapper_root;
+        logical_wrapper_dir = root_prefix.empty()
+            ? wrapper_dir
+            : logical_path_from_rooted_path(wrapper_dir);
+
+        std::string compat_worker_path = worker_path;
+        if (!root_prefix.empty()) {
+            std::string copied_worker_path = wrapper_dir + "/gpkg-worker";
+            if (copy_file_atomic(worker_path, copied_worker_path)) {
+                chmod(copied_worker_path.c_str(), 0755);
+                std::string logical_worker = logical_path_from_rooted_path(copied_worker_path);
+                if (!logical_worker.empty()) compat_worker_path = logical_worker;
+            } else {
+                const char* worker_candidates[] = {
+                    "/bin/apps/system/gpkg-worker",
+                    "/bin/gpkg-worker",
+                };
+                for (const char* candidate : worker_candidates) {
+                    std::string full_candidate = root_prefix + candidate;
+                    if (access(full_candidate.c_str(), X_OK) == 0) {
+                        compat_worker_path = candidate;
+                        break;
+                    }
+                }
+            }
+        }
 
         struct CompatWrapperSpec {
             const char* name;
@@ -2514,9 +2576,8 @@ struct ScopedMaintainerScriptCompat {
         for (const auto& spec : wrappers) {
             std::ostringstream script;
             script << "#!/bin/sh\n"
-                   << "worker=" << shell_quote(worker_path) << "\n"
+                   << "worker=" << shell_quote(compat_worker_path) << "\n"
                    << "exec \"$worker\"";
-            if (!root_prefix.empty()) script << " --root " << shell_quote(root_prefix);
             if (verbose) script << " --verbose";
             script << " " << spec.action << " \"$@\"\n";
 
@@ -2533,11 +2594,53 @@ struct ScopedMaintainerScriptCompat {
             return;
         }
 
-        env.set("PATH", build_maintscript_search_path(wrapper_dir));
+        env.set(
+            "PATH",
+            build_maintscript_search_path(
+                logical_wrapper_dir.empty() ? wrapper_dir : logical_wrapper_dir
+            )
+        );
     }
 
     ~ScopedMaintainerScriptCompat() {
         if (!wrapper_dir.empty()) remove_tree_no_follow(wrapper_dir);
+    }
+};
+
+struct ScopedRootedMaintainerScriptStage {
+    std::string staged_path;
+    std::string staging_dir;
+
+    explicit ScopedRootedMaintainerScriptStage(const std::string& script_path) {
+        if (g_root_prefix.empty() || script_path.empty()) {
+            staged_path = script_path;
+            return;
+        }
+
+        if (!logical_path_from_rooted_path(script_path).empty()) {
+            staged_path = script_path;
+            return;
+        }
+
+        std::string base_template = g_root_prefix + "/tmp/gpkg-maintscript-stage-XXXXXX";
+        std::vector<char> dir_template(base_template.begin(), base_template.end());
+        dir_template.push_back('\0');
+        char* staged_root = mkdtemp(dir_template.data());
+        if (!staged_root) return;
+        staging_dir = staged_root;
+
+        std::string target_path = staging_dir + "/" + path_basename(script_path);
+        if (!copy_file_atomic(script_path, target_path)) {
+            remove_tree_no_follow(staging_dir);
+            staging_dir.clear();
+            return;
+        }
+        chmod(target_path.c_str(), 0755);
+        staged_path = target_path;
+    }
+
+    ~ScopedRootedMaintainerScriptStage() {
+        if (!staging_dir.empty()) remove_tree_no_follow(staging_dir);
     }
 };
 
@@ -2561,6 +2664,8 @@ int run_maintainer_script_with_args(
     if (maintscript_package.empty()) maintscript_package = fallback_pkg_name;
     std::string maintscript_arch = read_maintscript_package_arch_from_metadata_path(metadata_path);
     std::string maintscript_version = read_json_string_from_metadata_path(metadata_path, "version");
+    ScopedRootedMaintainerScriptStage staged_script(script_path);
+    std::string runnable_script = staged_script.staged_path.empty() ? script_path : staged_script.staged_path;
 
     ScopedEnvOverrides env;
     ScopedMaintainerScriptCompat compat(current_worker_executable_path(), g_root_prefix, g_verbose);
@@ -2572,7 +2677,7 @@ int run_maintainer_script_with_args(
     env.set("DPKG_MAINTSCRIPT_PACKAGE_REFCOUNT", "1");
     env.set("DPKG_ADMINDIR", compat_dpkg_admindir());
     env.set("DPKG_RUNNING_VERSION", compat_dpkg_running_version());
-    if (!g_root_prefix.empty()) env.set("DPKG_ROOT", g_root_prefix);
+    if (!g_root_prefix.empty()) env.set("DPKG_ROOT", "/");
     env.set("DEB_MAINT_PARAMS", render_maintainer_script_params(args));
     std::string debconf_frontend = default_maintscript_debian_frontend();
     if (!debconf_frontend.empty()) env.set("DEBIAN_FRONTEND", debconf_frontend);
@@ -2581,7 +2686,7 @@ int run_maintainer_script_with_args(
     if (!getenv("HOME") || !*getenv("HOME")) env.set("HOME", maintscript_default_home());
     if (!getenv("TMPDIR") || !*getenv("TMPDIR")) env.set("TMPDIR", maintscript_default_tmpdir());
 
-    return run_path_with_args(script_path, args);
+    return run_path_with_args(runnable_script, args);
 }
 
 std::string installed_maintainer_script_path(
@@ -5828,6 +5933,476 @@ bool copy_path_atomic_no_follow(const std::string& source_path, const std::strin
     return copy_file_atomic(source_path, target_path);
 }
 
+std::string transaction_mounts_manifest_path(const std::string& txn_dir) {
+    return txn_dir + "/mounts.list";
+}
+
+std::string transaction_mounted_top_level_manifest_path(const std::string& txn_dir) {
+    return txn_dir + "/mounted-top-level.list";
+}
+
+std::string transaction_initial_root_entries_manifest_path(const std::string& txn_dir) {
+    return txn_dir + "/initial-root-entries.list";
+}
+
+std::string transaction_merged_root_path(const std::string& txn_dir) {
+    return txn_dir + "/root";
+}
+
+std::string transaction_upper_root_path(const std::string& txn_dir) {
+    return txn_dir + "/upper";
+}
+
+std::string transaction_work_root_path(const std::string& txn_dir) {
+    return txn_dir + "/work";
+}
+
+std::string worker_live_root_path() {
+    return g_root_prefix.empty() ? "/" : g_root_prefix;
+}
+
+bool transaction_should_overlay_top_level(const std::string& name) {
+    return name != "proc" &&
+           name != "sys" &&
+           name != "dev" &&
+           name != "run" &&
+           name != "tmp" &&
+           name != ".gpkg-txn";
+}
+
+bool transaction_bind_mount_path(
+    const std::string& source,
+    const std::string& target,
+    bool recursive = false
+) {
+    if (!mkdir_p(target)) return false;
+    unsigned long flags = MS_BIND;
+    if (recursive) flags |= MS_REC;
+    if (mount(source.c_str(), target.c_str(), nullptr, flags, nullptr) != 0) {
+        std::cerr << "E: Failed to bind-mount " << source << " -> " << target << ": "
+                  << strerror(errno) << std::endl;
+        return false;
+    }
+    return true;
+}
+
+bool transaction_mount_tmpfs_path(const std::string& target, mode_t mode) {
+    if (!mkdir_p(target)) return false;
+    std::ostringstream options;
+    options << "mode=" << std::oct << (mode & 07777);
+    if (mount("tmpfs", target.c_str(), "tmpfs", 0, options.str().c_str()) != 0) {
+        std::cerr << "E: Failed to mount tmpfs at " << target << ": "
+                  << strerror(errno) << std::endl;
+        return false;
+    }
+    return true;
+}
+
+bool transaction_mount_proc_path(const std::string& target) {
+    if (!mkdir_p(target)) return false;
+    if (mount("proc", target.c_str(), "proc", 0, "") != 0) {
+        std::cerr << "E: Failed to mount proc at " << target << ": "
+                  << strerror(errno) << std::endl;
+        return false;
+    }
+    return true;
+}
+
+bool transaction_mount_overlay_path(
+    const std::string& lower,
+    const std::string& upper,
+    const std::string& work,
+    const std::string& target
+) {
+    if (!mkdir_p(upper) || !mkdir_p(work) || !mkdir_p(target)) return false;
+    std::ostringstream options;
+    options << "lowerdir=" << lower << ",upperdir=" << upper << ",workdir=" << work;
+    if (mount("overlay", target.c_str(), "overlay", 0, options.str().c_str()) != 0) {
+        std::cerr << "E: Failed to mount overlay at " << target << ": "
+                  << strerror(errno) << std::endl;
+        return false;
+    }
+    return true;
+}
+
+bool append_transaction_manifest_line(const std::string& path, const std::string& line) {
+    std::ofstream out(path, std::ios::app);
+    if (!out) return false;
+    out << line << "\n";
+    return out.good();
+}
+
+bool overlay_upper_entry_is_whiteout(const struct stat& st) {
+    return S_ISCHR(st.st_mode) && major(st.st_rdev) == 0 && minor(st.st_rdev) == 0;
+}
+
+bool overlay_directory_is_opaque(const std::string& path) {
+    char value[16];
+    ssize_t size = getxattr(path.c_str(), "trusted.overlay.opaque", value, sizeof(value));
+    if (size <= 0) return false;
+    return value[0] == 'y' || value[0] == 'Y';
+}
+
+bool apply_transaction_live_removal(
+    const std::string& logical_path,
+    std::vector<InstallRollbackEntry>& rollback_entries
+) {
+    std::string live_full_path = g_root_prefix + logical_path;
+    bool had_existing = false;
+    if (!backup_live_path_if_present(live_full_path, logical_path, rollback_entries, &had_existing)) {
+        return false;
+    }
+    if (!had_existing) return true;
+    if (!remove_live_path_exact(live_full_path)) {
+        std::cerr << "E: Failed to remove live path " << live_full_path << ": "
+                  << strerror(errno) << std::endl;
+        return false;
+    }
+    return true;
+}
+
+bool commit_transaction_root_entry(
+    const std::string& source_path,
+    const std::string& logical_path,
+    std::vector<InstallRollbackEntry>& rollback_entries
+) {
+    std::string live_full_path = g_root_prefix + logical_path;
+    if (!mkdir_p(path_parent_dir(live_full_path))) {
+        std::cerr << "E: Failed to prepare parent directory for " << live_full_path << std::endl;
+        return false;
+    }
+
+    bool had_existing = false;
+    if (!backup_live_path_if_present(live_full_path, logical_path, rollback_entries, &had_existing)) {
+        return false;
+    }
+
+    if (!copy_path_atomic_no_follow(source_path, live_full_path)) {
+        std::cerr << "E: Failed to commit " << logical_path << " from transaction root." << std::endl;
+        return false;
+    }
+
+    if (!had_existing) {
+        rollback_entries.push_back({logical_path, live_full_path, "", true});
+    }
+    return true;
+}
+
+bool commit_overlay_upper_tree_recursive(
+    const std::string& upper_path,
+    const std::string& logical_path,
+    std::vector<InstallRollbackEntry>& rollback_entries
+) {
+    struct stat st {};
+    if (lstat(upper_path.c_str(), &st) != 0) {
+        std::cerr << "E: Failed to inspect transaction entry " << upper_path << ": "
+                  << strerror(errno) << std::endl;
+        return false;
+    }
+
+    if (overlay_upper_entry_is_whiteout(st)) {
+        return apply_transaction_live_removal(logical_path, rollback_entries);
+    }
+
+    if (!S_ISDIR(st.st_mode) || S_ISLNK(st.st_mode)) {
+        return commit_transaction_root_entry(upper_path, logical_path, rollback_entries);
+    }
+
+    std::string live_full_path = g_root_prefix + logical_path;
+    bool had_existing = false;
+    struct stat live_st {};
+    bool live_is_directory =
+        lstat(live_full_path.c_str(), &live_st) == 0 &&
+        S_ISDIR(live_st.st_mode) &&
+        !S_ISLNK(live_st.st_mode);
+    if (!live_is_directory) {
+        if (!backup_live_path_if_present(live_full_path, logical_path, rollback_entries, &had_existing)) {
+            return false;
+        }
+        if (!mkdir_p(path_parent_dir(live_full_path))) {
+            std::cerr << "E: Failed to prepare parent directory for " << live_full_path << std::endl;
+            return false;
+        }
+        if (mkdir(live_full_path.c_str(), st.st_mode & 07777) != 0 && errno != EEXIST) {
+            std::cerr << "E: Failed to create live directory " << live_full_path << ": "
+                      << strerror(errno) << std::endl;
+            return false;
+        }
+        if (!had_existing) rollback_entries.push_back({logical_path, live_full_path, "", true});
+    }
+    chmod(live_full_path.c_str(), st.st_mode & 07777);
+
+    std::set<std::string> upper_names;
+    DIR* dir = opendir(upper_path.c_str());
+    if (!dir) {
+        std::cerr << "E: Failed to open transaction directory " << upper_path << ": "
+                  << strerror(errno) << std::endl;
+        return false;
+    }
+
+    bool ok = true;
+    int saved_errno = 0;
+    struct dirent* entry = nullptr;
+    errno = 0;
+    while ((entry = readdir(dir)) != nullptr) {
+        std::string name = entry->d_name;
+        if (name == "." || name == "..") continue;
+        upper_names.insert(name);
+    }
+    saved_errno = errno;
+    rewinddir(dir);
+    if (saved_errno != 0) ok = false;
+
+    if (ok && overlay_directory_is_opaque(upper_path)) {
+        DIR* live_dir = opendir(live_full_path.c_str());
+        if (!live_dir) {
+            ok = false;
+            saved_errno = errno;
+        } else {
+            struct dirent* live_entry = nullptr;
+            while ((live_entry = readdir(live_dir)) != nullptr) {
+                std::string name = live_entry->d_name;
+                if (name == "." || name == "..") continue;
+                if (upper_names.count(name) != 0) continue;
+                if (!apply_transaction_live_removal(logical_path + "/" + name, rollback_entries)) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (errno != 0 && ok) {
+                ok = false;
+                saved_errno = errno;
+            }
+            closedir(live_dir);
+        }
+    }
+
+    errno = 0;
+    while (ok && (entry = readdir(dir)) != nullptr) {
+        std::string name = entry->d_name;
+        if (name == "." || name == "..") continue;
+        if (!commit_overlay_upper_tree_recursive(
+                upper_path + "/" + name,
+                logical_path + "/" + name,
+                rollback_entries)) {
+            ok = false;
+            break;
+        }
+    }
+    if (errno != 0 && ok) {
+        ok = false;
+        saved_errno = errno;
+    }
+    closedir(dir);
+
+    if (!ok && saved_errno != 0) errno = saved_errno;
+    return ok;
+}
+
+bool action_prepare_transaction_root(const std::string& txn_dir) {
+    if (txn_dir.empty() || txn_dir[0] != '/') {
+        std::cerr << "E: Transaction directory must be an absolute path." << std::endl;
+        return false;
+    }
+
+    std::string live_root = worker_live_root_path();
+    std::string merged_root = transaction_merged_root_path(txn_dir);
+    std::string upper_root = transaction_upper_root_path(txn_dir);
+    std::string work_root = transaction_work_root_path(txn_dir);
+
+    if (!mkdir_p(txn_dir) ||
+        !mkdir_p(merged_root) ||
+        !mkdir_p(upper_root) ||
+        !mkdir_p(work_root)) {
+        std::cerr << "E: Failed to prepare transaction root directories." << std::endl;
+        return false;
+    }
+
+    std::string mounts_manifest = transaction_mounts_manifest_path(txn_dir);
+    std::string mounted_names_manifest = transaction_mounted_top_level_manifest_path(txn_dir);
+    std::string initial_root_manifest = transaction_initial_root_entries_manifest_path(txn_dir);
+    unlink(mounts_manifest.c_str());
+    unlink(mounted_names_manifest.c_str());
+    unlink(initial_root_manifest.c_str());
+
+    DIR* root_dir = opendir(live_root.c_str());
+    if (!root_dir) {
+        std::cerr << "E: Failed to inspect live root " << live_root << ": "
+                  << strerror(errno) << std::endl;
+        return false;
+    }
+
+    bool ok = true;
+    int saved_errno = 0;
+    struct dirent* entry = nullptr;
+    errno = 0;
+    while ((entry = readdir(root_dir)) != nullptr) {
+        std::string name = entry->d_name;
+        if (name == "." || name == ".." || name == ".gpkg-txn") continue;
+
+        std::string source_path =
+            live_root == "/" ? "/" + name : live_root + "/" + name;
+        std::string target_path = merged_root + "/" + name;
+
+        struct stat st {};
+        if (lstat(source_path.c_str(), &st) != 0) {
+            ok = false;
+            saved_errno = errno;
+            break;
+        }
+
+        if (!S_ISDIR(st.st_mode) || S_ISLNK(st.st_mode)) {
+            if (!copy_path_atomic_no_follow(source_path, target_path) ||
+                !append_transaction_manifest_line(initial_root_manifest, name)) {
+                ok = false;
+                break;
+            }
+            continue;
+        }
+
+        bool mounted = false;
+        if (name == "proc") {
+            mounted = transaction_mount_proc_path(target_path);
+        } else if (name == "dev" || name == "sys") {
+            mounted = transaction_bind_mount_path(source_path, target_path, true);
+        } else if (name == "run") {
+            mounted = transaction_mount_tmpfs_path(target_path, 0755);
+        } else if (name == "tmp") {
+            mounted = transaction_mount_tmpfs_path(target_path, 01777);
+        } else if (transaction_should_overlay_top_level(name)) {
+            mounted = transaction_mount_overlay_path(
+                source_path,
+                upper_root + "/" + name,
+                work_root + "/" + name,
+                target_path
+            );
+        } else {
+            mounted = transaction_bind_mount_path(source_path, target_path, true);
+        }
+
+        if (!mounted ||
+            !append_transaction_manifest_line(mounts_manifest, target_path) ||
+            !append_transaction_manifest_line(mounted_names_manifest, name)) {
+            ok = false;
+            break;
+        }
+    }
+    if (errno != 0 && ok) {
+        ok = false;
+        saved_errno = errno;
+    }
+    closedir(root_dir);
+
+    if (!ok && saved_errno != 0) errno = saved_errno;
+    if (!ok) {
+        action_cleanup_transaction_root(txn_dir);
+        if (saved_errno != 0) {
+            std::cerr << "E: Failed to populate transaction root: " << strerror(saved_errno)
+                      << std::endl;
+        } else {
+            std::cerr << "E: Failed to populate transaction root." << std::endl;
+        }
+        return false;
+    }
+
+    return true;
+}
+
+bool action_cleanup_transaction_root(const std::string& txn_dir) {
+    if (txn_dir.empty() || txn_dir == "/" || txn_dir == ".") return false;
+
+    std::vector<std::string> mounts = read_text_lines_local(transaction_mounts_manifest_path(txn_dir));
+    for (auto it = mounts.rbegin(); it != mounts.rend(); ++it) {
+        if (it->empty()) continue;
+        if (umount2(it->c_str(), MNT_DETACH) != 0 && errno != EINVAL && errno != ENOENT) {
+            std::cerr << "W: Failed to unmount " << *it << ": " << strerror(errno) << std::endl;
+        }
+    }
+
+    if (!remove_tree_no_follow(txn_dir) && errno != ENOENT) {
+        std::cerr << "W: Failed to remove transaction root " << txn_dir << ": "
+                  << strerror(errno) << std::endl;
+        return false;
+    }
+    return true;
+}
+
+bool action_commit_transaction_root(const std::string& txn_dir) {
+    if (txn_dir.empty() || txn_dir[0] != '/') {
+        std::cerr << "E: Transaction directory must be an absolute path." << std::endl;
+        return false;
+    }
+
+    std::string merged_root = transaction_merged_root_path(txn_dir);
+    std::string upper_root = transaction_upper_root_path(txn_dir);
+    std::vector<std::string> mounted_names =
+        read_text_lines_local(transaction_mounted_top_level_manifest_path(txn_dir));
+    std::set<std::string> mounted_name_set(mounted_names.begin(), mounted_names.end());
+    std::vector<std::string> initial_root_entries =
+        read_text_lines_local(transaction_initial_root_entries_manifest_path(txn_dir));
+    std::set<std::string> initial_root_entry_set(
+        initial_root_entries.begin(),
+        initial_root_entries.end()
+    );
+
+    std::vector<InstallRollbackEntry> rollback_entries;
+
+    DIR* upper_dir = opendir(upper_root.c_str());
+    if (upper_dir) {
+        struct dirent* entry = nullptr;
+        errno = 0;
+        while ((entry = readdir(upper_dir)) != nullptr) {
+            std::string name = entry->d_name;
+            if (name == "." || name == "..") continue;
+            if (!commit_overlay_upper_tree_recursive(
+                    upper_root + "/" + name,
+                    "/" + name,
+                    rollback_entries)) {
+                closedir(upper_dir);
+                rollback_install_changes(rollback_entries);
+                return false;
+            }
+        }
+        closedir(upper_dir);
+    }
+
+    DIR* merged_dir = opendir(merged_root.c_str());
+    if (!merged_dir) {
+        std::cerr << "E: Failed to inspect merged transaction root " << merged_root << ": "
+                  << strerror(errno) << std::endl;
+        rollback_install_changes(rollback_entries);
+        return false;
+    }
+
+    std::set<std::string> current_root_entries;
+    struct dirent* entry = nullptr;
+    errno = 0;
+    while ((entry = readdir(merged_dir)) != nullptr) {
+        std::string name = entry->d_name;
+        if (name == "." || name == "..") continue;
+        current_root_entries.insert(name);
+        if (mounted_name_set.count(name) != 0) continue;
+        if (!commit_transaction_root_entry(merged_root + "/" + name, "/" + name, rollback_entries)) {
+            closedir(merged_dir);
+            rollback_install_changes(rollback_entries);
+            return false;
+        }
+    }
+    closedir(merged_dir);
+
+    for (const auto& name : initial_root_entry_set) {
+        if (current_root_entries.count(name) != 0) continue;
+        if (mounted_name_set.count(name) != 0) continue;
+        if (!apply_transaction_live_removal("/" + name, rollback_entries)) {
+            rollback_install_changes(rollback_entries);
+            return false;
+        }
+    }
+
+    discard_install_backups(rollback_entries);
+    return true;
+}
+
 std::vector<std::string> load_registered_undo_commands(const std::string& pkg_name) {
     std::vector<std::string> undo_cmds;
     std::string undo_path = get_info_dir() + pkg_name + ".undo";
@@ -8553,7 +9128,7 @@ int main(int argc, char* argv[]) {
 
     if (argc < 2) {
 
-        std::cout << "Usage: gpkg-worker [options]\nOptions:\n  --install <file>\n  --configure <pkg> [old-version]\n  --remove <pkg>\n  --purge <pkg>\n  --retire <pkg>\n  --verify <pkg>\n  --hydrate-control-metadata <pkg>\n  --compat-dpkg [dpkg args...]\n  --compat-dpkg-query [dpkg-query args...]\n  --compat-dpkg-trigger [dpkg-trigger args...]\n  --compat-update-rc.d [update-rc.d args...]\n  --compat-invoke-rc.d [invoke-rc.d args...]\n  --compat-service [service args...]\n  --compat-systemctl [systemctl args...]\n  --compat-deb-systemd-invoke [args...]\n  --compat-initctl [args...]\n  --refresh-dpkg-trigger-state\n  --refresh-runtime-linker-state\n  --refresh-selinux-label-state\n  --register-file <path> --pkg <name>\n  --register-undo <cmd> --pkg <name>\n  --jobs <n>\n  --defer-runtime-linker-refresh\n  --defer-selinux-relabel\n  --defer-configure\n  --unsafe-io\n";
+        std::cout << "Usage: gpkg-worker [options]\nOptions:\n  --install <file>\n  --configure <pkg> [old-version]\n  --remove <pkg>\n  --purge <pkg>\n  --retire <pkg>\n  --verify <pkg>\n  --hydrate-control-metadata <pkg>\n  --prepare-transaction-root <dir>\n  --commit-transaction-root <dir>\n  --cleanup-transaction-root <dir>\n  --compat-dpkg [dpkg args...]\n  --compat-dpkg-query [dpkg-query args...]\n  --compat-dpkg-trigger [dpkg-trigger args...]\n  --compat-update-rc.d [update-rc.d args...]\n  --compat-invoke-rc.d [invoke-rc.d args...]\n  --compat-service [service args...]\n  --compat-systemctl [systemctl args...]\n  --compat-deb-systemd-invoke [args...]\n  --compat-initctl [args...]\n  --refresh-dpkg-trigger-state\n  --refresh-runtime-linker-state\n  --refresh-selinux-label-state\n  --register-file <path> --pkg <name>\n  --register-undo <cmd> --pkg <name>\n  --jobs <n>\n  --defer-runtime-linker-refresh\n  --defer-selinux-relabel\n  --defer-configure\n  --unsafe-io\n";
 
         return 1;
 
@@ -8584,6 +9159,12 @@ int main(int argc, char* argv[]) {
         else if (arg == "--verify") mode = "verify", target = argv[++i];
 
         else if (arg == "--hydrate-control-metadata") mode = "hydrate-control-metadata", target = argv[++i];
+
+        else if (arg == "--prepare-transaction-root") mode = "prepare-transaction-root", target = argv[++i];
+
+        else if (arg == "--commit-transaction-root") mode = "commit-transaction-root", target = argv[++i];
+
+        else if (arg == "--cleanup-transaction-root") mode = "cleanup-transaction-root", target = argv[++i];
 
         else if (arg == "--refresh-dpkg-trigger-state") mode = "refresh-dpkg-trigger-state";
 
@@ -8634,6 +9215,18 @@ int main(int argc, char* argv[]) {
 
     if (mode == "hydrate-control-metadata" && !target.empty()) {
         return action_hydrate_control_metadata(target) ? 0 : 1;
+    }
+
+    if (mode == "prepare-transaction-root" && !target.empty()) {
+        return action_prepare_transaction_root(target) ? 0 : 1;
+    }
+
+    if (mode == "commit-transaction-root" && !target.empty()) {
+        return action_commit_transaction_root(target) ? 0 : 1;
+    }
+
+    if (mode == "cleanup-transaction-root" && !target.empty()) {
+        return action_cleanup_transaction_root(target) ? 0 : 1;
     }
 
     if (mode == "refresh-dpkg-trigger-state") return action_refresh_dpkg_trigger_state() ? 0 : 1;

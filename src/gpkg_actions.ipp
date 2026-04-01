@@ -12,6 +12,12 @@ bool prepare_install_archives(
     std::vector<std::string>& failures
 );
 
+bool update_package_auto_install_state_after_install(
+    const std::string& pkg_name,
+    bool should_be_manual,
+    const std::set<std::string>& previously_registered
+);
+
 enum class PlannedPackageKind {
     NewInstall,
     Upgrade,
@@ -783,7 +789,8 @@ std::vector<std::string> build_worker_command_argv(
     bool defer_runtime_refresh = false,
     bool defer_selinux_relabel = false,
     bool defer_configure = false,
-    const std::vector<std::string>& extra_args = {}
+    const std::vector<std::string>& extra_args = {},
+    const std::string& root_override = ""
 ) {
     std::string worker_command = resolve_gpkg_worker_command();
     if (worker_command.empty()) worker_command = "gpkg-worker";
@@ -793,9 +800,10 @@ std::vector<std::string> build_worker_command_argv(
     if (defer_runtime_refresh) argv.push_back("--defer-runtime-linker-refresh");
     if (defer_selinux_relabel) argv.push_back("--defer-selinux-relabel");
     if (defer_configure) argv.push_back("--defer-configure");
-    if (!ROOT_PREFIX.empty()) {
+    std::string effective_root = root_override.empty() ? ROOT_PREFIX : root_override;
+    if (!effective_root.empty()) {
         argv.push_back("--root");
-        argv.push_back(ROOT_PREFIX);
+        argv.push_back(effective_root);
     }
     return argv;
 }
@@ -803,14 +811,24 @@ std::vector<std::string> build_worker_command_argv(
 InstallCommandResult install_package_from_file(
     const std::string& pkg_file,
     bool verbose,
-    bool defer_configure = false
+    bool defer_configure = false,
+    const std::string& root_override = ""
 ) {
     CommandCaptureResult result = run_command_captured_argv(
-        build_worker_command_argv("--install", pkg_file, verbose, true, true, defer_configure),
+        build_worker_command_argv(
+            "--install",
+            pkg_file,
+            verbose,
+            true,
+            true,
+            defer_configure,
+            {},
+            root_override
+        ),
         verbose,
         "gpkg-install"
     );
-    if (result.exit_code == 0) queue_selinux_label_state_refresh();
+    if (result.exit_code == 0 && root_override.empty()) queue_selinux_label_state_refresh();
     return {result.exit_code == 0, result.log_path};
 }
 
@@ -826,7 +844,8 @@ InstallCommandResult hydrate_control_metadata_by_name(const std::string& pkg_nam
 InstallCommandResult configure_package_by_name(
     const std::string& pkg_name,
     const std::string& previous_version,
-    bool verbose
+    bool verbose,
+    const std::string& root_override = ""
 ) {
     CommandCaptureResult result = run_command_captured_argv(
         build_worker_command_argv(
@@ -836,12 +855,13 @@ InstallCommandResult configure_package_by_name(
             false,
             true,
             false,
-            {previous_version}
+            {previous_version},
+            root_override
         ),
         verbose,
         "gpkg-configure"
     );
-    if (result.exit_code == 0) queue_selinux_label_state_refresh();
+    if (result.exit_code == 0 && root_override.empty()) queue_selinux_label_state_refresh();
     return {result.exit_code == 0, result.log_path};
 }
 
@@ -1017,13 +1037,26 @@ bool ensure_transaction_control_metadata_ready(
     return failures.empty();
 }
 
-InstallCommandResult retire_package_by_name(const std::string& pkg_name, bool verbose) {
+InstallCommandResult retire_package_by_name(
+    const std::string& pkg_name,
+    bool verbose,
+    const std::string& root_override = ""
+) {
     CommandCaptureResult result = run_command_captured_argv(
-        build_worker_command_argv("--retire", pkg_name, verbose, true, true),
+        build_worker_command_argv(
+            "--retire",
+            pkg_name,
+            verbose,
+            true,
+            true,
+            false,
+            {},
+            root_override
+        ),
         verbose,
         "gpkg-retire"
     );
-    if (result.exit_code == 0) queue_selinux_label_state_refresh();
+    if (result.exit_code == 0 && root_override.empty()) queue_selinux_label_state_refresh();
     return {result.exit_code == 0, result.log_path};
 }
 
@@ -1169,15 +1202,150 @@ bool prepare_install_archives(
 InstallCommandResult install_package_v2(
     const PackageMetadata& meta,
     bool verbose,
-    bool defer_configure = false
+    bool defer_configure = false,
+    const std::string& root_override = ""
 ) {
-    return install_package_from_file(get_install_archive_path(meta), verbose, defer_configure);
+    return install_package_from_file(
+        get_install_archive_path(meta),
+        verbose,
+        defer_configure,
+        root_override
+    );
 }
 
 struct DeferredConfigureEntry {
     PackageMetadata meta;
     std::string previous_version;
 };
+
+struct PostCommitRetirementEntry {
+    std::string pkg_name;
+    std::vector<std::string> files;
+};
+
+struct PostCommitInstallEntry {
+    PackageMetadata meta;
+    bool should_be_manual = false;
+};
+
+struct ScopedWorkerTransactionRoot {
+    std::string txn_dir;
+    std::string merged_root;
+    bool prepared = false;
+    bool keep = false;
+
+    bool create(bool verbose) {
+        std::string parent_dir = ROOT_PREFIX + "/.gpkg-txn";
+        if (!mkdir_p(parent_dir)) return false;
+
+        std::string pattern = parent_dir + "/txn-XXXXXX";
+        std::vector<char> tmpl(pattern.begin(), pattern.end());
+        tmpl.push_back('\0');
+        char* created = mkdtemp(tmpl.data());
+        if (!created) return false;
+
+        txn_dir = created;
+        merged_root = txn_dir + "/root";
+        CommandCaptureResult result = run_command_captured_argv(
+            build_worker_command_argv("--prepare-transaction-root", txn_dir, verbose),
+            verbose,
+            "gpkg-txn-prepare"
+        );
+        if (result.exit_code != 0) {
+            run_command_captured_argv(
+                build_worker_command_argv("--cleanup-transaction-root", txn_dir, verbose),
+                verbose,
+                "gpkg-txn-cleanup"
+            );
+            txn_dir.clear();
+            merged_root.clear();
+            return false;
+        }
+        prepared = true;
+        return true;
+    }
+
+    bool commit(bool verbose, std::string* log_path = nullptr) {
+        if (log_path) log_path->clear();
+        if (!prepared) return false;
+        CommandCaptureResult result = run_command_captured_argv(
+            build_worker_command_argv("--commit-transaction-root", txn_dir, verbose),
+            verbose,
+            "gpkg-txn-commit"
+        );
+        if (log_path) *log_path = result.log_path;
+        return result.exit_code == 0;
+    }
+
+    ~ScopedWorkerTransactionRoot() {
+        if (!prepared || keep || txn_dir.empty()) return;
+        run_command_captured_argv(
+            build_worker_command_argv("--cleanup-transaction-root", txn_dir, false),
+            false,
+            "gpkg-txn-cleanup"
+        );
+    }
+};
+
+bool retire_replaced_packages_in_transaction(
+    const TransactionPlan& plan,
+    const std::string& pkg_name,
+    const std::string& root_override,
+    bool verbose,
+    std::vector<PostCommitRetirementEntry>& post_commit_retirements,
+    std::string* failed_pkg_out = nullptr,
+    std::string* failed_log_out = nullptr
+) {
+    if (failed_pkg_out) failed_pkg_out->clear();
+    if (failed_log_out) failed_log_out->clear();
+
+    std::vector<std::string> retirements;
+    if (!should_retire_after_install(plan, pkg_name, retirements)) return true;
+
+    for (const auto& retired_pkg : retirements) {
+        std::vector<std::string> retired_files = read_installed_file_list(retired_pkg);
+        InstallCommandResult retire_result = retire_package_by_name(retired_pkg, verbose, root_override);
+        if (!retire_result.success) {
+            if (failed_pkg_out) *failed_pkg_out = retired_pkg;
+            if (failed_log_out) *failed_log_out = retire_result.log_path;
+            return false;
+        }
+        post_commit_retirements.push_back({retired_pkg, retired_files});
+    }
+
+    return true;
+}
+
+bool finalize_post_commit_package_state(
+    const std::vector<PostCommitInstallEntry>& installs,
+    const std::vector<PostCommitRetirementEntry>& retirements,
+    const std::set<std::string>& previously_registered,
+    bool verbose
+) {
+    (void)verbose;
+    for (const auto& install : installs) {
+        queue_triggers_for_package(install.meta.name);
+        if (!update_package_auto_install_state_after_install(
+                install.meta.name,
+                install.should_be_manual,
+                previously_registered)) {
+            std::cerr << Color::RED << "E: Failed to update gpkg auto-install state for "
+                      << install.meta.name << Color::RESET << std::endl;
+            return false;
+        }
+    }
+
+    for (const auto& retirement : retirements) {
+        check_triggers(retirement.files);
+        if (!erase_package_auto_installed_state(retirement.pkg_name)) {
+            std::cerr << Color::RED << "E: Failed to update gpkg auto-install state for "
+                      << retirement.pkg_name << Color::RESET << std::endl;
+            return false;
+        }
+    }
+
+    return true;
+}
 
 size_t runtime_bootstrap_boundary_index(
     const std::vector<PackageMetadata>& queue,
@@ -3198,14 +3366,24 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
         return 1;
     }
 
+    ScopedWorkerTransactionRoot transaction_root;
+    if (!transaction_root.create(verbose)) {
+        std::cerr << Color::RED
+                  << "E: Failed to prepare the temporary transaction root for this upgrade."
+                  << Color::RESET << std::endl;
+        return 1;
+    }
+
     size_t installed_count = 0;
     std::vector<std::string> failures;
     size_t install_progress_width = 0;
     bool mutated_runtime_state = false;
     std::vector<DeferredConfigureEntry> deferred_configures;
+    std::vector<PostCommitInstallEntry> post_commit_installs;
+    std::vector<PostCommitRetirementEntry> post_commit_retirements;
     size_t bootstrap_boundary = runtime_bootstrap_boundary_index(upgrade_queue, verbose);
     std::cout << Color::CYAN << "[*] Installing " << upgrade_queue.size()
-              << " package(s)..." << Color::RESET << std::endl;
+              << " package(s) into the transaction root..." << Color::RESET << std::endl;
     for (size_t i = 0; i < upgrade_queue.size(); ++i) {
         if (!download_report.results[i].success) {
             failures.push_back(upgrade_queue[i].name);
@@ -3216,12 +3394,19 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
         std::string previous_version;
         get_local_installed_package_version(upgrade_queue[i].name, &previous_version, &context);
 
-        if (!verbose) render_package_progress("current", i, upgrade_queue.size(), upgrade_queue[i].name, &install_progress_width);
-        InstallCommandResult result = install_package_v2(upgrade_queue[i], verbose, defer_configure);
+        if (!verbose) {
+            render_package_progress("current", i, upgrade_queue.size(), upgrade_queue[i].name, &install_progress_width);
+        }
+        InstallCommandResult result = install_package_v2(
+            upgrade_queue[i],
+            verbose,
+            defer_configure,
+            transaction_root.merged_root
+        );
         if (!result.success) {
             if (!verbose) finish_progress_line(&install_progress_width);
             std::cerr << Color::RED << "E: Failed to install " << upgrade_queue[i].name
-                      << Color::RESET;
+                      << " in the transaction root" << Color::RESET;
             if (!verbose && !result.log_path.empty()) {
                 std::cerr << " (see " << result.log_path << ")";
             }
@@ -3230,73 +3415,75 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
             break;
         }
 
-        mutated_runtime_state = true;
-        if (defer_configure) deferred_configures.push_back({upgrade_queue[i], previous_version});
-
-        auto finalize_package = [&](const PackageMetadata& meta) -> bool {
-            queue_triggers_for_package(meta.name);
-            if (!update_package_auto_install_state_after_install(
+        auto stage_package = [&](const PackageMetadata& meta) -> bool {
+            std::string failed_pkg;
+            std::string failed_log;
+            if (!retire_replaced_packages_in_transaction(
+                    upgrade_plan,
                     meta.name,
-                    explicit_target_names.count(meta.name) != 0 &&
-                        context.exact_live_packages.count(meta.name) == 0,
-                    context.exact_live_packages)) {
+                    transaction_root.merged_root,
+                    verbose,
+                    post_commit_retirements,
+                    &failed_pkg,
+                    &failed_log)) {
                 if (!verbose) finish_progress_line(&install_progress_width);
-                std::cerr << Color::RED << "E: Failed to update gpkg auto-install state for "
-                          << meta.name << Color::RESET << std::endl;
-                failures.push_back(meta.name);
+                std::cerr << Color::RED << "E: Failed to retire replaced package " << failed_pkg
+                          << " inside the transaction root" << Color::RESET;
+                if (!verbose && !failed_log.empty()) {
+                    std::cerr << " (see " << failed_log << ")";
+                }
+                std::cerr << std::endl;
+                failures.push_back(failed_pkg.empty() ? meta.name : failed_pkg);
                 return false;
             }
-            std::vector<std::string> retirements;
-            if (should_retire_after_install(upgrade_plan, meta.name, retirements)) {
-                for (const auto& retired_pkg : retirements) {
-                    std::vector<std::string> retired_files = read_installed_file_list(retired_pkg);
-                    InstallCommandResult retire_result = retire_package_by_name(retired_pkg, verbose);
-                    if (!retire_result.success) {
-                        if (!verbose) finish_progress_line(&install_progress_width);
-                        std::cerr << Color::RED << "E: Failed to retire replaced package " << retired_pkg
-                                  << Color::RESET;
-                        if (!verbose && !retire_result.log_path.empty()) {
-                            std::cerr << " (see " << retire_result.log_path << ")";
-                        }
-                        std::cerr << std::endl;
-                        failures.push_back(retired_pkg);
-                        return false;
-                    }
-                    check_triggers(retired_files);
-                    if (!erase_package_auto_installed_state(retired_pkg)) {
-                        if (!verbose) finish_progress_line(&install_progress_width);
-                        std::cerr << Color::RED << "E: Failed to update gpkg auto-install state for "
-                                  << retired_pkg << Color::RESET << std::endl;
-                        failures.push_back(retired_pkg);
-                        return false;
-                    }
-                    mutated_runtime_state = true;
-                }
-            }
+
+            post_commit_installs.push_back({
+                meta,
+                explicit_target_names.count(meta.name) != 0 &&
+                    context.exact_live_packages.count(meta.name) == 0
+            });
             ++installed_count;
             return true;
         };
 
-        if (!defer_configure) {
-            if (!finalize_package(upgrade_queue[i])) break;
-        }
+        mutated_runtime_state = true;
+        if (defer_configure) deferred_configures.push_back({upgrade_queue[i], previous_version});
+        else if (!stage_package(upgrade_queue[i])) break;
 
         if (bootstrap_boundary != upgrade_queue.size() && i == bootstrap_boundary && failures.empty()) {
-            if (run_ldconfig_trigger(verbose, resolve_gpkg_worker_command()) != 0) {
+            CommandCaptureResult ldconfig_result = run_command_captured_argv(
+                build_worker_command_argv(
+                    "--refresh-runtime-linker-state",
+                    "",
+                    verbose,
+                    false,
+                    false,
+                    false,
+                    {},
+                    transaction_root.merged_root
+                ),
+                verbose,
+                "gpkg-ldconfig"
+            );
+            if (ldconfig_result.exit_code != 0) {
                 if (!verbose) finish_progress_line(&install_progress_width);
                 failures.push_back("gpkg-worker --refresh-runtime-linker-state");
                 std::cerr << Color::RED
-                          << "E: Failed to refresh the runtime linker state before configuring deferred packages."
+                          << "E: Failed to refresh the runtime linker state inside the transaction root."
                           << Color::RESET << std::endl;
                 break;
             }
             for (const auto& deferred : deferred_configures) {
-                InstallCommandResult configure_result =
-                    configure_package_by_name(deferred.meta.name, deferred.previous_version, verbose);
+                InstallCommandResult configure_result = configure_package_by_name(
+                    deferred.meta.name,
+                    deferred.previous_version,
+                    verbose,
+                    transaction_root.merged_root
+                );
                 if (!configure_result.success) {
                     if (!verbose) finish_progress_line(&install_progress_width);
                     std::cerr << Color::RED << "E: Failed to configure " << deferred.meta.name
-                              << Color::RESET;
+                              << " inside the transaction root" << Color::RESET;
                     if (!verbose && !configure_result.log_path.empty()) {
                         std::cerr << " (see " << configure_result.log_path << ")";
                     }
@@ -3304,13 +3491,40 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
                     failures.push_back(deferred.meta.name);
                     break;
                 }
-                if (!finalize_package(deferred.meta)) break;
+                if (!stage_package(deferred.meta)) break;
             }
             deferred_configures.clear();
             if (!failures.empty()) break;
         }
 
-        if (!verbose) render_package_progress("current", i + 1, upgrade_queue.size(), upgrade_queue[i].name, &install_progress_width);
+        if (!verbose) {
+            render_package_progress("current", i + 1, upgrade_queue.size(), upgrade_queue[i].name, &install_progress_width);
+        }
+    }
+
+    if (failures.empty()) {
+        std::string commit_log_path;
+        if (!transaction_root.commit(verbose, &commit_log_path)) {
+            if (!verbose) finish_progress_line(&install_progress_width);
+            std::cerr << Color::RED
+                      << "E: Failed to commit the transaction root into the live system."
+                      << Color::RESET;
+            if (!verbose && !commit_log_path.empty()) {
+                std::cerr << " (see " << commit_log_path << ")";
+            }
+            std::cerr << std::endl;
+            failures.push_back("transaction-commit");
+        } else {
+            transaction_root.keep = false;
+            if (!finalize_post_commit_package_state(
+                    post_commit_installs,
+                    post_commit_retirements,
+                    context.exact_live_packages,
+                    verbose)) {
+                if (!verbose) finish_progress_line(&install_progress_width);
+                failures.push_back("post-commit-finalization");
+            }
+        }
     }
     if (!verbose) {
         finish_progress_line(&install_progress_width);
@@ -3935,10 +4149,29 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
 
     for (const auto& local_file : local_files) {
         std::cout << "Installing local package: " << local_file << std::endl;
-        InstallCommandResult result = install_package_from_file(local_file, verbose);
+        std::string local_pkg_name = read_package_name_from_archive(local_file);
+        std::string previous_version;
+        if (!local_pkg_name.empty()) {
+            get_local_installed_package_version(local_pkg_name, &previous_version, nullptr);
+        }
+
+        ScopedWorkerTransactionRoot local_transaction_root;
+        if (!local_transaction_root.create(verbose)) {
+            std::cerr << Color::RED
+                      << "E: Failed to prepare the temporary transaction root for "
+                      << local_file << Color::RESET << std::endl;
+            return 1;
+        }
+
+        InstallCommandResult result = install_package_from_file(
+            local_file,
+            verbose,
+            true,
+            local_transaction_root.merged_root
+        );
         if (!result.success) {
             std::cerr << Color::RED << "E: Failed to install local package " << local_file
-                      << Color::RESET;
+                      << " in the transaction root" << Color::RESET;
             if (!verbose && !result.log_path.empty()) {
                 std::cerr << " See " << result.log_path << " for details.";
             }
@@ -3946,45 +4179,111 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
             return 1;
         }
 
-        std::string local_pkg_name = read_package_name_from_archive(local_file);
         if (!local_pkg_name.empty()) {
-            if (!set_package_auto_installed_state(local_pkg_name, false)) {
-                std::cerr << Color::RED << "E: Failed to update gpkg auto-install state for "
-                          << local_pkg_name << Color::RESET << std::endl;
+            CommandCaptureResult ldconfig_result = run_command_captured_argv(
+                build_worker_command_argv(
+                    "--refresh-runtime-linker-state",
+                    "",
+                    verbose,
+                    false,
+                    false,
+                    false,
+                    {},
+                    local_transaction_root.merged_root
+                ),
+                verbose,
+                "gpkg-ldconfig"
+            );
+            if (ldconfig_result.exit_code != 0) {
+                std::cerr << Color::RED
+                          << "E: Failed to refresh the runtime linker state inside the local-package transaction root."
+                          << Color::RESET << std::endl;
                 return 1;
             }
-            queue_triggers_for_package(local_pkg_name);
 
-            PackageMetadata local_meta;
-            if (get_installed_package_metadata(local_pkg_name, local_meta)) {
-                std::vector<PackageMetadata> local_queue = {local_meta};
+            InstallCommandResult configure_result = configure_package_by_name(
+                local_pkg_name,
+                previous_version,
+                verbose,
+                local_transaction_root.merged_root
+            );
+            if (!configure_result.success) {
+                std::cerr << Color::RED << "E: Failed to configure local package " << local_pkg_name
+                          << " inside the transaction root" << Color::RESET;
+                if (!verbose && !configure_result.log_path.empty()) {
+                    std::cerr << " See " << configure_result.log_path << " for details.";
+                }
+                std::cerr << std::endl;
+                return 1;
+            }
+        }
+
+        if (!local_pkg_name.empty()) {
+            std::vector<PostCommitRetirementEntry> local_post_commit_retirements;
+            std::vector<PostCommitInstallEntry> local_post_commit_installs;
+            local_post_commit_installs.push_back({PackageMetadata{}, true});
+            local_post_commit_installs.back().meta.name = local_pkg_name;
+
+            PackageMetadata local_repo_meta;
+            if (get_repo_package_info(local_pkg_name, local_repo_meta)) {
+                local_post_commit_installs.back().meta = local_repo_meta;
+                std::vector<PackageMetadata> local_queue = {local_repo_meta};
                 std::vector<std::string> registered = get_registered_package_names();
                 std::set<std::string> installed_now(registered.begin(), registered.end());
                 TransactionPlan local_plan;
                 if (!build_transaction_plan(local_queue, installed_now, verbose, local_plan)) return 1;
 
-                std::vector<std::string> retirements;
-                if (should_retire_after_install(local_plan, local_pkg_name, retirements)) {
-                    for (const auto& retired_pkg : retirements) {
-                        std::vector<std::string> retired_files = read_installed_file_list(retired_pkg);
-                        InstallCommandResult retire_result = retire_package_by_name(retired_pkg, verbose);
-                        if (!retire_result.success) {
-                            std::cerr << Color::RED << "E: Failed to retire replaced package "
-                                      << retired_pkg << Color::RESET;
-                            if (!verbose && !retire_result.log_path.empty()) {
-                                std::cerr << " See " << retire_result.log_path << " for details.";
-                            }
-                            std::cerr << std::endl;
-                            return 1;
-                        }
-                        check_triggers(retired_files);
-                        if (!erase_package_auto_installed_state(retired_pkg)) {
-                            std::cerr << Color::RED << "E: Failed to update gpkg auto-install state for "
-                                      << retired_pkg << Color::RESET << std::endl;
-                            return 1;
-                        }
+                std::string failed_pkg;
+                std::string failed_log;
+                if (!retire_replaced_packages_in_transaction(
+                        local_plan,
+                        local_pkg_name,
+                        local_transaction_root.merged_root,
+                        verbose,
+                        local_post_commit_retirements,
+                        &failed_pkg,
+                        &failed_log)) {
+                    std::cerr << Color::RED << "E: Failed to retire replaced package "
+                              << failed_pkg << " inside the transaction root"
+                              << Color::RESET << std::endl;
+                    if (!verbose && !failed_log.empty()) {
+                        std::cerr << " See " << failed_log << " for details.";
                     }
+                    std::cerr << std::endl;
+                    return 1;
                 }
+            }
+
+            std::string commit_log_path;
+            if (!local_transaction_root.commit(verbose, &commit_log_path)) {
+                std::cerr << Color::RED
+                          << "E: Failed to commit the local-package transaction root into the live system."
+                          << Color::RESET;
+                if (!verbose && !commit_log_path.empty()) {
+                    std::cerr << " See " << commit_log_path << " for details.";
+                }
+                std::cerr << std::endl;
+                return 1;
+            }
+
+            if (!finalize_post_commit_package_state(
+                    local_post_commit_installs,
+                    local_post_commit_retirements,
+                    installed_cache,
+                    verbose)) {
+                return 1;
+            }
+        } else {
+            std::string commit_log_path;
+            if (!local_transaction_root.commit(verbose, &commit_log_path)) {
+                std::cerr << Color::RED
+                          << "E: Failed to commit the local-package transaction root into the live system."
+                          << Color::RESET;
+                if (!verbose && !commit_log_path.empty()) {
+                    std::cerr << " See " << commit_log_path << " for details.";
+                }
+                std::cerr << std::endl;
+                return 1;
             }
         }
         mutated_runtime_state = true;
@@ -4117,24 +4416,41 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
         return 1;
     }
 
+    ScopedWorkerTransactionRoot transaction_root;
+    if (!transaction_root.create(verbose)) {
+        std::cerr << Color::RED
+                  << "E: Failed to prepare the temporary transaction root for this install."
+                  << Color::RESET << std::endl;
+        return 1;
+    }
+
     std::cout << Color::CYAN << "[*] Installing " << install_queue.size()
-              << " package(s)..." << Color::RESET << std::endl;
+              << " package(s) into the transaction root..." << Color::RESET << std::endl;
     size_t installed_count = 0;
     size_t install_progress_width = 0;
     std::vector<DeferredConfigureEntry> deferred_configures;
+    std::vector<PostCommitInstallEntry> post_commit_installs;
+    std::vector<PostCommitRetirementEntry> post_commit_retirements;
     size_t bootstrap_boundary = runtime_bootstrap_boundary_index(install_queue, verbose);
     for (size_t i = 0; i < install_queue.size(); ++i) {
         bool defer_configure = bootstrap_boundary != install_queue.size() && i <= bootstrap_boundary;
         std::string previous_version;
         get_local_installed_package_version(install_queue[i].name, &previous_version, nullptr);
 
-        if (!verbose) render_package_progress("current", i, install_queue.size(), install_queue[i].name, &install_progress_width);
-        InstallCommandResult result = install_package_v2(install_queue[i], verbose, defer_configure);
+        if (!verbose) {
+            render_package_progress("current", i, install_queue.size(), install_queue[i].name, &install_progress_width);
+        }
+        InstallCommandResult result = install_package_v2(
+            install_queue[i],
+            verbose,
+            defer_configure,
+            transaction_root.merged_root
+        );
         if (!result.success) {
             if (!verbose) finish_progress_line(&install_progress_width);
-            if (mutated_runtime_state) queue_runtime_linker_state_refresh();
             std::cerr << Color::RED << "E: Installation stopped at " << install_queue[i].name
-                      << ". " << installed_count << " package(s) were installed before the failure."
+                      << " while staging the transaction root. " << installed_count
+                      << " package(s) were staged before the failure."
                       << Color::RESET;
             if (!verbose && !result.log_path.empty()) {
                 std::cerr << " See " << result.log_path << " for details.";
@@ -4145,83 +4461,105 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
         mutated_runtime_state = true;
         if (defer_configure) deferred_configures.push_back({install_queue[i], previous_version});
 
-        auto finalize_package = [&](const PackageMetadata& meta) -> bool {
-            queue_triggers_for_package(meta.name);
-            if (!update_package_auto_install_state_after_install(
+        auto stage_package = [&](const PackageMetadata& meta) -> bool {
+            std::string failed_pkg;
+            std::string failed_log;
+            if (!retire_replaced_packages_in_transaction(
+                    install_plan,
                     meta.name,
-                    explicit_manual_targets.count(meta.name) != 0,
-                    installed_cache)) {
+                    transaction_root.merged_root,
+                    verbose,
+                    post_commit_retirements,
+                    &failed_pkg,
+                    &failed_log)) {
                 if (!verbose) finish_progress_line(&install_progress_width);
-                if (mutated_runtime_state) queue_runtime_linker_state_refresh();
-                std::cerr << Color::RED << "E: Failed to update gpkg auto-install state for "
-                          << meta.name << Color::RESET << std::endl;
+                std::cerr << Color::RED << "E: Failed to retire replaced package " << failed_pkg
+                          << " inside the transaction root" << Color::RESET;
+                if (!verbose && !failed_log.empty()) {
+                    std::cerr << " See " << failed_log << " for details.";
+                }
+                std::cerr << std::endl;
                 return false;
             }
-            std::vector<std::string> retirements;
-            if (should_retire_after_install(install_plan, meta.name, retirements)) {
-                for (const auto& retired_pkg : retirements) {
-                    std::vector<std::string> retired_files = read_installed_file_list(retired_pkg);
-                    InstallCommandResult retire_result = retire_package_by_name(retired_pkg, verbose);
-                    if (!retire_result.success) {
-                        if (!verbose) finish_progress_line(&install_progress_width);
-                        if (mutated_runtime_state) queue_runtime_linker_state_refresh();
-                        std::cerr << Color::RED << "E: Failed to retire replaced package " << retired_pkg
-                                  << Color::RESET;
-                        if (!verbose && !retire_result.log_path.empty()) {
-                            std::cerr << " See " << retire_result.log_path << " for details.";
-                        }
-                        std::cerr << std::endl;
-                        return false;
-                    }
-                    check_triggers(retired_files);
-                    if (!erase_package_auto_installed_state(retired_pkg)) {
-                        if (!verbose) finish_progress_line(&install_progress_width);
-                        if (mutated_runtime_state) queue_runtime_linker_state_refresh();
-                        std::cerr << Color::RED << "E: Failed to update gpkg auto-install state for "
-                                  << retired_pkg << Color::RESET << std::endl;
-                        return false;
-                    }
-                    mutated_runtime_state = true;
-                }
-            }
+
+            post_commit_installs.push_back({
+                meta,
+                explicit_manual_targets.count(meta.name) != 0
+            });
             ++installed_count;
             return true;
         };
 
-        if (!defer_configure) {
-            if (!finalize_package(install_queue[i])) return 1;
-        }
+        if (!defer_configure && !stage_package(install_queue[i])) return 1;
 
         if (bootstrap_boundary != install_queue.size() && i == bootstrap_boundary) {
-            if (run_ldconfig_trigger(verbose, resolve_gpkg_worker_command()) != 0) {
+            CommandCaptureResult ldconfig_result = run_command_captured_argv(
+                build_worker_command_argv(
+                    "--refresh-runtime-linker-state",
+                    "",
+                    verbose,
+                    false,
+                    false,
+                    false,
+                    {},
+                    transaction_root.merged_root
+                ),
+                verbose,
+                "gpkg-ldconfig"
+            );
+            if (ldconfig_result.exit_code != 0) {
                 if (!verbose) finish_progress_line(&install_progress_width);
-                if (mutated_runtime_state) queue_runtime_linker_state_refresh();
                 std::cerr << Color::RED
-                          << "E: Failed to refresh the runtime linker state before configuring deferred packages."
+                          << "E: Failed to refresh the runtime linker state inside the transaction root."
                           << Color::RESET << std::endl;
                 return 1;
             }
             for (const auto& deferred : deferred_configures) {
-                InstallCommandResult configure_result =
-                    configure_package_by_name(deferred.meta.name, deferred.previous_version, verbose);
+                InstallCommandResult configure_result = configure_package_by_name(
+                    deferred.meta.name,
+                    deferred.previous_version,
+                    verbose,
+                    transaction_root.merged_root
+                );
                 if (!configure_result.success) {
                     if (!verbose) finish_progress_line(&install_progress_width);
-                    if (mutated_runtime_state) queue_runtime_linker_state_refresh();
                     std::cerr << Color::RED << "E: Failed to configure " << deferred.meta.name
-                              << Color::RESET;
+                              << " inside the transaction root" << Color::RESET;
                     if (!verbose && !configure_result.log_path.empty()) {
                         std::cerr << " See " << configure_result.log_path << " for details.";
                     }
                     std::cerr << std::endl;
                     return 1;
                 }
-                if (!finalize_package(deferred.meta)) return 1;
+                if (!stage_package(deferred.meta)) return 1;
             }
             deferred_configures.clear();
         }
-        if (!verbose) render_package_progress("current", i + 1, install_queue.size(), install_queue[i].name, &install_progress_width);
+        if (!verbose) {
+            render_package_progress("current", i + 1, install_queue.size(), install_queue[i].name, &install_progress_width);
+        }
     }
     if (!verbose) finish_progress_line(&install_progress_width);
+
+    std::string commit_log_path;
+    if (!transaction_root.commit(verbose, &commit_log_path)) {
+        std::cerr << Color::RED
+                  << "E: Failed to commit the transaction root into the live system."
+                  << Color::RESET;
+        if (!verbose && !commit_log_path.empty()) {
+            std::cerr << " See " << commit_log_path << " for details.";
+        }
+        std::cerr << std::endl;
+        return 1;
+    }
+
+    if (!finalize_post_commit_package_state(
+            post_commit_installs,
+            post_commit_retirements,
+            installed_cache,
+            verbose)) {
+        return 1;
+    }
 
     if (mutated_runtime_state) queue_runtime_linker_state_refresh();
     std::cout << Color::GREEN << "✓ Installed " << installed_count << " package(s)." << Color::RESET << std::endl;
