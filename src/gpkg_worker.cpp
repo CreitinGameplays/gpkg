@@ -3611,6 +3611,32 @@ bool compat_rc_entry_matches_service(const std::string& entry_name, const std::s
            entry_name.substr(3) == service_name;
 }
 
+std::string compat_logical_path_from_full_path(const std::string& full_path) {
+    if (!g_root_prefix.empty() && full_path.rfind(g_root_prefix, 0) == 0) {
+        std::string logical = full_path.substr(g_root_prefix.size());
+        if (logical.empty()) return "/";
+        return logical[0] == '/' ? logical : "/" + logical;
+    }
+    return full_path;
+}
+
+bool compat_rc_entry_targets_service(
+    const std::string& entry_path,
+    const std::string& service_name
+) {
+    struct stat st {};
+    if (lstat(entry_path.c_str(), &st) != 0 || !S_ISLNK(st.st_mode)) return false;
+
+    std::string symlink_target = read_symlink_target(entry_path);
+    if (symlink_target.empty()) return false;
+
+    std::string resolved_target = resolve_logical_symlink_target(
+        compat_logical_path_from_full_path(entry_path),
+        symlink_target
+    );
+    return resolved_target == "/etc/init.d/" + service_name;
+}
+
 bool compat_service_has_registered_links(const std::string& service_name) {
     for (const auto& dir_path : compat_rc_directories()) {
         DIR* dir = opendir(dir_path.c_str());
@@ -3620,7 +3646,8 @@ bool compat_service_has_registered_links(const std::string& service_name) {
         while ((entry = readdir(dir)) != nullptr) {
             std::string name = entry->d_name;
             if (name == "." || name == "..") continue;
-            if (compat_rc_entry_matches_service(name, service_name)) {
+            if (compat_rc_entry_matches_service(name, service_name) &&
+                compat_rc_entry_targets_service(dir_path + "/" + name, service_name)) {
                 closedir(dir);
                 return true;
             }
@@ -3640,8 +3667,10 @@ bool compat_remove_registered_links(const std::string& service_name) {
         while ((entry = readdir(dir)) != nullptr) {
             std::string name = entry->d_name;
             if (name == "." || name == "..") continue;
-            if (compat_rc_entry_matches_service(name, service_name)) {
-                to_remove.push_back(dir_path + "/" + name);
+            std::string full_path = dir_path + "/" + name;
+            if (compat_rc_entry_matches_service(name, service_name) &&
+                compat_rc_entry_targets_service(full_path, service_name)) {
+                to_remove.push_back(full_path);
             }
         }
         closedir(dir);
@@ -3806,6 +3835,8 @@ bool compat_toggle_registered_service_links(const std::string& service_name, boo
         while ((entry = readdir(dir)) != nullptr) {
             std::string current_name = entry->d_name;
             if (!compat_rc_entry_matches_service(current_name, service_name)) continue;
+            std::string current_path = dir_path + "/" + current_name;
+            if (!compat_rc_entry_targets_service(current_path, service_name)) continue;
 
             char current_kind = current_name[0];
             if ((enable && current_kind != 'K') || (!enable && current_kind != 'S')) continue;
@@ -3892,22 +3923,21 @@ int action_compat_update_rc_d(const std::vector<std::string>& raw_args) {
 
     const std::string& service_name = operands[0];
     const std::string& command = operands[1];
-    bool requires_init_script =
-        command != "remove";
-
-    if (requires_init_script && !compat_service_init_script_exists(service_name)) {
-        std::cerr << "update-rc.d: /etc/init.d/" << service_name << " is missing" << std::endl;
-        return 1;
-    }
-    if (!requires_init_script && !force && !compat_service_init_script_exists(service_name)) {
-        std::cerr << "update-rc.d: refusing to remove " << service_name
-                  << " without -f because /etc/init.d/" << service_name << " is missing"
-                  << std::endl;
-        return 1;
-    }
+    bool init_script_exists = compat_service_init_script_exists(service_name);
 
     if (command == "remove") {
+        if (init_script_exists && !force) {
+            std::cerr << "update-rc.d: refusing to remove " << service_name
+                      << " because /etc/init.d/" << service_name
+                      << " still exists; use -f to force removal" << std::endl;
+            return 1;
+        }
         return compat_remove_registered_links(service_name) ? 0 : 1;
+    }
+
+    if (!init_script_exists) {
+        std::cerr << "update-rc.d: /etc/init.d/" << service_name << " is missing" << std::endl;
+        return 1;
     }
 
     if (command == "defaults" || command == "defaults-disabled") {
