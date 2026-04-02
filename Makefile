@@ -7,11 +7,15 @@ GLOBAL_SRC_DIR = $(PROJECT_ROOT)/src
 SYS_INFO_HEADER ?= $(GLOBAL_SRC_DIR)/sys_info.h
 GPKG_VERSION_HELPER ?= $(PROJECT_ROOT)/tools/gpkg_version.py
 ROOTFS ?=
-TARGET_CXX_VERSION := $(shell find $(ROOTFS)/usr/include/c++ -maxdepth 1 -mindepth 1 -type d -printf '%f\n' 2>/dev/null | grep -E '^[0-9]+$$' | sort -V | tail -n1)
+TARGET_ROOTFS := $(strip $(ROOTFS))
+ifeq ($(TARGET_ROOTFS),)
+TARGET_ROOTFS := $(PROJECT_ROOT)/rootfs
+endif
+TARGET_CXX_VERSION := $(shell find $(TARGET_ROOTFS)/usr/include/c++ -maxdepth 1 -mindepth 1 -type d -printf '%f\n' 2>/dev/null | grep -E '^[0-9]+$$' | sort -V | tail -n1)
 GPKG_VERSION ?=
 GPKG_CODENAME ?=
 LZMA_STATIC := $(firstword \
-	$(wildcard $(ROOTFS)/usr/lib/x86_64-linux-gnu/liblzma.a) \
+	$(wildcard $(TARGET_ROOTFS)/usr/lib/x86_64-linux-gnu/liblzma.a) \
 	$(wildcard $(PROJECT_ROOT)/rootfs/usr/lib/x86_64-linux-gnu/liblzma.a))
 ifeq ($(strip $(GPKG_VERSION)),)
 ifneq ($(wildcard $(GPKG_VERSION_HELPER)),)
@@ -27,43 +31,59 @@ endif
 
 CXXFLAGS += -Wall -Wextra -O2 -I./src -I$(GINIT_DIR)/src -I$(GLOBAL_SRC_DIR)
 CXXFLAGS += '-DGPKG_VERSION="$(GPKG_VERSION)"' '-DGPKG_CODENAME="$(GPKG_CODENAME)"'
-LIBAPT_PKG_LIBS := $(shell pkg-config --libs apt-pkg 2>/dev/null)
-ifeq ($(strip $(LIBAPT_PKG_LIBS)),)
-LIBAPT_PKG_LIBS := -lapt-pkg -pthread
+ifneq ($(wildcard $(TARGET_ROOTFS)),)
+CXXFLAGS += --sysroot=$(TARGET_ROOTFS)
+LDFLAGS += --sysroot=$(TARGET_ROOTFS)
 endif
+ifneq ($(wildcard $(TARGET_ROOTFS)),)
 LIBAPT_PKG_HEADER_DIR := $(firstword \
-	$(wildcard $(ROOTFS)/usr/include/apt-pkg) \
-	$(wildcard $(PROJECT_ROOT)/rootfs/usr/include/apt-pkg) \
+	$(wildcard $(TARGET_ROOTFS)/usr/include/apt-pkg))
+LIBAPT_PKG_RUNTIME_LIB_CANDIDATE := $(firstword \
+	$(wildcard $(TARGET_ROOTFS)/usr/lib/x86_64-linux-gnu/libapt-pkg.so.[0-9]*))
+else
+LIBAPT_PKG_HEADER_DIR := $(firstword \
 	$(wildcard /usr/include/apt-pkg))
-ifneq ($(strip $(LIBAPT_PKG_HEADER_DIR)),)
-CXXFLAGS += -DGPKG_HAVE_WORKING_LIBAPT_PKG_BACKEND
+LIBAPT_PKG_RUNTIME_LIB_CANDIDATE := $(firstword \
+	$(wildcard /usr/lib/x86_64-linux-gnu/libapt-pkg.so.[0-9]*))
 endif
-ifneq ($(strip $(ROOTFS)),)
-ifneq ($(wildcard $(ROOTFS)/usr/include),)
-CXXFLAGS += -I$(ROOTFS)/usr/include
+LIBAPT_PKG_RUNTIME_LIB := $(realpath $(LIBAPT_PKG_RUNTIME_LIB_CANDIDATE))
+LIBAPT_PKG_RUNTIME_DIR := $(dir $(LIBAPT_PKG_RUNTIME_LIB))
+ifneq ($(strip $(LIBAPT_PKG_HEADER_DIR)),)
+ifneq ($(strip $(LIBAPT_PKG_RUNTIME_LIB)),)
+CXXFLAGS += -DGPKG_HAVE_WORKING_LIBAPT_PKG_BACKEND
+LIBAPT_PKG_LIBS := -L$(LIBAPT_PKG_RUNTIME_DIR) -lapt-pkg -pthread
+else
+LIBAPT_PKG_LIBS :=
+endif
+else
+LIBAPT_PKG_LIBS :=
+endif
+ifneq ($(strip $(TARGET_ROOTFS)),)
+ifneq ($(wildcard $(TARGET_ROOTFS)/usr/include),)
+CXXFLAGS += -I$(TARGET_ROOTFS)/usr/include
 endif
 endif
 ifneq ($(strip $(TARGET_CXX_VERSION)),)
 CXXFLAGS += -nostdinc++
-CXXFLAGS += -isystem $(ROOTFS)/usr/include/c++/$(TARGET_CXX_VERSION)
-CXXFLAGS += -isystem $(ROOTFS)/usr/include/x86_64-linux-gnu/c++/$(TARGET_CXX_VERSION)
-CXXFLAGS += -isystem $(ROOTFS)/usr/include/c++/$(TARGET_CXX_VERSION)/backward
+CXXFLAGS += -isystem $(TARGET_ROOTFS)/usr/include/c++/$(TARGET_CXX_VERSION)
+CXXFLAGS += -isystem $(TARGET_ROOTFS)/usr/include/x86_64-linux-gnu/c++/$(TARGET_CXX_VERSION)
+CXXFLAGS += -isystem $(TARGET_ROOTFS)/usr/include/c++/$(TARGET_CXX_VERSION)/backward
 endif
-GPKG_LDFLAGS = -L$(GINIT_DIR)/lib -lgemcore -lssl -lcrypto -lz -lzstd -ldl -lpthread -lcrypt $(LIBAPT_PKG_LIBS)
+GPKG_LDFLAGS = $(LDFLAGS) -L$(GINIT_DIR)/lib -lgemcore -lssl -lcrypto -lz -lzstd -ldl -lpthread -lcrypt $(LIBAPT_PKG_LIBS)
 ifeq ($(strip $(LZMA_STATIC)),)
 GPKG_LDFLAGS += -llzma
 else
 GPKG_LDFLAGS += $(LZMA_STATIC)
 endif
-WORKER_LDFLAGS = -lssl -lcrypto -lz -lzstd -ldl -lpthread
+WORKER_LDFLAGS = $(LDFLAGS) -lssl -lcrypto -lz -lzstd -ldl -lpthread
 ifeq ($(strip $(LZMA_STATIC)),)
 WORKER_LDFLAGS += -llzma
 else
 WORKER_LDFLAGS += $(LZMA_STATIC)
 endif
 ifneq ($(strip $(TARGET_CXX_VERSION)),)
-GPKG_LDFLAGS += $(ROOTFS)/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
-WORKER_LDFLAGS += $(ROOTFS)/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+GPKG_LDFLAGS += $(TARGET_ROOTFS)/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+WORKER_LDFLAGS += $(TARGET_ROOTFS)/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
 endif
 
 SRCDIR = src
@@ -84,7 +104,7 @@ FORCE:
 $(BUILD_CONFIG_STAMP): FORCE | $(OBJDIR)
 	@tmp="$@.tmp"; \
 	printf 'GPKG_VERSION=%s\nGPKG_CODENAME=%s\nTARGET_CXX_VERSION=%s\nROOTFS=%s\n' \
-		'$(GPKG_VERSION)' '$(GPKG_CODENAME)' '$(TARGET_CXX_VERSION)' '$(ROOTFS)' > "$$tmp"; \
+		'$(GPKG_VERSION)' '$(GPKG_CODENAME)' '$(TARGET_CXX_VERSION)' '$(TARGET_ROOTFS)' > "$$tmp"; \
 	if [ -f "$@" ] && cmp -s "$@" "$$tmp"; then \
 		rm -f "$$tmp"; \
 	else \

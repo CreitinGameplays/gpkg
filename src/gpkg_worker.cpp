@@ -888,10 +888,46 @@ bool refresh_linker_cache_if_available() {
     return true;
 }
 
+bool verify_runtime_command_smoke_tests() {
+    struct RuntimeSmokeTest {
+        const char* path;
+        std::vector<std::string> args;
+    };
+
+    const RuntimeSmokeTest tests[] = {
+        {"/bin/sh", {"-c", "exit 0"}},
+        {"/bin/bash", {"--version"}},
+        {"/bin/ls", {"--version"}},
+        {"/bin/gpkg", {"--version"}},
+    };
+
+    for (const auto& test : tests) {
+        std::string full_path = g_root_prefix + test.path;
+        if (access(full_path.c_str(), X_OK) != 0) continue;
+
+        int rc = run_path_with_args(full_path, test.args);
+        if (rc == 0) continue;
+
+        std::ostringstream rendered;
+        rendered << test.path;
+        for (const auto& arg : test.args) rendered << " " << arg;
+        std::cerr << "E: Runtime smoke test failed after refreshing linker state: "
+                  << rendered.str() << " (exit " << rc << ")." << std::endl;
+        return false;
+    }
+
+    return true;
+}
+
+bool refresh_and_verify_runtime_linker_state() {
+    if (!refresh_linker_cache_if_available()) return false;
+    return verify_runtime_command_smoke_tests();
+}
+
 bool finalize_runtime_linker_state_for_success(bool runtime_sensitive) {
     if (!runtime_sensitive) return true;
     if (g_defer_runtime_linker_refresh) return true;
-    return refresh_linker_cache_if_available();
+    return refresh_and_verify_runtime_linker_state();
 }
 
 struct ScopedEnvOverrides {
@@ -8654,7 +8690,7 @@ bool action_verify(const std::string& pkg_name) {
 }
 
 bool action_refresh_runtime_linker_state() {
-    return refresh_linker_cache_if_available();
+    return refresh_and_verify_runtime_linker_state();
 }
 
 int main(int argc, char* argv[]) {
