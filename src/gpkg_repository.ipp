@@ -1035,10 +1035,37 @@ std::string build_upgrade_catalog_fingerprint() {
 
 std::set<std::string> load_present_base_registry_package_names() {
     std::set<std::string> names;
-    for (const auto& entry : load_base_system_registry_entries()) {
-        if (entry.package.empty()) continue;
-        if (!base_system_registry_entry_looks_present(entry)) continue;
-        names.insert(canonicalize_package_name(entry.package));
+    for (const auto& record : load_base_system_package_status_records()) {
+        if (record.package.empty()) continue;
+        if (!package_status_is_installed_like(record.status)) continue;
+
+        std::string canonical_name = canonicalize_package_name(record.package);
+        if (canonical_name.empty()) continue;
+
+        PackageMetadata exact_meta;
+        if (get_loaded_repo_package_info(canonical_name, exact_meta)) {
+            names.insert(canonical_name);
+            continue;
+        }
+
+        auto provider_it = g_repo_provider_cache.find(canonical_name);
+        if (provider_it == g_repo_provider_cache.end()) continue;
+
+        bool found_provider = false;
+        PackageMetadata best_meta;
+        std::string best_name;
+        for (const auto& provider_name : provider_it->second) {
+            PackageMetadata candidate;
+            if (!get_loaded_repo_package_info(provider_name, candidate)) continue;
+            if (!found_provider || should_prefer_repo_candidate(candidate, best_meta)) {
+                found_provider = true;
+                best_meta = candidate;
+                best_name = candidate.name;
+            }
+        }
+        if (found_provider && !best_name.empty()) {
+            names.insert(best_name);
+        }
     }
     return names;
 }

@@ -45,6 +45,14 @@ bool get_installed_package_metadata(const std::string& pkg_name, PackageMetadata
 }
 
 bool get_live_installed_package_metadata(const std::string& pkg_name, PackageMetadata& out_meta) {
+    auto has_comparable_live_version = [](const std::string& version) {
+        std::string normalized = trim(version);
+        return !normalized.empty() &&
+            normalized != "0" &&
+            normalized != "9999" &&
+            normalized != NATIVE_DPKG_UNVERIFIED_VERSION;
+    };
+
     PackageStatusRecord status_record;
     bool have_live_status =
         get_dpkg_package_status_record(pkg_name, &status_record) &&
@@ -57,9 +65,7 @@ bool get_live_installed_package_metadata(const std::string& pkg_name, PackageMet
 
     PackageMetadata installed_meta;
     bool have_installed_meta = get_installed_package_metadata(pkg_name, installed_meta);
-    bool have_exact_live_version =
-        !trim(status_record.version).empty() &&
-        status_record.version != NATIVE_DPKG_UNVERIFIED_VERSION;
+    bool have_exact_live_version = has_comparable_live_version(status_record.version);
     bool installed_relations_exact =
         have_exact_live_version &&
         have_installed_meta &&
@@ -293,9 +299,18 @@ bool package_metadata_satisfies_dependency(
     const PackageMetadata& meta,
     const Dependency& dep
 ) {
+    auto has_comparable_version = [&](const std::string& version) {
+        std::string normalized = trim(version);
+        return !normalized.empty() &&
+            normalized != "0" &&
+            normalized != "9999" &&
+            normalized != NATIVE_DPKG_UNVERIFIED_VERSION;
+    };
+
     std::string canonical_package = canonicalize_package_name(package_name);
     std::string canonical_dep = canonicalize_package_name(dep.name);
     if (canonical_package == canonical_dep &&
+        (dep.op.empty() || has_comparable_version(meta.version)) &&
         version_satisfies(meta.version, dep.op, dep.version)) {
         return true;
     }
@@ -879,6 +894,15 @@ bool relation_matches_concrete_package(
     if (dep.name.empty()) return false;
     if (canonicalize_package_name(pkg_name) != dep.name) return false;
     if (!pkg_meta) return dep.op.empty();
+    if (!dep.op.empty()) {
+        std::string normalized_version = trim(pkg_meta->version);
+        if (normalized_version.empty() ||
+            normalized_version == "0" ||
+            normalized_version == "9999" ||
+            normalized_version == NATIVE_DPKG_UNVERIFIED_VERSION) {
+            return false;
+        }
+    }
     return version_satisfies(pkg_meta->version, dep.op, dep.version);
 }
 

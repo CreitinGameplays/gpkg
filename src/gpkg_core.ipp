@@ -589,11 +589,17 @@ bool native_dpkg_package_has_exact_registered_live_version(
 
 std::string get_raw_base_system_registry_version_for_package(const std::string& pkg_name) {
     if (pkg_name.empty()) return "";
-    std::string lowered = ascii_lower_copy(pkg_name);
+    std::string canonical_name = canonicalize_package_name(pkg_name);
     for (const auto& entry : load_base_system_registry_entries()) {
-        if (entry.package == pkg_name || ascii_lower_copy(entry.package) == lowered) {
-            return trim(entry.version);
+        if (!base_system_registry_entry_looks_present(entry)) continue;
+        if (!base_registry_identity_has_exact_registry_version(canonical_name)) continue;
+
+        std::vector<std::string> identities = get_base_registry_package_identities(entry);
+        if (std::find(identities.begin(), identities.end(), canonical_name) == identities.end()) {
+            continue;
         }
+
+        return trim(entry.version);
     }
     return "";
 }
@@ -602,6 +608,7 @@ std::string resolve_base_system_status_version(
     const std::string& pkg_name,
     const std::string& registry_version
 ) {
+    std::string normalized_registry_version = trim(registry_version);
     std::string exact_version;
     if (native_dpkg_package_has_exact_registered_live_version(pkg_name, &exact_version)) {
         return exact_version;
@@ -617,7 +624,16 @@ std::string resolve_base_system_status_version(
         }
     }
 
-    (void) registry_version;
+    if (!normalized_registry_version.empty() &&
+        base_registry_identity_has_exact_registry_version(pkg_name)) {
+        return normalized_registry_version;
+    }
+
+    std::string exact_registry_version = get_raw_base_system_registry_version_for_package(pkg_name);
+    if (!exact_registry_version.empty()) {
+        return exact_registry_version;
+    }
+
     return NATIVE_DPKG_UNVERIFIED_VERSION;
 }
 
@@ -833,16 +849,37 @@ bool get_json_array(const std::string& obj, const std::string& key, std::vector<
 }
 
 std::vector<PackageStatusRecord> load_base_system_package_status_records() {
-    std::vector<PackageStatusRecord> records;
+    std::map<std::string, PackageStatusRecord> records_by_package;
     for (const auto& entry : load_base_system_registry_entries()) {
         if (!base_system_registry_entry_looks_present(entry)) continue;
-        PackageStatusRecord record;
-        record.package = entry.package;
-        record.version = resolve_base_system_status_version(entry.package, entry.version);
-        record.want = "install";
-        record.flag = "ok";
-        record.status = "installed";
-        records.push_back(record);
+
+        std::vector<std::string> identities = get_base_registry_package_identities(entry);
+        for (const auto& identity : identities) {
+            if (identity.empty()) continue;
+
+            PackageStatusRecord record;
+            record.package = identity;
+            record.version = resolve_base_system_status_version(
+                identity,
+                base_registry_identity_has_exact_registry_version(identity) ? entry.version : ""
+            );
+            record.want = "install";
+            record.flag = "ok";
+            record.status = "installed";
+
+            auto existing = records_by_package.find(identity);
+            if (existing == records_by_package.end() ||
+                (existing->second.version == NATIVE_DPKG_UNVERIFIED_VERSION &&
+                 record.version != NATIVE_DPKG_UNVERIFIED_VERSION)) {
+                records_by_package[identity] = record;
+            }
+        }
+    }
+
+    std::vector<PackageStatusRecord> records;
+    records.reserve(records_by_package.size());
+    for (const auto& pair : records_by_package) {
+        records.push_back(pair.second);
     }
     return records;
 }

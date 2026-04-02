@@ -36,16 +36,26 @@ std::string resolve_native_dpkg_bootstrap_name(
     const std::string& source_pkg_name,
     PackageMetadata* meta_out = nullptr
 );
+std::string normalize_dpkg_compatible_version(
+    const std::string& pkg_name,
+    const std::string& raw_version,
+    const ImportPolicy& policy
+);
 bool is_native_dpkg_compat_placeholder_version(
     const std::string& pkg_name,
     const std::string& version,
     const ImportPolicy& policy
 );
+std::string native_synthetic_info_list_path(const std::string& pkg_name);
 bool package_name_is_debian_control_sidecar_package(const std::string& pkg_name);
 std::string resolve_context_synthetic_live_version(
     const std::string& pkg_name,
     const std::string& raw_version,
     UpgradeContext& context
+);
+bool get_repo_native_live_payload_version_hint(
+    const std::string& pkg_name,
+    std::string* version_out = nullptr
 );
 InstallCommandResult install_native_debian_batch(
     const std::vector<PackageMetadata>& batch,
@@ -167,12 +177,23 @@ bool get_local_installed_package_version(
             consider_version(base_it->second.version);
         }
 
+        std::string live_payload_version;
+        if (get_repo_native_live_payload_version_hint(pkg_name, &live_payload_version)) {
+            consider_version(live_payload_version);
+        }
+
         if (!found) return false;
         if (version_out) *version_out = best_version;
         return true;
     }
 
     if (is_installed(pkg_name, version_out)) return true;
+
+    std::string live_payload_version;
+    if (get_repo_native_live_payload_version_hint(pkg_name, &live_payload_version)) {
+        if (version_out) *version_out = live_payload_version;
+        return true;
+    }
 
     PackageStatusRecord dpkg_record;
     if (get_dpkg_package_status_record(pkg_name, &dpkg_record) &&
@@ -210,6 +231,10 @@ bool package_has_exact_live_install_state(
                 dpkg_it->second.version,
                 *context
             );
+            const ImportPolicy& policy = get_import_policy(false);
+            if (is_native_dpkg_compat_placeholder_version(pkg_name, resolved_version, policy)) {
+                return false;
+            }
             if (version_out) *version_out = resolved_version;
             return true;
         }
@@ -222,11 +247,44 @@ bool package_has_exact_live_install_state(
     PackageStatusRecord dpkg_record;
     if (get_dpkg_package_status_record(pkg_name, &dpkg_record) &&
         package_status_is_installed_like(dpkg_record.status)) {
+        const ImportPolicy& policy = get_import_policy(false);
+        if (is_native_dpkg_compat_placeholder_version(pkg_name, dpkg_record.version, policy)) {
+            return false;
+        }
         if (version_out) *version_out = dpkg_record.version;
         return true;
     }
 
     return false;
+}
+
+bool get_repo_native_live_payload_version_hint(
+    const std::string& pkg_name,
+    std::string* version_out
+) {
+    if (version_out) version_out->clear();
+
+    std::string canonical_name = canonicalize_package_name(pkg_name);
+    if (canonical_name != "gpkg") return false;
+
+    const std::vector<std::string> probe_paths = {
+        ROOT_PREFIX + "/bin/apps/system/gpkg",
+        ROOT_PREFIX + "/bin/gpkg",
+    };
+    bool live_payload_present = false;
+    for (const auto& path : probe_paths) {
+        if (!path.empty() && access(path.c_str(), F_OK) == 0) {
+            live_payload_present = true;
+            break;
+        }
+    }
+    if (!live_payload_present) return false;
+
+    std::string version = trim(GPKG_VERSION);
+    if (version.empty() || version == OS_VERSION) return false;
+
+    if (version_out) *version_out = version;
+    return true;
 }
 
 std::string to_lower_copy(const std::string& value) {
@@ -399,17 +457,12 @@ bool write_text_file_atomically(const std::string& path, const std::string& cont
 bool package_has_present_base_registry_entry_exact(const std::string& pkg_name) {
     if (pkg_name.empty()) return false;
     std::string canonical_name = canonicalize_package_name(pkg_name);
-    std::string lowered_name = to_lower_copy(pkg_name);
-    std::string lowered_canonical = to_lower_copy(canonical_name);
     for (const auto& entry : load_base_system_registry_entries()) {
-        std::string entry_canonical = canonicalize_package_name(entry.package);
-        if (entry.package != pkg_name &&
-            entry_canonical != canonical_name &&
-            to_lower_copy(entry.package) != lowered_name &&
-            to_lower_copy(entry_canonical) != lowered_canonical) {
-            continue;
+        if (!base_system_registry_entry_looks_present(entry)) continue;
+        std::vector<std::string> identities = get_base_registry_package_identities(entry);
+        if (std::find(identities.begin(), identities.end(), canonical_name) != identities.end()) {
+            return true;
         }
-        if (base_system_registry_entry_looks_present(entry)) return true;
     }
     return false;
 }
@@ -626,6 +679,86 @@ void seed_native_dpkg_bootstrap_entry(
             entry.files.insert(normalized);
         }
     }
+}
+
+std::vector<std::string> build_native_dpkg_compat_status_paragraph(
+    const NativeDpkgBootstrapEntry& entry,
+    const ImportPolicy& policy
+) {
+    std::vector<std::string> lines;
+    if (entry.package.empty()) return lines;
+
+    std::string version = normalize_dpkg_compatible_version(entry.package, "", policy);
+    std::string priority = trim(entry.meta.priority);
+    if (priority.empty()) {
+        priority = native_dpkg_seed_prefers_high_compat_version(entry.package, policy) ? "required" : "optional";
+    }
+
+    std::string section = trim(entry.meta.section);
+    if (section.empty()) {
+        section = priority == "required" ? "admin" : "misc";
+    }
+
+    std::string maintainer = trim(entry.meta.maintainer);
+    if (maintainer.empty()) maintainer = "GeminiOS";
+
+    std::string architecture = normalize_dpkg_architecture_name(entry.meta.arch);
+    if (entry.package == "base-files" && entry.meta.arch.empty()) architecture = "all";
+
+    std::string description = description_summary(entry.meta.description, 200);
+    if (description.empty()) {
+        description = "Synthetic native dpkg compatibility record managed by gpkg";
+    }
+
+    lines.push_back("Package: " + entry.package);
+    lines.push_back(
+        "Status: " +
+        (entry.status.want.empty() ? "install" : entry.status.want) + " " +
+        (entry.status.flag.empty() ? "ok" : entry.status.flag) + " " +
+        (entry.status.status.empty() ? "installed" : entry.status.status)
+    );
+    lines.push_back("Priority: " + priority);
+    lines.push_back("Section: " + section);
+    lines.push_back("Installed-Size: 0");
+    lines.push_back("Maintainer: " + maintainer);
+    lines.push_back("Architecture: " + architecture);
+    lines.push_back("Version: " + version);
+    if (!trim(entry.multi_arch).empty()) {
+        lines.push_back("Multi-Arch: " + trim(entry.multi_arch));
+    }
+    lines.push_back("Description: " + description);
+
+    return lines;
+}
+
+bool write_native_dpkg_compat_list_manifest(
+    const std::string& pkg_name,
+    const std::set<std::string>& files,
+    std::string* error_out = nullptr
+) {
+    if (error_out) error_out->clear();
+    if (pkg_name.empty()) return true;
+
+    std::ostringstream list_stream;
+    for (const auto& file : files) {
+        if (trim(file).empty()) continue;
+        list_stream << file << "\n";
+    }
+    std::string content = list_stream.str();
+
+    const std::vector<std::string> destinations = {
+        native_synthetic_info_list_path(pkg_name),
+        DPKG_INFO_DIR + "/" + pkg_name + ".list",
+    };
+    for (const auto& path : destinations) {
+        if (write_text_file_atomically(path, content)) continue;
+        if (error_out) {
+            *error_out = "failed to write " + path + ": " + std::strerror(errno);
+        }
+        return false;
+    }
+
+    return true;
 }
 
 std::vector<std::string> collect_native_dpkg_policy_seed_packages(const ImportPolicy& policy) {
@@ -1017,6 +1150,24 @@ bool repair_native_dpkg_status_database(bool verbose, std::string* error_out) {
                 synthetic_record.satisfies_versioned_deps =
                     have_exact_registered_live_version;
                 synthetic_state_by_package[pkg_name] = synthetic_record;
+
+                NativeDpkgBootstrapEntry compat_entry;
+                compat_entry.package = pkg_name;
+                compat_entry.meta = resolved_meta;
+                compat_entry.multi_arch = resolve_native_dpkg_bootstrap_multi_arch(
+                    pkg_name,
+                    have_resolved_meta ? &resolved_meta : nullptr,
+                    false
+                );
+                compat_entry.status.want = "install";
+                compat_entry.status.flag = "ok";
+                compat_entry.status.status = "installed";
+                compat_entry.emit_solver_relations = false;
+                rebuilt_paragraphs.push_back({
+                    pkg_name,
+                    original_pkg_name,
+                    build_native_dpkg_compat_status_paragraph(compat_entry, policy)
+                });
                 changed = true;
                 continue;
             }
@@ -1102,38 +1253,44 @@ bool repair_native_dpkg_status_database(bool verbose, std::string* error_out) {
         const std::string& new_pkg = rename_pair.second;
         if (old_pkg.empty() || new_pkg.empty() || old_pkg == new_pkg) continue;
 
-        std::string old_list_path = DPKG_INFO_DIR + "/" + old_pkg + ".list";
-        std::string new_list_path = native_synthetic_info_list_path(new_pkg);
+        std::string old_dpkg_list_path = DPKG_INFO_DIR + "/" + old_pkg + ".list";
+        std::string old_synthetic_list_path = native_synthetic_info_list_path(old_pkg);
+        std::string new_dpkg_list_path = DPKG_INFO_DIR + "/" + new_pkg + ".list";
+        std::string new_synthetic_list_path = native_synthetic_info_list_path(new_pkg);
 
         std::set<std::string> merged_paths;
-        for (const auto& raw_path : load_dependency_entries(new_list_path)) {
-            std::string normalized = trim(raw_path);
-            if (normalized.empty()) continue;
-            if (normalized.front() != '/') normalized = "/" + normalized;
-            merged_paths.insert(normalized);
-        }
-        for (const auto& raw_path : load_dependency_entries(old_list_path)) {
-            std::string normalized = trim(raw_path);
-            if (normalized.empty()) continue;
-            if (normalized.front() != '/') normalized = "/" + normalized;
-            merged_paths.insert(normalized);
-        }
+        auto merge_list_paths = [&](const std::string& path) {
+            for (const auto& raw_path : load_dependency_entries(path)) {
+                std::string normalized = trim(raw_path);
+                if (normalized.empty()) continue;
+                if (normalized.front() != '/') normalized = "/" + normalized;
+                merged_paths.insert(normalized);
+            }
+        };
+        merge_list_paths(new_dpkg_list_path);
+        merge_list_paths(new_synthetic_list_path);
+        merge_list_paths(old_dpkg_list_path);
+        merge_list_paths(old_synthetic_list_path);
 
         if (!merged_paths.empty()) {
-            std::ostringstream list_stream;
-            for (const auto& path : merged_paths) {
-                list_stream << path << "\n";
-            }
-            if (!write_text_file_atomically(new_list_path, list_stream.str())) {
-                if (error_out) *error_out = "failed to migrate " + old_list_path + " to "
-                    + new_list_path + ": " + std::strerror(errno);
+            if (!write_native_dpkg_compat_list_manifest(new_pkg, merged_paths, error_out)) {
+                if (error_out && error_out->empty()) {
+                    *error_out = "failed to migrate " + old_dpkg_list_path + " and " +
+                        old_synthetic_list_path + " to " + new_dpkg_list_path + " and " +
+                        new_synthetic_list_path;
+                }
                 return false;
             }
         }
 
-        if (access(old_list_path.c_str(), F_OK) == 0) {
-            if (unlink(old_list_path.c_str()) != 0 && errno != ENOENT) {
-                if (error_out) *error_out = "failed to remove stale " + old_list_path + ": "
+        const std::vector<std::string> stale_paths = {
+            old_dpkg_list_path,
+            old_synthetic_list_path,
+        };
+        for (const auto& stale_path : stale_paths) {
+            if (access(stale_path.c_str(), F_OK) != 0) continue;
+            if (unlink(stale_path.c_str()) != 0 && errno != ENOENT) {
+                if (error_out) *error_out = "failed to remove stale " + stale_path + ": "
                     + std::strerror(errno);
                 return false;
             }
@@ -1174,6 +1331,9 @@ bool repair_native_dpkg_status_database(bool verbose, std::string* error_out) {
             remember_key(to_lower_copy(canonical_resolved));
         };
         remember_files(entry.package);
+        for (const auto& identity : get_base_registry_package_identities(entry)) {
+            remember_files(identity);
+        }
         remember_files(resolve_native_dpkg_bootstrap_name(entry.package));
     }
 
@@ -1234,11 +1394,13 @@ bool repair_native_dpkg_status_database(bool verbose, std::string* error_out) {
             normalized_files.insert(normalized);
         }
 
-        std::ostringstream list_stream;
-        for (const auto& file : normalized_files) {
-            list_stream << file << "\n";
-        }
-        if (!write_text_file_atomically(list_path, list_stream.str())) {
+        if (!write_text_file_atomically(list_path, [&]() {
+                std::ostringstream list_stream;
+                for (const auto& file : normalized_files) {
+                    list_stream << file << "\n";
+                }
+                return list_stream.str();
+            }())) {
             if (error_out) *error_out = "failed to write " + list_path + ": " + std::strerror(errno);
             return false;
         }
@@ -1289,12 +1451,7 @@ bool repair_native_dpkg_status_database(bool verbose, std::string* error_out) {
             normalized_files.insert(normalized);
         }
 
-        std::ostringstream list_stream;
-        for (const auto& file : normalized_files) {
-            list_stream << file << "\n";
-        }
-        if (!write_text_file_atomically(list_path, list_stream.str())) {
-            if (error_out) *error_out = "failed to write " + list_path + ": " + std::strerror(errno);
+        if (!write_native_dpkg_compat_list_manifest(record.package, normalized_files, error_out)) {
             return false;
         }
     }
@@ -1350,28 +1507,16 @@ bool native_dpkg_package_looks_synthetic(const std::string& pkg_name) {
 std::vector<std::string> get_base_system_registry_files_for_package(const std::string& pkg_name) {
     if (pkg_name.empty()) return {};
     std::string canonical_name = canonicalize_package_name(pkg_name);
-    std::string lowered_name = to_lower_copy(pkg_name);
-    std::string lowered_canonical = to_lower_copy(canonical_name);
     for (const auto& entry : load_base_system_registry_entries()) {
-        std::string entry_canonical = canonicalize_package_name(entry.package);
-        if (entry.package != pkg_name &&
-            entry_canonical != canonical_name &&
-            to_lower_copy(entry.package) != lowered_name &&
-            to_lower_copy(entry_canonical) != lowered_canonical) {
-            continue;
+        std::vector<std::string> identities = get_base_registry_package_identities(entry);
+        if (std::find(identities.begin(), identities.end(), canonical_name) != identities.end()) {
+            return entry.files;
         }
-        return entry.files;
     }
     for (const auto& entry : load_base_system_registry_entries()) {
         std::string resolved = resolve_native_dpkg_bootstrap_name(entry.package);
         std::string resolved_canonical = canonicalize_package_name(resolved);
-        if (resolved != pkg_name &&
-            resolved_canonical != canonical_name &&
-            to_lower_copy(resolved) != lowered_name &&
-            to_lower_copy(resolved_canonical) != lowered_canonical) {
-            continue;
-        }
-        return entry.files;
+        if (resolved == pkg_name || resolved_canonical == canonical_name) return entry.files;
     }
     return {};
 }
@@ -1534,31 +1679,41 @@ bool bootstrap_native_dpkg_status_database(bool verbose, std::string* error_out)
         if (base_entry.package.empty()) continue;
         if (!base_system_registry_entry_looks_present(base_entry)) continue;
 
-        PackageMetadata meta;
-        bool have_meta = false;
-        std::string bootstrap_name = resolve_native_dpkg_bootstrap_name(base_entry.package, &meta);
-        if (!bootstrap_name.empty() && !meta.name.empty()) {
-            have_meta = true;
-        } else {
-            have_meta = get_installed_package_metadata(base_entry.package, meta);
+        std::vector<std::string> identities = get_base_registry_package_identities(base_entry);
+        bool first_identity = true;
+        for (const auto& identity : identities) {
+            if (identity.empty()) continue;
+
+            PackageMetadata meta;
+            bool have_meta = false;
+            std::string bootstrap_name = resolve_native_dpkg_bootstrap_name(identity, &meta);
+            if (!bootstrap_name.empty() && !meta.name.empty()) {
+                have_meta = true;
+            } else {
+                have_meta = get_installed_package_metadata(identity, meta);
+            }
+
+            PackageStatusRecord record;
+            record.package = identity;
+            record.want = "install";
+            record.flag = "ok";
+            record.status = "installed";
+            record.version = resolve_base_system_status_version(
+                identity,
+                base_registry_identity_has_exact_registry_version(identity) ? base_entry.version : ""
+            );
+
+            seed_native_dpkg_bootstrap_entry(
+                synthetic_entries,
+                identity,
+                have_meta ? &meta : nullptr,
+                &record,
+                first_identity ? &base_entry.files : nullptr,
+                record.version,
+                false
+            );
+            first_identity = false;
         }
-
-        PackageStatusRecord record;
-        record.package = base_entry.package;
-        record.want = "install";
-        record.flag = "ok";
-        record.status = "installed";
-        record.version = resolve_base_system_status_version(base_entry.package, base_entry.version);
-
-        seed_native_dpkg_bootstrap_entry(
-            synthetic_entries,
-            base_entry.package,
-            have_meta ? &meta : nullptr,
-            &record,
-            &base_entry.files,
-            record.version,
-            false
-        );
     }
 
     for (const auto& pkg_name : collect_native_dpkg_policy_seed_packages(policy)) {
@@ -1602,13 +1757,22 @@ bool bootstrap_native_dpkg_status_database(bool verbose, std::string* error_out)
         return false;
     }
 
-    if (!write_text_file_atomically(DPKG_STATUS_FILE, "")) {
+    std::ostringstream status_stream;
+    for (const auto& pair : synthetic_entries) {
+        std::vector<std::string> paragraph =
+            build_native_dpkg_compat_status_paragraph(pair.second, policy);
+        for (const auto& line : paragraph) status_stream << line << "\n";
+        status_stream << "\n";
+    }
+    std::string status_content = status_stream.str();
+
+    if (!write_text_file_atomically(DPKG_STATUS_FILE, status_content)) {
         if (error_out) {
             *error_out = "failed to write " + DPKG_STATUS_FILE + ": " + std::strerror(errno);
         }
         return false;
     }
-    if (!write_text_file_atomically(DPKG_ADMIN_DIR + "/status-old", "")) {
+    if (!write_text_file_atomically(DPKG_ADMIN_DIR + "/status-old", status_content)) {
         if (verbose) {
             std::cout << "[DEBUG] Failed to refresh " << DPKG_ADMIN_DIR + "/status-old"
                       << " during native dpkg bootstrap." << std::endl;
@@ -1636,15 +1800,7 @@ bool bootstrap_native_dpkg_status_database(bool verbose, std::string* error_out)
             synthetic_record.version_confidence == "exact";
         synthetic_state_by_package[package_name] = synthetic_record;
 
-        std::ostringstream list_stream;
-        for (const auto& file : entry.files) {
-            list_stream << file << "\n";
-        }
-        if (!write_text_file_atomically(native_synthetic_info_list_path(package_name), list_stream.str())) {
-            if (error_out) {
-                *error_out = "failed to write " + native_synthetic_info_list_path(package_name)
-                    + ": " + std::strerror(errno);
-            }
+        if (!write_native_dpkg_compat_list_manifest(package_name, entry.files, error_out)) {
             return false;
         }
     }
@@ -1654,7 +1810,7 @@ bool bootstrap_native_dpkg_status_database(bool verbose, std::string* error_out)
     }
 
     VLOG(verbose, "Bootstrapped real native dpkg state at " << DPKG_STATUS_FILE
-                  << " with 0 real native package record(s) and "
+                  << " with " << synthetic_entries.size() << " compat package record(s) and "
                   << synthetic_entries.size() << " synthetic owner record(s).");
     return true;
 }
@@ -1684,6 +1840,8 @@ UpgradeContext build_upgrade_context(bool verbose) {
         }
     }
 
+    const ImportPolicy& policy = get_import_policy(verbose);
+
     UpgradeContext context;
     context.registered_status_records = load_package_status_records();
     for (const auto& record : context.registered_status_records) {
@@ -1707,32 +1865,44 @@ UpgradeContext build_upgrade_context(bool verbose) {
         if (record.package.empty()) continue;
         context.dpkg_status_by_package[record.package] = record;
         if (!package_status_is_installed_like(record.status)) continue;
-        context.exact_live_packages.insert(record.package);
+        if (!is_native_dpkg_compat_placeholder_version(record.package, record.version, policy)) {
+            context.exact_live_packages.insert(record.package);
+        }
     }
 
     context.base_entries = load_base_system_registry_entries();
     for (const auto& entry : context.base_entries) {
         if (entry.package.empty()) continue;
         bool present = base_system_registry_entry_looks_present(entry);
-        auto existing = context.base_presence_by_package.find(entry.package);
-        if (existing == context.base_presence_by_package.end()) {
-            context.base_presence_by_package[entry.package] = present;
-        } else {
-            existing->second = existing->second || present;
-        }
         if (!present) continue;
 
-        context.present_base_packages.insert(entry.package);
-        PackageStatusRecord record;
-        record.package = entry.package;
-        record.version = resolve_base_system_status_version(entry.package, entry.version);
-        record.want = "install";
-        record.flag = "ok";
-        record.status = "installed";
-        if (record.version != NATIVE_DPKG_UNVERIFIED_VERSION) {
-            context.exact_live_packages.insert(entry.package);
+        std::vector<std::string> identities = get_base_registry_package_identities(entry, verbose);
+        for (const auto& identity : identities) {
+            if (identity.empty()) continue;
+
+            auto existing = context.base_presence_by_package.find(identity);
+            if (existing == context.base_presence_by_package.end()) {
+                context.base_presence_by_package[identity] = true;
+            } else {
+                existing->second = true;
+            }
+
+            context.present_base_packages.insert(identity);
+            PackageStatusRecord record;
+            record.package = identity;
+            record.version = resolve_base_system_status_version(
+                identity,
+                base_registry_identity_has_exact_registry_version(identity, verbose) ? entry.version : ""
+            );
+            record.want = "install";
+            record.flag = "ok";
+            record.status = "installed";
+            if (record.version != NATIVE_DPKG_UNVERIFIED_VERSION &&
+                !is_native_dpkg_compat_placeholder_version(identity, record.version, policy)) {
+                context.exact_live_packages.insert(identity);
+            }
+            context.base_status_by_package[identity] = record;
         }
-        context.base_status_by_package[entry.package] = record;
     }
 
     std::string catalog_problem;
@@ -1763,15 +1933,20 @@ bool get_context_live_installed_package_metadata(
     bool have_live_version =
         get_local_installed_package_version(pkg_name, &installed_version, &context);
     if (!have_live_version) {
+        if (get_repo_native_live_payload_version_hint(pkg_name, &installed_version)) {
+            have_live_version = true;
+        }
+    }
+    if (!have_live_version) {
         context.missing_live_metadata.insert(pkg_name);
         return false;
     }
 
     PackageMetadata installed_meta;
     bool have_installed_meta = get_installed_package_metadata(pkg_name, installed_meta);
+    const ImportPolicy& policy = get_import_policy(false);
     bool have_exact_live_version =
-        !trim(installed_version).empty() &&
-        installed_version != NATIVE_DPKG_UNVERIFIED_VERSION;
+        !is_native_dpkg_compat_placeholder_version(pkg_name, installed_version, policy);
     bool installed_relations_exact =
         have_exact_live_version &&
         have_installed_meta &&
@@ -1829,32 +2004,34 @@ bool resolve_local_or_repo_package_metadata(
 
 bool base_registry_entry_is_shadowed_by_live_package(
     const BaseSystemRegistryEntry& entry,
+    const std::string& identity,
     const PackageMetadata& entry_repo_meta,
     const std::set<std::string>& exact_live_packages,
     bool verbose
 ) {
+    (void) entry;
     for (const auto& live_name : exact_live_packages) {
-        if (live_name.empty() || live_name == entry.package) continue;
+        if (live_name.empty() || live_name == identity) continue;
 
         PackageMetadata live_meta;
         if (!resolve_local_or_repo_package_metadata(live_name, live_meta)) continue;
 
-        Dependency entry_dep{entry.package, "", ""};
+        Dependency entry_dep{identity, "", ""};
         bool live_provides_entry =
             package_metadata_satisfies_dependency(live_name, live_meta, entry_dep);
         bool entry_conflicts_live =
             package_conflicts_with_package(entry_repo_meta, live_name, &live_meta);
         bool live_conflicts_entry =
-            package_conflicts_with_package(live_meta, entry.package, &entry_repo_meta);
+            package_conflicts_with_package(live_meta, identity, &entry_repo_meta);
         bool live_replaces_entry =
-            package_replaces_package(live_meta, entry.package, &entry_repo_meta);
+            package_replaces_package(live_meta, identity, &entry_repo_meta);
 
         if (!live_provides_entry && !entry_conflicts_live &&
             !live_conflicts_entry && !live_replaces_entry) {
             continue;
         }
 
-        VLOG(verbose, "Skipping stale base-system entry " << entry.package
+        VLOG(verbose, "Skipping stale base-system identity " << identity
                      << " because live package " << live_name
                      << " supersedes or conflicts with it.");
         return true;
@@ -1894,35 +2071,43 @@ std::vector<std::string> collect_upgrade_scan_packages(
 
     for (const auto& entry : load_base_system_registry_entries()) {
         if (entry.package.empty()) continue;
-        if (upgrade_scan.count(entry.package) != 0) continue;
         if (!base_system_registry_entry_looks_present(entry)) {
             VLOG(verbose, "Skipping stale base-system registry package during upgrade scan: "
                          << entry.package);
             continue;
         }
 
-        if (package_is_base_system_provided(entry.package) &&
-            !is_upgradeable_system_package(entry.package)) {
-            VLOG(verbose, "Skipping non-upgradeable base package from base-system registry: " << entry.package);
-            continue;
-        }
+        std::vector<std::string> identities = get_base_registry_package_identities(entry, verbose);
+        for (const auto& identity : identities) {
+            if (identity.empty()) continue;
+            if (upgrade_scan.count(identity) != 0) continue;
 
-        if (is_blocked_import_package(entry.package, verbose)) {
-            VLOG(verbose, "Skipping policy-blocked base-system registry package during upgrade scan: " << entry.package);
-            continue;
-        }
+            if (package_is_base_system_provided(identity) &&
+                !is_upgradeable_system_package(identity)) {
+                VLOG(verbose, "Skipping non-upgradeable base package from base-system registry: "
+                             << identity);
+                continue;
+            }
 
-        PackageMetadata repo_meta;
-        if (!get_repo_package_info(entry.package, repo_meta)) continue;
-        if (!package_has_exact_live_install_state(entry.package) &&
-            base_registry_entry_is_shadowed_by_live_package(
-                entry,
-                repo_meta,
-                exact_live_packages,
-                verbose)) {
-            continue;
+            if (is_blocked_import_package(identity, verbose)) {
+                VLOG(verbose, "Skipping policy-blocked base-system registry package during upgrade scan: "
+                             << identity);
+                continue;
+            }
+
+            PackageMetadata repo_meta;
+            if (!get_repo_package_info(identity, repo_meta)) continue;
+            if (!package_has_exact_live_install_state(identity) &&
+                base_registry_entry_is_shadowed_by_live_package(
+                    entry,
+                    identity,
+                    repo_meta,
+                    exact_live_packages,
+                    verbose)) {
+                continue;
+            }
+            upgrade_scan.insert(identity);
         }
-        upgrade_scan.insert(entry.package);
     }
 
     return std::vector<std::string>(upgrade_scan.begin(), upgrade_scan.end());
@@ -1930,10 +2115,14 @@ std::vector<std::string> collect_upgrade_scan_packages(
 
 bool package_has_present_base_registry_state(const std::string& pkg_name) {
     if (pkg_name.empty()) return false;
+    std::string canonical_name = canonicalize_package_name(pkg_name);
 
     for (const auto& entry : load_base_system_registry_entries()) {
-        if (entry.package != pkg_name) continue;
-        return base_system_registry_entry_looks_present(entry);
+        if (!base_system_registry_entry_looks_present(entry)) continue;
+        std::vector<std::string> identities = get_base_registry_package_identities(entry);
+        if (std::find(identities.begin(), identities.end(), canonical_name) != identities.end()) {
+            return true;
+        }
     }
 
     return false;

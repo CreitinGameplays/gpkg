@@ -29,6 +29,8 @@ struct ImportPolicy {
     std::vector<std::string> allow_essential_packages;
     std::vector<std::string> skip_dependency_patterns;
     std::vector<std::string> skip_packages;
+    std::map<std::string, std::vector<std::string>> base_package_identities;
+    std::vector<std::string> base_package_exact_versions;
     std::map<std::string, std::string> package_aliases;
     std::map<std::string, std::string> dependency_choices;
     std::map<std::string, std::string> dependency_rewrites;
@@ -37,6 +39,7 @@ struct ImportPolicy {
 };
 
 bool is_system_provided(const std::string& pkg, const std::string& op, const std::string& req_version);
+RelationAtom normalize_relation_atom(const std::string& raw_atom, const std::string& apt_arch);
 
 void append_unique_policy_value(std::vector<std::string>& values, const std::string& value) {
     std::string normalized = trim(value);
@@ -53,6 +56,20 @@ bool wildcard_match(const std::string& value, const std::string& pattern) {
 bool matches_any_pattern(const std::string& value, const std::vector<std::string>& patterns) {
     for (const auto& pattern : patterns) {
         if (wildcard_match(value, pattern)) return true;
+    }
+    return false;
+}
+
+bool policy_relation_entries_reference_package(
+    const std::vector<std::string>& entries,
+    const std::string& package_name
+) {
+    if (package_name.empty()) return false;
+    std::string canonical_name = canonicalize_package_name(package_name);
+    for (const auto& entry : entries) {
+        RelationAtom relation = normalize_relation_atom(entry, "any");
+        if (!relation.valid || relation.name.empty()) continue;
+        if (canonicalize_package_name(relation.name) == canonical_name) return true;
     }
     return false;
 }
@@ -434,6 +451,17 @@ ImportPolicy load_import_policy(bool verbose = false) {
     );
     policy.skip_dependency_patterns = json_string_array(json_object_get(root, "skip_dependency_patterns"));
     policy.skip_packages = json_string_array(json_object_get(root, "skip_packages"));
+    const JsonValue* base_package_identities = json_object_get(root, "base_package_identities");
+    if (base_package_identities && base_package_identities->is_object()) {
+        for (const auto& entry : base_package_identities->object_items) {
+            policy.base_package_identities[entry.first] = normalize_policy_string_entries(
+                json_string_array(&entry.second)
+            );
+        }
+    }
+    policy.base_package_exact_versions = normalize_policy_string_entries(
+        json_string_array(json_object_get(root, "base_package_exact_versions"))
+    );
 
     const JsonValue* package_aliases = json_object_get(root, "package_aliases");
     if (package_aliases && package_aliases->is_object()) {
@@ -549,7 +577,7 @@ std::string apply_dependency_rewrite_name(
     return name;
 }
 
-std::string canonicalize_package_name(const std::string& name, bool verbose = false) {
+std::string canonicalize_package_name(const std::string& name, bool verbose) {
     const ImportPolicy& policy = get_import_policy(verbose);
     auto exact_alias = policy.package_aliases.find(name);
     if (exact_alias != policy.package_aliases.end()) {
@@ -563,6 +591,60 @@ std::string canonicalize_package_name(const std::string& name, bool verbose = fa
         return canonical.empty() ? name : canonical;
     }
     return name;
+}
+
+std::vector<std::string> get_base_registry_package_identities(
+    const BaseSystemRegistryEntry& entry,
+    bool verbose
+) {
+    std::vector<std::string> identities;
+    if (entry.package.empty()) return identities;
+
+    const ImportPolicy& policy = get_import_policy(verbose);
+    std::set<std::string> seen;
+    auto append_identity = [&](const std::string& raw_name) {
+        std::string identity = canonicalize_package_name(trim(raw_name), verbose);
+        if (identity.empty()) return;
+        if (!seen.insert(identity).second) return;
+        identities.push_back(identity);
+    };
+
+    auto exact_it = policy.base_package_identities.find(entry.package);
+    if (exact_it != policy.base_package_identities.end()) {
+        for (const auto& identity : exact_it->second) append_identity(identity);
+        return identities;
+    }
+
+    for (const auto& mapping : policy.base_package_identities) {
+        if (mapping.first == entry.package) continue;
+        if (!wildcard_match(entry.package, mapping.first)) continue;
+        for (const auto& identity : mapping.second) append_identity(identity);
+        return identities;
+    }
+
+    if (policy_relation_entries_reference_package(policy.system_provides, entry.package) ||
+        policy_relation_entries_reference_package(policy.upgradeable_system, entry.package)) {
+        append_identity(entry.package);
+    }
+
+    std::string canonical_name = canonicalize_package_name(entry.package, verbose);
+    if (canonical_name != entry.package &&
+        (policy_relation_entries_reference_package(policy.system_provides, canonical_name) ||
+         policy_relation_entries_reference_package(policy.upgradeable_system, canonical_name))) {
+        append_identity(canonical_name);
+    }
+
+    return identities;
+}
+
+bool base_registry_identity_has_exact_registry_version(
+    const std::string& identity,
+    bool verbose
+) {
+    std::string canonical_identity = canonicalize_package_name(identity, verbose);
+    if (canonical_identity.empty()) return false;
+    const ImportPolicy& policy = get_import_policy(verbose);
+    return matches_any_pattern(canonical_identity, policy.base_package_exact_versions);
 }
 
 std::string resolve_provider_name(

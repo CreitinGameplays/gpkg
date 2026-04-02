@@ -34,6 +34,14 @@
 #include <unistd.h>
 #include <vector>
 
+#ifndef GPKG_VERSION
+#define GPKG_VERSION OS_VERSION
+#endif
+
+#ifndef GPKG_CODENAME
+#define GPKG_CODENAME OS_CODENAME
+#endif
+
 namespace Color {
 const std::string RESET   = "\033[0m";
 const std::string RED     = "\033[31m";
@@ -143,6 +151,15 @@ std::vector<PackageStatusRecord> load_dpkg_package_status_records();
 std::vector<PackageStatusRecord> load_base_system_package_status_records();
 std::vector<BaseSystemRegistryEntry> load_base_system_registry_entries();
 bool base_system_registry_entry_looks_present(const BaseSystemRegistryEntry& entry);
+std::string canonicalize_package_name(const std::string& name, bool verbose = false);
+std::vector<std::string> get_base_registry_package_identities(
+    const BaseSystemRegistryEntry& entry,
+    bool verbose = false
+);
+bool base_registry_identity_has_exact_registry_version(
+    const std::string& identity,
+    bool verbose = false
+);
 bool get_package_status_record(const std::string& pkg_name, PackageStatusRecord* out = nullptr);
 bool get_dpkg_package_status_record(const std::string& pkg_name, PackageStatusRecord* out = nullptr);
 bool get_base_system_package_status_record(const std::string& pkg_name, PackageStatusRecord* out = nullptr);
@@ -1866,6 +1883,7 @@ bool get_context_live_installed_package_metadata(
     const std::string& pkg_name,
     PackageMetadata& out_meta
 );
+bool get_repo_package_info(const std::string& pkg_name, PackageMetadata& out_meta);
 bool load_upgrade_catalog(
     ResolvedUpgradeCatalog& out_catalog,
     std::string* problem_out = nullptr,
