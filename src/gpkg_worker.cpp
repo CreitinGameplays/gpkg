@@ -2133,6 +2133,10 @@ std::string get_base_system_registry_path() {
     return g_root_prefix + "/usr/share/gpkg/base-system.json";
 }
 
+std::string get_base_debian_package_registry_path() {
+    return g_root_prefix + "/usr/share/gpkg/base-debian-packages.json";
+}
+
 unsigned int json_hex_digit_value(char c) {
     if (c >= '0' && c <= '9') return static_cast<unsigned int>(c - '0');
     if (c >= 'a' && c <= 'f') return static_cast<unsigned int>(10 + (c - 'a'));
@@ -2851,21 +2855,23 @@ bool load_compat_dpkg_package_from_base_system_object(
     out_info.gpkg_name = package;
     out_info.debian_name = package;
     get_json_string_value_from_object(obj, "version", out_info.version);
+    get_json_string_value_from_object(obj, "architecture", out_info.package_arch);
     get_json_string_value_from_object(obj, "source_kind", out_info.source_kind);
     get_json_string_value_from_object(obj, "installed_from", out_info.installed_from);
-    out_info.package_arch = native_package_architecture();
+    if (out_info.package_arch.empty()) out_info.package_arch = native_package_architecture();
     out_info.arch = compat_debian_architecture_for_package_arch(out_info.package_arch);
     out_info.is_base_system = true;
     get_json_string_array_from_object(obj, "files", out_info.file_list);
     return true;
 }
 
-bool load_compat_dpkg_package_from_base_system(
+bool load_compat_dpkg_package_from_base_registry(
+    const std::string& registry_path,
     const std::string& pkg_name,
     CompatDpkgPackageInfo& out_info
 ) {
     bool found = false;
-    foreach_json_object_in_file(get_base_system_registry_path(), [&](const std::string& obj) {
+    foreach_json_object_in_file(registry_path, [&](const std::string& obj) {
         CompatDpkgPackageInfo candidate;
         if (!load_compat_dpkg_package_from_base_system_object(obj, candidate)) return true;
         if (candidate.gpkg_name != pkg_name) return true;
@@ -2874,6 +2880,23 @@ bool load_compat_dpkg_package_from_base_system(
         return false;
     });
     return found;
+}
+
+bool load_compat_dpkg_package_from_base_system(
+    const std::string& pkg_name,
+    CompatDpkgPackageInfo& out_info
+) {
+    if (load_compat_dpkg_package_from_base_registry(
+            get_base_debian_package_registry_path(),
+            pkg_name,
+            out_info)) {
+        return true;
+    }
+    return load_compat_dpkg_package_from_base_registry(
+        get_base_system_registry_path(),
+        pkg_name,
+        out_info
+    );
 }
 
 std::vector<CompatDpkgPackageInfo> collect_all_compat_dpkg_packages() {
@@ -2885,14 +2908,19 @@ std::vector<CompatDpkgPackageInfo> collect_all_compat_dpkg_packages() {
         if (!load_compat_dpkg_package_by_gpkg_name(gpkg_name, info)) continue;
         packages.push_back(std::move(info));
     }
-    foreach_json_object_in_file(get_base_system_registry_path(), [&](const std::string& obj) {
-        CompatDpkgPackageInfo info;
-        if (!load_compat_dpkg_package_from_base_system_object(obj, info)) return true;
-        std::string package = info.gpkg_name;
-        if (!seen.insert(package).second) return true;
-        packages.push_back(std::move(info));
-        return true;
-    });
+    for (const auto& registry_path : {
+            get_base_debian_package_registry_path(),
+            get_base_system_registry_path(),
+        }) {
+        foreach_json_object_in_file(registry_path, [&](const std::string& obj) {
+            CompatDpkgPackageInfo info;
+            if (!load_compat_dpkg_package_from_base_system_object(obj, info)) return true;
+            std::string package = info.gpkg_name;
+            if (!seen.insert(package).second) return true;
+            packages.push_back(std::move(info));
+            return true;
+        });
+    }
     return packages;
 }
 
@@ -4627,8 +4655,8 @@ int action_compat_initctl(const std::vector<std::string>& raw_args) {
     );
 }
 
-void populate_base_system_owner_map(std::map<std::string, std::string>& owner_by_path) {
-    foreach_json_object_in_file(get_base_system_registry_path(), [&](const std::string& obj) {
+void populate_registry_owner_map(const std::string& registry_path, std::map<std::string, std::string>& owner_by_path) {
+    foreach_json_object_in_file(registry_path, [&](const std::string& obj) {
         std::string package;
         std::vector<std::string> files;
         if (!get_json_string_value_from_object(obj, "package", package)) return true;
@@ -4641,6 +4669,11 @@ void populate_base_system_owner_map(std::map<std::string, std::string>& owner_by
         }
         return true;
     });
+}
+
+void populate_base_system_owner_map(std::map<std::string, std::string>& owner_by_path) {
+    populate_registry_owner_map(get_base_debian_package_registry_path(), owner_by_path);
+    populate_registry_owner_map(get_base_system_registry_path(), owner_by_path);
 }
 
 const InstalledManifestSnapshot& ensure_installed_manifest_snapshot() {

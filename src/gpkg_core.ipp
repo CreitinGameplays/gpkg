@@ -590,6 +590,13 @@ bool native_dpkg_package_has_exact_registered_live_version(
 std::string get_raw_base_system_registry_version_for_package(const std::string& pkg_name) {
     if (pkg_name.empty()) return "";
     std::string canonical_name = canonicalize_package_name(pkg_name);
+
+    for (const auto& entry : load_base_debian_package_registry_entries()) {
+        if (!base_system_registry_entry_looks_present(entry)) continue;
+        if (canonicalize_package_name(entry.package) != canonical_name) continue;
+        return trim(entry.version);
+    }
+
     for (const auto& entry : load_base_system_registry_entries()) {
         if (!base_system_registry_entry_looks_present(entry)) continue;
         if (!base_registry_identity_has_exact_registry_version(canonical_name)) continue;
@@ -850,6 +857,28 @@ bool get_json_array(const std::string& obj, const std::string& key, std::vector<
 
 std::vector<PackageStatusRecord> load_base_system_package_status_records() {
     std::map<std::string, PackageStatusRecord> records_by_package;
+    auto remember_record = [&](const PackageStatusRecord& record) {
+        if (record.package.empty()) return;
+        auto existing = records_by_package.find(record.package);
+        if (existing == records_by_package.end() ||
+            (existing->second.version == NATIVE_DPKG_UNVERIFIED_VERSION &&
+             record.version != NATIVE_DPKG_UNVERIFIED_VERSION)) {
+            records_by_package[record.package] = record;
+        }
+    };
+
+    for (const auto& entry : load_base_debian_package_registry_entries()) {
+        if (!base_system_registry_entry_looks_present(entry)) continue;
+
+        PackageStatusRecord record;
+        record.package = canonicalize_package_name(entry.package);
+        record.version = resolve_base_system_status_version(record.package, entry.version);
+        record.want = "install";
+        record.flag = "ok";
+        record.status = "installed";
+        remember_record(record);
+    }
+
     for (const auto& entry : load_base_system_registry_entries()) {
         if (!base_system_registry_entry_looks_present(entry)) continue;
 
@@ -866,13 +895,7 @@ std::vector<PackageStatusRecord> load_base_system_package_status_records() {
             record.want = "install";
             record.flag = "ok";
             record.status = "installed";
-
-            auto existing = records_by_package.find(identity);
-            if (existing == records_by_package.end() ||
-                (existing->second.version == NATIVE_DPKG_UNVERIFIED_VERSION &&
-                 record.version != NATIVE_DPKG_UNVERIFIED_VERSION)) {
-                records_by_package[identity] = record;
-            }
+            remember_record(record);
         }
     }
 
@@ -894,9 +917,9 @@ bool get_base_system_package_status_record(const std::string& pkg_name, PackageS
     return false;
 }
 
-std::vector<BaseSystemRegistryEntry> load_base_system_registry_entries() {
+std::vector<BaseSystemRegistryEntry> load_base_registry_entries_from_path(const std::string& path) {
     std::vector<BaseSystemRegistryEntry> entries;
-    foreach_json_object(BASE_SYSTEM_REGISTRY_PATH, [&](const std::string& obj) {
+    foreach_json_object(path, [&](const std::string& obj) {
         BaseSystemRegistryEntry entry;
         if (!get_json_value(obj, "package", entry.package)) return true;
         get_json_value(obj, "version", entry.version);
@@ -905,6 +928,14 @@ std::vector<BaseSystemRegistryEntry> load_base_system_registry_entries() {
         return true;
     });
     return entries;
+}
+
+std::vector<BaseSystemRegistryEntry> load_base_debian_package_registry_entries() {
+    return load_base_registry_entries_from_path(BASE_DEBIAN_PACKAGE_REGISTRY_PATH);
+}
+
+std::vector<BaseSystemRegistryEntry> load_base_system_registry_entries() {
+    return load_base_registry_entries_from_path(BASE_SYSTEM_REGISTRY_PATH);
 }
 
 bool base_system_registry_entry_looks_present(const BaseSystemRegistryEntry& entry) {

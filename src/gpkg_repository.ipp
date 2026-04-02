@@ -1028,6 +1028,7 @@ std::string build_upgrade_catalog_fingerprint() {
         upgrade_catalog_file_fingerprint_component(get_repo_catalog_state_path()) + "|" +
         upgrade_catalog_file_fingerprint_component(IMPORT_POLICY_PATH) + "|" +
         upgrade_catalog_file_fingerprint_component(UPGRADE_COMPANIONS_PATH) + "|" +
+        upgrade_catalog_file_fingerprint_component(BASE_DEBIAN_PACKAGE_REGISTRY_PATH) + "|" +
         upgrade_catalog_file_fingerprint_component(BASE_SYSTEM_REGISTRY_PATH) + "|" +
         upgrade_catalog_file_fingerprint_component(SYSTEM_PROVIDES_PATH) + "|" +
         upgrade_catalog_file_fingerprint_component(UPGRADEABLE_SYSTEM_PATH);

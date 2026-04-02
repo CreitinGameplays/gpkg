@@ -15,6 +15,31 @@ struct CachedArchivePayloadInfo {
     std::vector<std::string> installed_paths;
 };
 
+struct StagedNativeDebianBatch {
+    std::string stage_root;
+    std::map<std::string, std::vector<std::string>> installed_paths_by_package;
+    std::map<std::string, std::string> payload_root_by_package;
+};
+
+struct ScopedNativeDebianBatchStage {
+    std::string stage_root;
+    bool preserve = false;
+
+    void adopt(const std::string& root) {
+        stage_root = root;
+        preserve = false;
+    }
+
+    void keep_for_debugging() {
+        preserve = true;
+    }
+
+    ~ScopedNativeDebianBatchStage() {
+        if (stage_root.empty() || preserve) return;
+        remove_path_recursive(stage_root);
+    }
+};
+
 bool prepare_install_archives(
     const std::vector<PackageMetadata>& packages,
     const DownloadBatchReport& download_report,
@@ -29,9 +54,30 @@ bool inspect_debian_archive_payload_for_disk_estimate(
     const std::string& archive_path,
     CachedArchivePayloadInfo* out_info
 );
+bool prepare_native_debian_payload_store(
+    const PackageMetadata& meta,
+    bool verbose,
+    std::string* payload_root_out = nullptr,
+    std::vector<std::string>* installed_paths_out = nullptr,
+    std::string* error_out = nullptr
+);
 bool native_dpkg_package_looks_synthetic(const std::string& pkg_name);
 bool native_dpkg_status_keeps_file_manifest(const std::string& status);
 bool debian_archive_mutates_runtime_linker_state(const PackageMetadata& meta);
+std::vector<std::string> get_base_system_registry_files_for_package(const std::string& pkg_name);
+bool stage_native_debian_batch_payloads(
+    const std::vector<PackageMetadata>& batch,
+    bool verbose,
+    StagedNativeDebianBatch* out_stage,
+    std::string* error_out = nullptr
+);
+bool prepare_live_root_for_staged_debian_batch(
+    const std::vector<PackageMetadata>& batch,
+    const StagedNativeDebianBatch& stage,
+    bool verbose,
+    std::vector<std::string>* created_dirs_out = nullptr,
+    std::string* error_out = nullptr
+);
 std::string resolve_native_dpkg_bootstrap_name(
     const std::string& source_pkg_name,
     PackageMetadata* meta_out = nullptr
@@ -47,6 +93,7 @@ bool is_native_dpkg_compat_placeholder_version(
     const ImportPolicy& policy
 );
 std::string native_synthetic_info_list_path(const std::string& pkg_name);
+std::string native_synthetic_owner_marker_path(const std::string& pkg_name);
 bool package_name_is_debian_control_sidecar_package(const std::string& pkg_name);
 std::string resolve_context_synthetic_live_version(
     const std::string& pkg_name,
@@ -457,6 +504,12 @@ bool write_text_file_atomically(const std::string& path, const std::string& cont
 bool package_has_present_base_registry_entry_exact(const std::string& pkg_name) {
     if (pkg_name.empty()) return false;
     std::string canonical_name = canonicalize_package_name(pkg_name);
+    for (const auto& entry : load_base_debian_package_registry_entries()) {
+        if (!base_system_registry_entry_looks_present(entry)) continue;
+        if (canonicalize_package_name(entry.package) == canonical_name) {
+            return true;
+        }
+    }
     for (const auto& entry : load_base_system_registry_entries()) {
         if (!base_system_registry_entry_looks_present(entry)) continue;
         std::vector<std::string> identities = get_base_registry_package_identities(entry);
@@ -688,7 +741,11 @@ std::vector<std::string> build_native_dpkg_compat_status_paragraph(
     std::vector<std::string> lines;
     if (entry.package.empty()) return lines;
 
-    std::string version = normalize_dpkg_compatible_version(entry.package, "", policy);
+    std::string version = normalize_dpkg_compatible_version(
+        entry.package,
+        entry.status.version,
+        policy
+    );
     std::string priority = trim(entry.meta.priority);
     if (priority.empty()) {
         priority = native_dpkg_seed_prefers_high_compat_version(entry.package, policy) ? "required" : "optional";
@@ -739,10 +796,25 @@ bool write_native_dpkg_compat_list_manifest(
     if (error_out) error_out->clear();
     if (pkg_name.empty()) return true;
 
+    if (!write_text_file_atomically(native_synthetic_owner_marker_path(pkg_name), "")) {
+        if (error_out) {
+            *error_out = "failed to initialize " + native_synthetic_owner_marker_path(pkg_name) +
+                ": " + std::strerror(errno);
+        }
+        return false;
+    }
+
+    std::set<std::string> normalized_files = files;
+    normalized_files.insert(
+        native_synthetic_owner_marker_path(pkg_name).substr(ROOT_PREFIX.size())
+    );
+
     std::ostringstream list_stream;
-    for (const auto& file : files) {
-        if (trim(file).empty()) continue;
-        list_stream << file << "\n";
+    for (const auto& file : normalized_files) {
+        std::string normalized = trim(file);
+        if (normalized.empty()) continue;
+        if (normalized.front() != '/') normalized = "/" + normalized;
+        list_stream << normalized << "\n";
     }
     std::string content = list_stream.str();
 
@@ -788,6 +860,9 @@ bool ensure_native_dpkg_admin_layout(std::string* error_out) {
         DPKG_ADMIN_DIR,
         DPKG_INFO_DIR,
         NATIVE_SYNTHETIC_INFO_DIR,
+        NATIVE_SYNTHETIC_OWNERS_DIR,
+        NATIVE_DPKG_STORE_DIR,
+        NATIVE_DPKG_STAGE_DIR,
         DPKG_ADMIN_DIR + "/alternatives",
         DPKG_ADMIN_DIR + "/parts",
         DPKG_ADMIN_DIR + "/updates",
@@ -816,6 +891,10 @@ bool ensure_native_dpkg_admin_layout(std::string* error_out) {
 
 std::string native_synthetic_info_list_path(const std::string& pkg_name) {
     return NATIVE_SYNTHETIC_INFO_DIR + "/" + pkg_name + ".list";
+}
+
+std::string native_synthetic_owner_marker_path(const std::string& pkg_name) {
+    return NATIVE_SYNTHETIC_OWNERS_DIR + "/" + pkg_name + ".owner";
 }
 
 bool native_synthetic_state_record_has_exact_version(const NativeSyntheticStateRecord& record) {
@@ -1305,44 +1384,13 @@ bool repair_native_dpkg_status_database(bool verbose, std::string* error_out) {
         }
     }
 
-    std::map<std::string, std::vector<std::string>> base_files_by_package;
-    for (const auto& entry : load_base_system_registry_entries()) {
-        if (entry.package.empty() || entry.files.empty()) continue;
-        auto remember_files = [&](const std::string& pkg_name) {
-            if (pkg_name.empty()) return;
-            auto remember_key = [&](const std::string& key) {
-                if (key.empty() || base_files_by_package.count(key) != 0) return;
-                base_files_by_package[key] = entry.files;
-            };
-
-            remember_key(pkg_name);
-            remember_key(to_lower_copy(pkg_name));
-
-            std::string canonical_name = canonicalize_package_name(pkg_name);
-            remember_key(canonical_name);
-            remember_key(to_lower_copy(canonical_name));
-
-            std::string resolved_name = resolve_native_dpkg_bootstrap_name(pkg_name);
-            remember_key(resolved_name);
-            remember_key(to_lower_copy(resolved_name));
-
-            std::string canonical_resolved = canonicalize_package_name(resolved_name);
-            remember_key(canonical_resolved);
-            remember_key(to_lower_copy(canonical_resolved));
-        };
-        remember_files(entry.package);
-        for (const auto& identity : get_base_registry_package_identities(entry)) {
-            remember_files(identity);
-        }
-        remember_files(resolve_native_dpkg_bootstrap_name(entry.package));
-    }
-
     std::vector<PackageStatusRecord> manifest_records = load_dpkg_package_status_records();
     std::vector<PackageStatusRecord> update_records = load_native_dpkg_update_status_records();
     manifest_records.insert(manifest_records.end(), update_records.begin(), update_records.end());
 
     for (const auto& record : manifest_records) {
         if (record.package.empty() || !native_dpkg_status_keeps_file_manifest(record.status)) continue;
+        if (native_dpkg_package_looks_synthetic(record.package)) continue;
 
         std::string list_path = DPKG_INFO_DIR + "/" + record.package + ".list";
         bool list_exists = access(list_path.c_str(), F_OK) == 0;
@@ -1351,21 +1399,6 @@ bool repair_native_dpkg_status_database(bool verbose, std::string* error_out) {
             ? load_dependency_entries(list_path)
             : std::vector<std::string>{};
         if (files.empty()) files = read_installed_file_list(record.package);
-        if (files.empty()) {
-            auto base_it = base_files_by_package.find(record.package);
-            if (base_it == base_files_by_package.end()) {
-                base_it = base_files_by_package.find(canonicalize_package_name(record.package));
-            }
-            if (base_it == base_files_by_package.end()) {
-                base_it = base_files_by_package.find(to_lower_copy(record.package));
-            }
-            if (base_it == base_files_by_package.end()) {
-                base_it = base_files_by_package.find(
-                    to_lower_copy(canonicalize_package_name(record.package))
-                );
-            }
-            if (base_it != base_files_by_package.end()) files = base_it->second;
-        }
         if (list_exists && !files.empty()) {
             std::set<std::string> existing_normalized;
             for (const auto& file : load_dependency_entries(list_path)) {
@@ -1413,34 +1446,27 @@ bool repair_native_dpkg_status_database(bool verbose, std::string* error_out) {
         const NativeSyntheticStateRecord& record = pair.second;
         if (record.package.empty() || !record.owns_files) continue;
 
-        std::string list_path = native_synthetic_info_list_path(record.package);
-        std::vector<std::string> files = load_dependency_entries(list_path);
-        if (files.empty()) {
-            std::string legacy_list_path = DPKG_INFO_DIR + "/" + record.package + ".list";
-            files = load_dependency_entries(legacy_list_path);
-            if (!files.empty() && access(legacy_list_path.c_str(), F_OK) == 0) {
-                if (unlink(legacy_list_path.c_str()) != 0 && errno != ENOENT) {
-                    if (error_out) *error_out = "failed to remove stale " + legacy_list_path + ": "
-                        + std::strerror(errno);
-                    return false;
+        bool base_backed_package =
+            package_is_base_system_provided(record.package) ||
+            package_has_present_base_registry_entry_exact(record.package);
+        std::vector<std::string> files = read_installed_file_list(record.package);
+        if (files.empty() && base_backed_package) {
+            files = get_base_system_registry_files_for_package(record.package);
+        }
+        if (files.empty() && !base_backed_package) {
+            std::string list_path = native_synthetic_info_list_path(record.package);
+            files = load_dependency_entries(list_path);
+            if (files.empty()) {
+                std::string legacy_list_path = DPKG_INFO_DIR + "/" + record.package + ".list";
+                files = load_dependency_entries(legacy_list_path);
+                if (!files.empty() && access(legacy_list_path.c_str(), F_OK) == 0) {
+                    if (unlink(legacy_list_path.c_str()) != 0 && errno != ENOENT) {
+                        if (error_out) *error_out = "failed to remove stale " + legacy_list_path + ": "
+                            + std::strerror(errno);
+                        return false;
+                    }
                 }
             }
-        }
-        if (files.empty()) files = read_installed_file_list(record.package);
-        if (files.empty()) {
-            auto base_it = base_files_by_package.find(record.package);
-            if (base_it == base_files_by_package.end()) {
-                base_it = base_files_by_package.find(canonicalize_package_name(record.package));
-            }
-            if (base_it == base_files_by_package.end()) {
-                base_it = base_files_by_package.find(to_lower_copy(record.package));
-            }
-            if (base_it == base_files_by_package.end()) {
-                base_it = base_files_by_package.find(
-                    to_lower_copy(canonicalize_package_name(record.package))
-                );
-            }
-            if (base_it != base_files_by_package.end()) files = base_it->second;
         }
 
         std::set<std::string> normalized_files;
@@ -1507,6 +1533,12 @@ bool native_dpkg_package_looks_synthetic(const std::string& pkg_name) {
 std::vector<std::string> get_base_system_registry_files_for_package(const std::string& pkg_name) {
     if (pkg_name.empty()) return {};
     std::string canonical_name = canonicalize_package_name(pkg_name);
+    for (const auto& entry : load_base_debian_package_registry_entries()) {
+        if (!base_system_registry_entry_looks_present(entry)) continue;
+        if (canonicalize_package_name(entry.package) == canonical_name) {
+            return entry.files;
+        }
+    }
     for (const auto& entry : load_base_system_registry_entries()) {
         std::vector<std::string> identities = get_base_registry_package_identities(entry);
         if (std::find(identities.begin(), identities.end(), canonical_name) != identities.end()) {
@@ -1532,12 +1564,16 @@ bool prune_synthetic_dpkg_file_ownership_for_package(
 ) {
     if (error_out) error_out->clear();
 
-    CachedArchivePayloadInfo payload_info;
-    if (!inspect_debian_archive_payload_for_disk_estimate(
-            get_cached_debian_archive_path(meta),
-            &payload_info) ||
-        !payload_info.available ||
-        payload_info.installed_paths.empty()) {
+    std::string payload_root;
+    std::vector<std::string> staged_paths;
+    if (!prepare_native_debian_payload_store(
+            meta,
+            verbose,
+            &payload_root,
+            &staged_paths,
+            error_out) ||
+        staged_paths.empty()) {
+        if (error_out) error_out->clear();
         return true;
     }
 
@@ -1545,7 +1581,7 @@ bool prune_synthetic_dpkg_file_ownership_for_package(
     if (incoming_name.empty()) incoming_name = meta.name;
 
     std::set<std::string> incoming_paths;
-    for (const auto& path : payload_info.installed_paths) {
+    for (const auto& path : staged_paths) {
         std::string normalized = trim(path);
         if (normalized.empty()) continue;
         if (normalized.front() != '/') normalized = "/" + normalized;
@@ -1560,9 +1596,6 @@ bool prune_synthetic_dpkg_file_ownership_for_package(
         std::string list_path = native_synthetic_info_list_path(record.package);
         std::vector<std::string> owned_paths =
             load_dependency_entries(list_path);
-        if (owned_paths.empty()) {
-            owned_paths = get_base_system_registry_files_for_package(record.package);
-        }
         if (owned_paths.empty()) {
             owned_paths = read_installed_file_list(record.package);
         }
@@ -1583,12 +1616,18 @@ bool prune_synthetic_dpkg_file_ownership_for_package(
         }
         if (removed_count == 0) continue;
 
-        std::ostringstream list_stream;
-        for (const auto& path : filtered_paths) {
-            list_stream << path << "\n";
-        }
-        if (!write_text_file_atomically(list_path, list_stream.str())) {
-            if (error_out) *error_out = "failed to update " + list_path + ": " + std::strerror(errno);
+        std::set<std::string> normalized_filtered_paths(
+            filtered_paths.begin(),
+            filtered_paths.end()
+        );
+        if (!write_native_dpkg_compat_list_manifest(
+                record.package,
+                normalized_filtered_paths,
+                error_out)) {
+            if (error_out && error_out->empty()) {
+                *error_out = "failed to update synthetic native dpkg manifest for " +
+                    record.package;
+            }
             return false;
         }
 
@@ -1675,14 +1714,45 @@ bool bootstrap_native_dpkg_status_database(bool verbose, std::string* error_out)
         );
     }
 
+    for (const auto& base_entry : load_base_debian_package_registry_entries()) {
+        if (base_entry.package.empty()) continue;
+        if (!base_system_registry_entry_looks_present(base_entry)) continue;
+
+        PackageMetadata meta;
+        bool have_meta = false;
+        std::string bootstrap_name = resolve_native_dpkg_bootstrap_name(base_entry.package, &meta);
+        if (!bootstrap_name.empty() && !meta.name.empty()) {
+            have_meta = true;
+        } else {
+            have_meta = get_installed_package_metadata(base_entry.package, meta);
+        }
+
+        PackageStatusRecord record;
+        record.package = canonicalize_package_name(base_entry.package);
+        record.want = "install";
+        record.flag = "ok";
+        record.status = "installed";
+        record.version = resolve_base_system_status_version(record.package, base_entry.version);
+
+        seed_native_dpkg_bootstrap_entry(
+            synthetic_entries,
+            record.package,
+            have_meta ? &meta : nullptr,
+            &record,
+            &base_entry.files,
+            record.version,
+            false
+        );
+    }
+
     for (const auto& base_entry : load_base_system_registry_entries()) {
         if (base_entry.package.empty()) continue;
         if (!base_system_registry_entry_looks_present(base_entry)) continue;
 
         std::vector<std::string> identities = get_base_registry_package_identities(base_entry);
-        bool first_identity = true;
         for (const auto& identity : identities) {
             if (identity.empty()) continue;
+            if (synthetic_entries.find(identity) != synthetic_entries.end()) continue;
 
             PackageMetadata meta;
             bool have_meta = false;
@@ -1708,11 +1778,10 @@ bool bootstrap_native_dpkg_status_database(bool verbose, std::string* error_out)
                 identity,
                 have_meta ? &meta : nullptr,
                 &record,
-                first_identity ? &base_entry.files : nullptr,
+                nullptr,
                 record.version,
                 false
             );
-            first_identity = false;
         }
     }
 
@@ -1870,13 +1939,33 @@ UpgradeContext build_upgrade_context(bool verbose) {
         }
     }
 
-    context.base_entries = load_base_system_registry_entries();
+    std::vector<BaseSystemRegistryEntry> exact_base_entries = load_base_debian_package_registry_entries();
+    std::set<std::string> exact_base_packages;
+    for (const auto& entry : exact_base_entries) {
+        if (entry.package.empty()) continue;
+        exact_base_packages.insert(canonicalize_package_name(entry.package, verbose));
+    }
+
+    context.base_entries = exact_base_entries;
+    {
+        std::vector<BaseSystemRegistryEntry> component_entries = load_base_system_registry_entries();
+        context.base_entries.insert(
+            context.base_entries.end(),
+            component_entries.begin(),
+            component_entries.end()
+        );
+    }
     for (const auto& entry : context.base_entries) {
         if (entry.package.empty()) continue;
         bool present = base_system_registry_entry_looks_present(entry);
         if (!present) continue;
 
-        std::vector<std::string> identities = get_base_registry_package_identities(entry, verbose);
+        std::vector<std::string> identities;
+        if (exact_base_packages.count(canonicalize_package_name(entry.package, verbose)) != 0) {
+            identities.push_back(canonicalize_package_name(entry.package, verbose));
+        } else {
+            identities = get_base_registry_package_identities(entry, verbose);
+        }
         for (const auto& identity : identities) {
             if (identity.empty()) continue;
 
@@ -2046,6 +2135,16 @@ std::vector<std::string> collect_upgrade_scan_packages(
 ) {
     std::set<std::string> upgrade_scan = registered_installed;
     std::set<std::string> exact_live_packages = registered_installed;
+    std::vector<BaseSystemRegistryEntry> base_entries = load_base_debian_package_registry_entries();
+    {
+        std::vector<BaseSystemRegistryEntry> component_entries = load_base_system_registry_entries();
+        base_entries.insert(base_entries.end(), component_entries.begin(), component_entries.end());
+    }
+    std::set<std::string> exact_base_packages;
+    for (const auto& entry : load_base_debian_package_registry_entries()) {
+        if (entry.package.empty()) continue;
+        exact_base_packages.insert(canonicalize_package_name(entry.package, verbose));
+    }
 
     for (const auto& record : load_dpkg_package_status_records()) {
         if (record.package.empty()) continue;
@@ -2069,7 +2168,7 @@ std::vector<std::string> collect_upgrade_scan_packages(
         upgrade_scan.insert(record.package);
     }
 
-    for (const auto& entry : load_base_system_registry_entries()) {
+    for (const auto& entry : base_entries) {
         if (entry.package.empty()) continue;
         if (!base_system_registry_entry_looks_present(entry)) {
             VLOG(verbose, "Skipping stale base-system registry package during upgrade scan: "
@@ -2077,7 +2176,12 @@ std::vector<std::string> collect_upgrade_scan_packages(
             continue;
         }
 
-        std::vector<std::string> identities = get_base_registry_package_identities(entry, verbose);
+        std::vector<std::string> identities;
+        if (exact_base_packages.count(canonicalize_package_name(entry.package, verbose)) != 0) {
+            identities.push_back(canonicalize_package_name(entry.package, verbose));
+        } else {
+            identities = get_base_registry_package_identities(entry, verbose);
+        }
         for (const auto& identity : identities) {
             if (identity.empty()) continue;
             if (upgrade_scan.count(identity) != 0) continue;
@@ -2116,6 +2220,13 @@ std::vector<std::string> collect_upgrade_scan_packages(
 bool package_has_present_base_registry_state(const std::string& pkg_name) {
     if (pkg_name.empty()) return false;
     std::string canonical_name = canonicalize_package_name(pkg_name);
+
+    for (const auto& entry : load_base_debian_package_registry_entries()) {
+        if (!base_system_registry_entry_looks_present(entry)) continue;
+        if (canonicalize_package_name(entry.package) == canonical_name) {
+            return true;
+        }
+    }
 
     for (const auto& entry : load_base_system_registry_entries()) {
         if (!base_system_registry_entry_looks_present(entry)) continue;
@@ -2259,6 +2370,12 @@ std::string find_best_exact_live_family(
         return requested_dep.name;
     }
 
+    PackageMetadata requested_repo_meta;
+    bool requested_has_concrete_repo_package =
+        get_repo_package_info(requested_dep.name, requested_repo_meta) &&
+        canonicalize_package_name(requested_repo_meta.name) ==
+            canonicalize_package_name(requested_dep.name);
+
     std::string best_name;
     PackageMetadata best_meta;
     for (const auto& live_name : context.exact_live_packages) {
@@ -2277,6 +2394,13 @@ std::string find_best_exact_live_family(
                 live_meta,
                 &context
             );
+        bool provider_only_match =
+            satisfies_dependency &&
+            !replaces_requested &&
+            !conflict_only_shadow;
+        if (provider_only_match && requested_has_concrete_repo_package) {
+            continue;
+        }
         if (!satisfies_dependency &&
             !replaces_requested &&
             !conflict_only_shadow) {
@@ -2699,6 +2823,17 @@ bool prepare_install_archives(
             bool ok = true;
             if (download_report.results[package_index].success) {
                 ok = ensure_install_archive_ready(packages[package_index], verbose, &error);
+                if (ok && package_is_debian_source(packages[package_index])) {
+                    std::string payload_root;
+                    std::vector<std::string> installed_paths;
+                    ok = prepare_native_debian_payload_store(
+                        packages[package_index],
+                        verbose,
+                        &payload_root,
+                        &installed_paths,
+                        &error
+                    );
+                }
             }
 
             size_t completed = completed_count.fetch_add(1) + 1;
@@ -2990,6 +3125,26 @@ InstallCommandResult install_native_debian_batch_legacy(
         return {false, "", batch.front().name, 0, ""};
     }
 
+    ScopedNativeDebianBatchStage staged_batch_scope;
+    StagedNativeDebianBatch staged_batch;
+    std::string stage_error;
+    if (!stage_native_debian_batch_payloads(batch, verbose, &staged_batch, &stage_error)) {
+        if (!staged_batch.stage_root.empty() && verbose) {
+            staged_batch_scope.adopt(staged_batch.stage_root);
+            staged_batch_scope.keep_for_debugging();
+        }
+        std::cerr << "E: Failed to stage native Debian batch";
+        if (!stage_error.empty()) {
+            std::cerr << ": " << stage_error;
+        }
+        if (!staged_batch.stage_root.empty() && verbose) {
+            std::cerr << " (preserved at " << staged_batch.stage_root << ")";
+        }
+        std::cerr << std::endl;
+        return {false, "", batch.front().name, 0, ""};
+    }
+    staged_batch_scope.adopt(staged_batch.stage_root);
+
     ScopedNativeDpkgMaintscriptCompat maintscript_compat(true, verbose);
     ScopedMaintscriptShellOverride maintscript_shell(true, verbose);
 
@@ -3000,7 +3155,33 @@ InstallCommandResult install_native_debian_batch_legacy(
             std::cerr << ": " << pending_result.failed_package;
         }
         std::cerr << std::endl;
+        if (verbose) staged_batch_scope.keep_for_debugging();
         return pending_result;
+    }
+
+    std::vector<std::string> prepared_parent_dirs;
+    std::string prepare_error;
+    if (!prepare_live_root_for_staged_debian_batch(
+            batch,
+            staged_batch,
+            verbose,
+            &prepared_parent_dirs,
+            &prepare_error
+        )) {
+        if (verbose) staged_batch_scope.keep_for_debugging();
+        std::cerr << "E: Failed to prepare native Debian transaction";
+        if (!prepare_error.empty()) {
+            std::cerr << ": " << prepare_error;
+        }
+        if (!staged_batch.stage_root.empty() && verbose) {
+            std::cerr << " (preserved at " << staged_batch.stage_root << ")";
+        }
+        std::cerr << std::endl;
+        return {false, "", batch.front().name, 0, ""};
+    }
+    if (!prepared_parent_dirs.empty()) {
+        VLOG(verbose, "Prepared " << prepared_parent_dirs.size()
+                     << " live parent directorie(s) before native dpkg unpack.");
     }
 
     std::vector<std::vector<size_t>> outgoing(batch.size());
@@ -3126,11 +3307,12 @@ InstallCommandResult install_native_debian_batch_legacy(
                     batch_result.log_path = predepends_pending.log_path;
                     batch_result.failed_package = predepends_pending.failed_package;
                     if (batch_result.failed_package.empty()) batch_result.failed_package = meta_name;
-                    std::cerr << "E: Failed to configure pending Debian packages before unpacking "
-                              << meta_name << std::endl;
-                    return batch_result;
-                }
+                std::cerr << "E: Failed to configure pending Debian packages before unpacking "
+                          << meta_name << std::endl;
+                if (verbose) staged_batch_scope.keep_for_debugging();
+                return batch_result;
             }
+        }
         }
         bool runtime_sensitive = debian_archive_mutates_runtime_linker_state(meta);
         std::string overlap_repair_error;
@@ -3141,6 +3323,7 @@ InstallCommandResult install_native_debian_batch_legacy(
             if (!overlap_repair_error.empty()) {
                 std::cerr << "E: " << overlap_repair_error << std::endl;
             }
+            if (verbose) staged_batch_scope.keep_for_debugging();
             return batch_result;
         }
 
@@ -3160,6 +3343,7 @@ InstallCommandResult install_native_debian_batch_legacy(
             if (!synthetic_state_error.empty()) {
                 std::cerr << "E: " << synthetic_state_error << std::endl;
             }
+            if (verbose) staged_batch_scope.keep_for_debugging();
             return batch_result;
         }
 
@@ -3180,6 +3364,7 @@ InstallCommandResult install_native_debian_batch_legacy(
                     if (batch_result.failed_package.empty()) batch_result.failed_package = meta.name;
                     std::cerr << "E: Runtime linker refresh failed after installing "
                               << batch_result.failed_package << std::endl;
+                    if (verbose) staged_batch_scope.keep_for_debugging();
                     return batch_result;
                 }
             }
@@ -3205,6 +3390,7 @@ InstallCommandResult install_native_debian_batch_legacy(
                 }
                 std::cerr << "E: Failed to configure pending Debian packages after installing "
                           << batch_result.last_processed_package << std::endl;
+                if (verbose) staged_batch_scope.keep_for_debugging();
                 return batch_result;
             }
             if (!verbose && progress_width && progress_total > 0) {
@@ -3232,6 +3418,7 @@ InstallCommandResult install_native_debian_batch_legacy(
                           << incoming_name << ": " << restore_state_error << std::endl;
             }
         }
+        if (verbose) staged_batch_scope.keep_for_debugging();
         return batch_result;
     }
 
@@ -3246,6 +3433,7 @@ InstallCommandResult install_native_debian_batch_legacy(
         }
         std::cerr << "E: Failed to configure pending Debian packages after completing the batch"
                   << std::endl;
+        if (verbose) staged_batch_scope.keep_for_debugging();
         return batch_result;
     }
 
@@ -3594,6 +3782,15 @@ uint64_t estimate_current_installed_payload_bytes(
     );
     if (measured != 0) return measured;
 
+    std::vector<std::string> base_files = get_base_system_registry_files_for_package(pkg_name);
+    if (!base_files.empty()) {
+        uint64_t base_measured = measure_manifest_payload_bytes(
+            base_files,
+            excluded_paths.empty() ? nullptr : &excluded_paths
+        );
+        if (base_measured != 0) return base_measured;
+    }
+
     PackageMetadata installed_meta;
     if (get_installed_package_metadata(pkg_name, installed_meta)) {
         bool declared_approximate = false;
@@ -3762,6 +3959,651 @@ bool inspect_debian_archive_payload_for_disk_estimate(
     return ok;
 }
 
+std::string native_debian_stage_parent_path(const std::string& path) {
+    if (path.empty() || path == "/") return "";
+    size_t slash = path.find_last_of('/');
+    if (slash == std::string::npos || slash == 0) return "/";
+    return path.substr(0, slash);
+}
+
+size_t native_debian_stage_path_depth(const std::string& path) {
+    size_t depth = 0;
+    for (char ch : path) {
+        if (ch == '/') ++depth;
+    }
+    return depth;
+}
+
+bool live_path_is_directory_like(const std::string& full_path) {
+    struct stat st {};
+    if (lstat(full_path.c_str(), &st) != 0) return false;
+    if (S_ISDIR(st.st_mode)) return true;
+    if (!S_ISLNK(st.st_mode)) return false;
+
+    struct stat target_st {};
+    return stat(full_path.c_str(), &target_st) == 0 && S_ISDIR(target_st.st_mode);
+}
+
+bool create_native_debian_stage_root(std::string* root_out, std::string* error_out = nullptr) {
+    if (root_out) root_out->clear();
+    if (error_out) error_out->clear();
+
+    if (!mkdir_p(NATIVE_DPKG_STAGE_DIR)) {
+        if (error_out) {
+            *error_out = "failed to create native Debian stage dir " + NATIVE_DPKG_STAGE_DIR +
+                ": " + std::strerror(errno);
+        }
+        return false;
+    }
+
+    std::string template_path = NATIVE_DPKG_STAGE_DIR + "/batch-XXXXXX";
+    std::vector<char> tmpl(template_path.begin(), template_path.end());
+    tmpl.push_back('\0');
+    char* stage_root = mkdtemp(tmpl.data());
+    if (!stage_root) {
+        if (error_out) {
+            *error_out = "failed to allocate native Debian stage dir under " + NATIVE_DPKG_STAGE_DIR +
+                ": " + std::string(std::strerror(errno));
+        }
+        return false;
+    }
+
+    if (root_out) *root_out = stage_root;
+    return true;
+}
+
+std::string normalize_native_debian_preflight_path(const std::string& raw_path) {
+    std::string normalized = trim(raw_path);
+    if (normalized.empty()) return "";
+    if (normalized.front() != '/') normalized = "/" + normalized;
+    normalized = canonical_multiarch_logical_path_for_estimate(normalized);
+    if (normalized.empty()) return "";
+    if (normalized.front() != '/') normalized = "/" + normalized;
+    return normalized;
+}
+
+void register_native_debian_preflight_owner_paths(
+    const std::string& owner,
+    const std::vector<std::string>& raw_paths,
+    std::map<std::string, std::string>& owner_by_path
+) {
+    if (owner.empty()) return;
+    for (const auto& raw_path : raw_paths) {
+        std::string normalized = normalize_native_debian_preflight_path(raw_path);
+        if (normalized.empty()) continue;
+        owner_by_path[normalized] = owner;
+    }
+}
+
+std::map<std::string, std::string> build_native_debian_preflight_live_owner_map() {
+    std::map<std::string, std::string> owner_by_path;
+
+    for (const auto& pkg_name :
+         collect_registered_package_names_from_status_records(load_package_status_records())) {
+        register_native_debian_preflight_owner_paths(
+            pkg_name,
+            load_dependency_entries(INFO_DIR + pkg_name + ".list"),
+            owner_by_path
+        );
+    }
+
+    std::vector<PackageStatusRecord> dpkg_records = load_dpkg_package_status_records();
+    std::vector<PackageStatusRecord> dpkg_update_records = load_native_dpkg_update_status_records();
+    dpkg_records.insert(dpkg_records.end(), dpkg_update_records.begin(), dpkg_update_records.end());
+    for (const auto& record : dpkg_records) {
+        if (record.package.empty() || !native_dpkg_status_keeps_file_manifest(record.status)) continue;
+        register_native_debian_preflight_owner_paths(
+            record.package,
+            load_dependency_entries(DPKG_INFO_DIR + "/" + record.package + ".list"),
+            owner_by_path
+        );
+    }
+
+    for (const auto& record : load_native_synthetic_state_records()) {
+        if (record.package.empty() || !record.owns_files) continue;
+        register_native_debian_preflight_owner_paths(
+            record.package,
+            load_dependency_entries(native_synthetic_info_list_path(record.package)),
+            owner_by_path
+        );
+    }
+
+    return owner_by_path;
+}
+
+std::map<std::string, std::string> build_native_debian_preflight_base_owner_map() {
+    std::map<std::string, std::string> owner_by_path;
+
+    for (const auto& entry : load_base_debian_package_registry_entries()) {
+        if (!base_system_registry_entry_looks_present(entry) || entry.package.empty()) continue;
+        register_native_debian_preflight_owner_paths(entry.package, entry.files, owner_by_path);
+    }
+
+    for (const auto& entry : load_base_system_registry_entries()) {
+        if (!base_system_registry_entry_looks_present(entry)) continue;
+        std::string owner = resolve_native_dpkg_bootstrap_name(entry.package);
+        if (owner.empty()) owner = entry.package;
+        register_native_debian_preflight_owner_paths(owner, entry.files, owner_by_path);
+    }
+
+    return owner_by_path;
+}
+
+bool staged_native_debian_payload_path_is_directory_like(
+    const std::string& payload_root,
+    const std::string& logical_path,
+    bool* exists_out = nullptr
+) {
+    if (exists_out) *exists_out = false;
+    if (payload_root.empty()) return false;
+
+    std::string full_path = payload_root + logical_path;
+    struct stat st {};
+    if (lstat(full_path.c_str(), &st) != 0) return false;
+    if (exists_out) *exists_out = true;
+    return live_path_is_directory_like(full_path);
+}
+
+bool write_staged_native_debian_batch_manifest(
+    const StagedNativeDebianBatch& stage,
+    std::string* error_out = nullptr
+) {
+    if (error_out) error_out->clear();
+    if (stage.stage_root.empty()) return true;
+
+    std::ostringstream manifest;
+    for (const auto& pair : stage.installed_paths_by_package) {
+        manifest << pair.first << " " << pair.second.size() << "\n";
+    }
+    if (!write_text_file_atomically(stage.stage_root + "/manifest.txt", manifest.str())) {
+        if (error_out) *error_out = "failed to write native Debian stage manifest";
+        return false;
+    }
+    return true;
+}
+
+bool prepare_native_debian_payload_store(
+    const PackageMetadata& meta,
+    bool verbose,
+    std::string* payload_root_out,
+    std::vector<std::string>* installed_paths_out,
+    std::string* error_out
+) {
+    if (payload_root_out) payload_root_out->clear();
+    if (installed_paths_out) installed_paths_out->clear();
+    if (error_out) error_out->clear();
+
+    std::string archive_path = get_cached_debian_archive_path(meta);
+    if (archive_path.empty() || access(archive_path.c_str(), F_OK) != 0) {
+        if (error_out) *error_out = "cached Debian archive is missing for " + meta.name;
+        return false;
+    }
+
+    if (!mkdir_p(NATIVE_DPKG_STORE_DIR)) {
+        if (error_out) {
+            *error_out = "failed to create native Debian payload store " + NATIVE_DPKG_STORE_DIR +
+                ": " + std::strerror(errno);
+        }
+        return false;
+    }
+
+    std::string archive_hash = sha256_hex_file(archive_path);
+    if (archive_hash.empty()) {
+        if (error_out) *error_out = "failed to hash cached Debian archive " + archive_path;
+        return false;
+    }
+
+    std::string package_name = debian_backend_package_name(meta);
+    if (package_name.empty()) package_name = meta.name;
+    std::string store_root = NATIVE_DPKG_STORE_DIR + "/" + archive_hash;
+    std::string store_payload_root = store_root + "/payload";
+    std::string store_paths_manifest = store_root + "/paths.list";
+
+    if (access(store_paths_manifest.c_str(), F_OK) == 0 &&
+        access(store_payload_root.c_str(), F_OK) == 0) {
+        std::vector<std::string> stored_paths = load_dependency_entries(store_paths_manifest);
+        if (!stored_paths.empty()) {
+            if (payload_root_out) *payload_root_out = store_payload_root;
+            if (installed_paths_out) *installed_paths_out = stored_paths;
+            VLOG(verbose, "Reusing cached native Debian payload store for "
+                         << package_name << " from " << store_root << ".");
+            return true;
+        }
+    }
+
+    std::string tmp_template = NATIVE_DPKG_STORE_DIR + "/tmp-" + archive_hash.substr(0, 12) + "-XXXXXX";
+    std::vector<char> tmp_chars(tmp_template.begin(), tmp_template.end());
+    tmp_chars.push_back('\0');
+    char* tmp_store_root = mkdtemp(tmp_chars.data());
+    if (!tmp_store_root) {
+        if (error_out) {
+            *error_out = "failed to allocate temporary native Debian payload store under " +
+                NATIVE_DPKG_STORE_DIR + ": " + std::string(std::strerror(errno));
+        }
+        return false;
+    }
+    std::string temp_store_root = tmp_store_root;
+
+    std::string unpack_root = temp_store_root + "/ar";
+    if (!mkdir_p(unpack_root)) {
+        if (error_out) *error_out = "failed to create temporary native Debian payload store " + unpack_root;
+        remove_path_recursive(temp_store_root);
+        return false;
+    }
+
+    std::string archive_error;
+    if (!GpkgArchive::extract_ar_archive_to_directory(archive_path, unpack_root, &archive_error)) {
+        if (error_out) {
+            *error_out = "failed to extract cached Debian archive into payload store for " +
+                package_name + ": " + archive_error;
+        }
+        remove_path_recursive(temp_store_root);
+        return false;
+    }
+
+    std::string data_archive;
+    if (!locate_deb_data_archive(unpack_root, data_archive)) {
+        if (error_out) {
+            *error_out = "failed to locate Debian payload archive while populating payload store for " +
+                package_name;
+        }
+        remove_path_recursive(temp_store_root);
+        return false;
+    }
+
+    std::string payload_tar;
+    if (!materialize_deb_payload_tar(data_archive, temp_store_root, payload_tar, &archive_error)) {
+        if (error_out) {
+            *error_out = "failed to materialize Debian payload tar while populating payload store for " +
+                package_name + ": " + archive_error;
+        }
+        remove_path_recursive(temp_store_root);
+        return false;
+    }
+
+    std::string payload_root = temp_store_root + "/payload";
+    if (!mkdir_p(payload_root)) {
+        if (error_out) *error_out = "failed to create payload store root " + payload_root;
+        remove_path_recursive(temp_store_root);
+        return false;
+    }
+
+    if (!GpkgArchive::tar_extract_to_directory(payload_tar, payload_root, {}, &archive_error)) {
+        if (error_out) {
+            *error_out = "failed to extract Debian payload into payload store for " +
+                package_name + ": " + archive_error;
+        }
+        remove_path_recursive(temp_store_root);
+        return false;
+    }
+
+    CachedArchivePayloadInfo payload_info = inspect_payload_tar_for_disk_estimate(payload_tar);
+    if (!payload_info.available) {
+        if (error_out) {
+            *error_out = "failed to inspect Debian payload while populating payload store for " +
+                package_name;
+        }
+        remove_path_recursive(temp_store_root);
+        return false;
+    }
+
+    std::ostringstream package_manifest;
+    for (const auto& path : payload_info.installed_paths) {
+        package_manifest << path << "\n";
+    }
+    if (!write_text_file_atomically(temp_store_root + "/paths.list", package_manifest.str())) {
+        if (error_out) *error_out = "failed to write payload store manifest for " + package_name;
+        remove_path_recursive(temp_store_root);
+        return false;
+    }
+    if (!write_text_file_atomically(temp_store_root + "/source.txt", archive_path + "\n")) {
+        if (error_out) *error_out = "failed to write payload store source metadata for " + package_name;
+        remove_path_recursive(temp_store_root);
+        return false;
+    }
+
+    if (access(store_root.c_str(), F_OK) != 0) {
+        if (rename(temp_store_root.c_str(), store_root.c_str()) != 0) {
+            if (errno != EEXIST) {
+                if (error_out) {
+                    *error_out = "failed to activate native Debian payload store for " +
+                        package_name + ": " + std::string(std::strerror(errno));
+                }
+                remove_path_recursive(temp_store_root);
+                return false;
+            }
+        }
+    }
+    remove_path_recursive(temp_store_root);
+
+    if (payload_root_out) *payload_root_out = store_payload_root;
+    if (installed_paths_out) *installed_paths_out = payload_info.installed_paths;
+    VLOG(verbose, "Cached native Debian payload for " << package_name
+                 << " in " << store_root << ".");
+    return true;
+}
+
+bool stage_native_debian_batch_payloads(
+    const std::vector<PackageMetadata>& batch,
+    bool verbose,
+    StagedNativeDebianBatch* out_stage,
+    std::string* error_out
+) {
+    if (out_stage) *out_stage = StagedNativeDebianBatch{};
+    if (error_out) error_out->clear();
+    if (batch.empty()) return true;
+
+    StagedNativeDebianBatch stage;
+    if (!create_native_debian_stage_root(&stage.stage_root, error_out)) return false;
+
+    for (const auto& meta : batch) {
+        std::string package_name = debian_backend_package_name(meta);
+        if (package_name.empty()) package_name = meta.name;
+        if (package_name.empty()) {
+            if (error_out) *error_out = "cannot stage unnamed Debian package";
+            return false;
+        }
+
+        std::string payload_root;
+        std::vector<std::string> installed_paths;
+        if (!prepare_native_debian_payload_store(
+                meta,
+                verbose,
+                &payload_root,
+                &installed_paths,
+                error_out
+            )) {
+            return false;
+        }
+
+        stage.payload_root_by_package[package_name] = payload_root;
+        stage.installed_paths_by_package[package_name] = installed_paths;
+        std::string package_root = stage.stage_root + "/" +
+            cache_safe_component(package_name) + "_" +
+            cache_safe_component(meta.version.empty() ? "unknown" : meta.version);
+        if (!mkdir_p(package_root)) {
+            if (error_out) *error_out = "failed to create stage workspace " + package_root;
+            return false;
+        }
+        std::ostringstream package_manifest;
+        for (const auto& path : installed_paths) {
+            package_manifest << path << "\n";
+        }
+        if (!write_text_file_atomically(package_root + "/paths.list", package_manifest.str())) {
+            if (error_out) {
+                *error_out = "failed to write staged path manifest for " + package_name;
+            }
+            return false;
+        }
+        if (!write_text_file_atomically(package_root + "/payload-root.txt", payload_root + "\n")) {
+            if (error_out) {
+                *error_out = "failed to write staged payload root manifest for " + package_name;
+            }
+            return false;
+        }
+    }
+
+    if (!write_staged_native_debian_batch_manifest(stage, error_out)) return false;
+
+    VLOG(verbose, "Staged " << batch.size() << " native Debian archive(s) under "
+                 << stage.stage_root << " for preflight validation.");
+    if (out_stage) *out_stage = std::move(stage);
+    return true;
+}
+
+bool prepare_live_root_for_staged_debian_batch(
+    const std::vector<PackageMetadata>& batch,
+    const StagedNativeDebianBatch& stage,
+    bool verbose,
+    std::vector<std::string>* created_dirs_out,
+    std::string* error_out
+) {
+    if (created_dirs_out) created_dirs_out->clear();
+    if (error_out) error_out->clear();
+
+    std::set<std::string> required_dirs;
+    for (const auto& pair : stage.installed_paths_by_package) {
+        for (const auto& path : pair.second) {
+            std::string current = native_debian_stage_parent_path(path);
+            while (!current.empty() && current != "/") {
+                required_dirs.insert(current);
+                current = native_debian_stage_parent_path(current);
+            }
+        }
+    }
+
+    std::vector<std::string> ordered_dirs(required_dirs.begin(), required_dirs.end());
+    std::sort(ordered_dirs.begin(), ordered_dirs.end(), [](const std::string& left, const std::string& right) {
+        size_t left_depth = native_debian_stage_path_depth(left);
+        size_t right_depth = native_debian_stage_path_depth(right);
+        if (left_depth != right_depth) return left_depth < right_depth;
+        return left < right;
+    });
+
+    size_t created_count = 0;
+    for (const auto& logical_dir : ordered_dirs) {
+        std::string full_path = ROOT_PREFIX + logical_dir;
+        struct stat st {};
+        if (lstat(full_path.c_str(), &st) == 0) {
+            if (live_path_is_directory_like(full_path)) continue;
+            if (error_out) {
+                *error_out = "cannot prepare native Debian transaction because " + logical_dir +
+                    " exists and is not a directory";
+            }
+            return false;
+        }
+
+        if (errno != ENOENT) {
+            if (error_out) {
+                *error_out = "failed to inspect required parent path " + logical_dir +
+                    ": " + std::string(std::strerror(errno));
+            }
+            return false;
+        }
+
+        if (mkdir(full_path.c_str(), 0755) != 0) {
+            if (errno == EEXIST && live_path_is_directory_like(full_path)) continue;
+            if (error_out) {
+                *error_out = "failed to create required parent path " + logical_dir +
+                    ": " + std::string(std::strerror(errno));
+            }
+            return false;
+        }
+
+        ++created_count;
+        if (created_dirs_out) created_dirs_out->push_back(logical_dir);
+    }
+
+    if (created_count > 0) {
+        VLOG(verbose, "Prepared " << created_count
+                     << " missing live parent directorie(s) for staged native Debian payload(s).");
+    } else {
+        VLOG(verbose, "Validated live parent directories for staged native Debian payload(s).");
+    }
+
+    std::map<std::string, PackageMetadata> metadata_by_package;
+    for (const auto& meta : batch) {
+        std::string package_name = debian_backend_package_name(meta);
+        if (package_name.empty()) package_name = meta.name;
+        if (!package_name.empty()) metadata_by_package[package_name] = meta;
+    }
+
+    std::map<std::string, std::string> live_owner_by_path =
+        build_native_debian_preflight_live_owner_map();
+    std::map<std::string, std::string> base_owner_by_path =
+        build_native_debian_preflight_base_owner_map();
+    std::map<std::string, PackageMetadata> resolved_owner_metadata_cache;
+    std::set<std::string> unresolved_owner_metadata;
+
+    auto resolve_owner_metadata = [&](const std::string& owner_name) -> const PackageMetadata* {
+        if (owner_name.empty()) return nullptr;
+        auto batch_it = metadata_by_package.find(owner_name);
+        if (batch_it != metadata_by_package.end()) return &batch_it->second;
+        auto cache_it = resolved_owner_metadata_cache.find(owner_name);
+        if (cache_it != resolved_owner_metadata_cache.end()) return &cache_it->second;
+        if (unresolved_owner_metadata.count(owner_name) != 0) return nullptr;
+
+        PackageMetadata owner_meta;
+        if (resolve_local_or_repo_package_metadata(owner_name, owner_meta, nullptr)) {
+            auto inserted = resolved_owner_metadata_cache.emplace(owner_name, owner_meta);
+            return &inserted.first->second;
+        }
+
+        unresolved_owner_metadata.insert(owner_name);
+        return nullptr;
+    };
+
+    std::map<std::string, std::string> staged_owner_by_path;
+    size_t staged_replaces_takeovers = 0;
+    for (const auto& pair : stage.installed_paths_by_package) {
+        const std::string& package_name = pair.first;
+        auto meta_it = metadata_by_package.find(package_name);
+        if (meta_it == metadata_by_package.end()) continue;
+        const PackageMetadata& incoming_meta = meta_it->second;
+
+        for (const auto& raw_path : pair.second) {
+            std::string logical_path = normalize_native_debian_preflight_path(raw_path);
+            if (logical_path.empty()) continue;
+
+            auto staged_owner_it = staged_owner_by_path.find(logical_path);
+            if (staged_owner_it == staged_owner_by_path.end() ||
+                staged_owner_it->second == package_name) {
+                staged_owner_by_path[logical_path] = package_name;
+                continue;
+            }
+
+            const std::string existing_owner = staged_owner_it->second;
+            auto existing_meta_it = metadata_by_package.find(existing_owner);
+            const PackageMetadata* existing_meta_ptr =
+                existing_meta_it != metadata_by_package.end() ? &existing_meta_it->second : nullptr;
+            bool incoming_replaces_existing =
+                package_replaces_package(incoming_meta, existing_owner, existing_meta_ptr);
+            bool existing_replaces_incoming =
+                existing_meta_ptr &&
+                package_replaces_package(*existing_meta_ptr, package_name, &incoming_meta);
+            if (!incoming_replaces_existing && !existing_replaces_incoming) {
+                if (error_out) {
+                    *error_out = "native Debian transaction stages conflicting ownership of " +
+                        logical_path + " in both " + existing_owner + " and " + package_name;
+                }
+                return false;
+            }
+
+            if (incoming_replaces_existing) staged_owner_by_path[logical_path] = package_name;
+            ++staged_replaces_takeovers;
+        }
+    }
+
+    size_t unmanaged_takeovers = 0;
+    size_t same_package_base_takeovers = 0;
+    std::map<std::string, size_t> base_takeovers_by_owner;
+    std::map<std::string, size_t> replaced_takeovers_by_owner;
+    for (const auto& pair : stage.installed_paths_by_package) {
+        const std::string& package_name = pair.first;
+        auto meta_it = metadata_by_package.find(package_name);
+        if (meta_it == metadata_by_package.end()) continue;
+        const PackageMetadata& incoming_meta = meta_it->second;
+
+        std::string payload_root;
+        auto payload_it = stage.payload_root_by_package.find(package_name);
+        if (payload_it != stage.payload_root_by_package.end()) payload_root = payload_it->second;
+
+        for (const auto& raw_path : pair.second) {
+            std::string logical_path = normalize_native_debian_preflight_path(raw_path);
+            if (logical_path.empty()) continue;
+
+            std::string full_path = ROOT_PREFIX + logical_path;
+            struct stat live_st {};
+            if (lstat(full_path.c_str(), &live_st) != 0) {
+                if (errno == ENOENT) continue;
+                if (error_out) {
+                    *error_out = "failed to inspect staged native Debian target path " +
+                        logical_path + ": " + std::string(std::strerror(errno));
+                }
+                return false;
+            }
+
+            bool staged_exists = false;
+            bool staged_is_directory =
+                staged_native_debian_payload_path_is_directory_like(payload_root, logical_path, &staged_exists);
+            bool live_is_directory = live_path_is_directory_like(full_path);
+            if (staged_exists && live_is_directory != staged_is_directory) {
+                if (error_out) {
+                    *error_out = "native Debian transaction would change path type for " +
+                        logical_path + " while it already exists live";
+                }
+                return false;
+            }
+            if (live_is_directory) continue;
+
+            auto owner_it = live_owner_by_path.find(logical_path);
+            if (owner_it != live_owner_by_path.end() &&
+                !owner_it->second.empty() &&
+                owner_it->second != package_name) {
+                const PackageMetadata* owner_meta_ptr = resolve_owner_metadata(owner_it->second);
+                if (!package_replaces_package(incoming_meta, owner_it->second, owner_meta_ptr)) {
+                    if (error_out) {
+                        *error_out = "native Debian transaction would overwrite " +
+                            logical_path + " owned by installed package " + owner_it->second;
+                    }
+                    return false;
+                }
+                ++replaced_takeovers_by_owner[owner_it->second];
+                continue;
+            }
+
+            auto base_owner_it = base_owner_by_path.find(logical_path);
+            if (base_owner_it != base_owner_by_path.end() && !base_owner_it->second.empty()) {
+                if (base_owner_it->second == package_name) {
+                    ++same_package_base_takeovers;
+                } else {
+                    const PackageMetadata* owner_meta_ptr = resolve_owner_metadata(base_owner_it->second);
+                    if (package_replaces_package(incoming_meta, base_owner_it->second, owner_meta_ptr)) {
+                        ++replaced_takeovers_by_owner[base_owner_it->second];
+                    } else {
+                        ++base_takeovers_by_owner[base_owner_it->second];
+                    }
+                }
+                continue;
+            }
+
+            ++unmanaged_takeovers;
+        }
+    }
+
+    if (unmanaged_takeovers > 0) {
+        VLOG(verbose, "Native Debian preflight would adopt " << unmanaged_takeovers
+                     << " existing unowned live path"
+                     << (unmanaged_takeovers == 1 ? "" : "s") << ".");
+    }
+    if (same_package_base_takeovers > 0) {
+        VLOG(verbose, "Native Debian preflight confirmed " << same_package_base_takeovers
+                     << " existing base path"
+                     << (same_package_base_takeovers == 1 ? "" : "s")
+                     << " already aligned with the incoming package identity.");
+    }
+    if (staged_replaces_takeovers > 0) {
+        VLOG(verbose, "Native Debian preflight permitted " << staged_replaces_takeovers
+                     << " staged path handoff"
+                     << (staged_replaces_takeovers == 1 ? "" : "s")
+                     << " within the Debian batch because a package declares Replaces.");
+    }
+    for (const auto& entry : base_takeovers_by_owner) {
+        VLOG(verbose, "Native Debian preflight would adopt " << entry.second
+                     << " base path"
+                     << (entry.second == 1 ? "" : "s")
+                     << " from " << entry.first << ".");
+    }
+    for (const auto& entry : replaced_takeovers_by_owner) {
+        VLOG(verbose, "Native Debian preflight permitted " << entry.second
+                     << " owned path takeover"
+                     << (entry.second == 1 ? "" : "s")
+                     << " because the incoming package declares Replaces on " << entry.first << ".");
+    }
+
+    return true;
+}
+
 bool get_cached_archive_payload_info(const PackageMetadata& meta, CachedArchivePayloadInfo* out_info) {
     if (out_info) *out_info = CachedArchivePayloadInfo{};
 
@@ -3832,6 +4674,11 @@ TransactionDiskEstimate estimate_install_transaction_disk_change(
         bool target_approximate = false;
         uint64_t current_bytes = 0;
         bool current_approximate = false;
+        bool has_live_payload_state =
+            is_installed(pkg.name) ||
+            package_has_exact_live_install_state(pkg.name, nullptr, nullptr) ||
+            package_is_base_system_provided(pkg.name) ||
+            package_has_present_base_registry_entry_exact(pkg.name);
         CachedArchivePayloadInfo archive_info;
         bool have_archive_info = get_cached_archive_payload_info(pkg, &archive_info);
         if (have_archive_info) {
@@ -3841,13 +4688,11 @@ TransactionDiskEstimate estimate_install_transaction_disk_change(
             target_approximate = true;
         }
 
-        if (is_installed(pkg.name)) {
+        if (has_live_payload_state) {
             current_bytes = estimate_current_installed_payload_bytes(pkg.name, true, &current_approximate);
         } else if (have_archive_info) {
             current_bytes = measure_manifest_payload_bytes(archive_info.installed_paths);
             current_approximate = archive_info.approximate;
-        } else if (package_is_base_system_provided(pkg.name)) {
-            current_approximate = true;
         }
 
         estimate.approximate = estimate.approximate || target_approximate || current_approximate;
