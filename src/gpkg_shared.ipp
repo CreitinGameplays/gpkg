@@ -64,6 +64,9 @@ const std::string IMPORT_POLICY_PATH = ROOT_PREFIX + "/etc/gpkg/import-policy.js
 const std::string DPKG_ADMIN_DIR = ROOT_PREFIX + "/var/lib/dpkg";
 const std::string DPKG_STATUS_FILE = DPKG_ADMIN_DIR + "/status";
 const std::string DPKG_INFO_DIR = DPKG_ADMIN_DIR + "/info";
+const std::string NATIVE_DPKG_UNVERIFIED_VERSION = "0~gpkg-unverified";
+const std::string NATIVE_SYNTHETIC_STATUS_FILE = ROOT_PREFIX + "/var/lib/gpkg/native-synthetic-status";
+const std::string NATIVE_SYNTHETIC_INFO_DIR = ROOT_PREFIX + "/var/lib/gpkg/native-info";
 const std::string BASE_SYSTEM_REGISTRY_PATH = ROOT_PREFIX + "/usr/share/gpkg/base-system.json";
 const std::string BASE_SYSTEM_PROVIDER = "<base system policy>";
 const std::string STATUS_FILE = ROOT_PREFIX + "/var/lib/gpkg/status";
@@ -103,6 +106,15 @@ struct BaseSystemRegistryEntry {
     std::vector<std::string> files;
 };
 
+struct NativeSyntheticStateRecord {
+    std::string package;
+    std::string version;
+    std::string provenance = "unknown";
+    std::string version_confidence = "unknown";
+    bool owns_files = true;
+    bool satisfies_versioned_deps = false;
+};
+
 struct PackageAutoStateRecord {
     std::string package;
     bool auto_installed = false;
@@ -134,6 +146,9 @@ bool base_system_registry_entry_looks_present(const BaseSystemRegistryEntry& ent
 bool get_package_status_record(const std::string& pkg_name, PackageStatusRecord* out = nullptr);
 bool get_dpkg_package_status_record(const std::string& pkg_name, PackageStatusRecord* out = nullptr);
 bool get_base_system_package_status_record(const std::string& pkg_name, PackageStatusRecord* out = nullptr);
+std::vector<NativeSyntheticStateRecord> load_native_synthetic_state_records();
+bool get_native_synthetic_state_record(const std::string& pkg_name, NativeSyntheticStateRecord* out = nullptr);
+bool save_native_synthetic_state_records(const std::vector<NativeSyntheticStateRecord>& records);
 bool package_status_is_installed_like(const std::string& state);
 std::vector<PackageAutoStateRecord> load_package_auto_state_records();
 bool get_package_auto_installed_state(const std::string& pkg_name, bool* out_auto = nullptr);

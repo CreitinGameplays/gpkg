@@ -57,7 +57,11 @@ bool get_live_installed_package_metadata(const std::string& pkg_name, PackageMet
 
     PackageMetadata installed_meta;
     bool have_installed_meta = get_installed_package_metadata(pkg_name, installed_meta);
+    bool have_exact_live_version =
+        !trim(status_record.version).empty() &&
+        status_record.version != NATIVE_DPKG_UNVERIFIED_VERSION;
     bool installed_relations_exact =
+        have_exact_live_version &&
         have_installed_meta &&
         package_metadata_relations_match_version_exactly(installed_meta, status_record.version);
 
@@ -65,6 +69,7 @@ bool get_live_installed_package_metadata(const std::string& pkg_name, PackageMet
         PackageMetadata repo_meta;
         bool have_repo_meta = get_repo_package_info(pkg_name, repo_meta);
         bool repo_relations_exact =
+            have_exact_live_version &&
             have_repo_meta &&
             package_metadata_relations_match_version_exactly(repo_meta, status_record.version);
 
@@ -84,7 +89,9 @@ bool get_live_installed_package_metadata(const std::string& pkg_name, PackageMet
         }
         if (have_repo_meta) {
             overlay_missing_package_metadata_descriptive_fields(meta, repo_meta);
-            if (!repo_relations_exact && !installed_relations_exact) {
+            if (have_exact_live_version &&
+                !repo_relations_exact &&
+                !installed_relations_exact) {
                 overlay_missing_package_metadata_relations(meta, repo_meta, true);
             }
         }
@@ -445,6 +452,11 @@ bool find_installed_dependency_provider(
     return false;
 }
 
+bool dependency_requires_exact_live_system_version(const Dependency& dep) {
+    if (dep.name.empty() || dep.op.empty()) return false;
+    return is_upgradeable_system_package(dep.name);
+}
+
 bool is_dependency_satisfied_locally(
     const Dependency& dep,
     const std::set<std::string>& installed_cache,
@@ -457,8 +469,17 @@ bool is_dependency_satisfied_locally(
     if (provider_out) provider_out->clear();
     (void)raw_context;
 
+    bool require_exact_live_system_version =
+        dependency_requires_exact_live_system_version(dep);
+    bool has_exact_live_version = false;
+    if (require_exact_live_system_version) {
+        has_exact_live_version =
+            package_has_exact_live_install_state(dep.name, nullptr, context);
+    }
+
     std::string installed_ver;
-    if (get_local_installed_package_version(dep.name, &installed_ver, context) &&
+    if ((!require_exact_live_system_version || has_exact_live_version) &&
+        get_local_installed_package_version(dep.name, &installed_ver, context) &&
         version_satisfies(installed_ver, dep.op, dep.version)) {
         if (!prefer_native_dpkg) {
             if (provider_out) *provider_out = dep.name;
@@ -486,7 +507,8 @@ bool is_dependency_satisfied_locally(
         return true;
     }
 
-    if (is_system_provided(dep.name, dep.op, dep.version)) {
+    if ((!require_exact_live_system_version || has_exact_live_version) &&
+        is_system_provided(dep.name, dep.op, dep.version)) {
         if (is_upgradeable_system_package(dep.name)) {
             VLOG(verbose, dep.name
                  << " is provided by the GeminiOS base image and remains satisfied locally"
@@ -1244,6 +1266,24 @@ bool build_transaction_plan_legacy(
         }
     }
 
+    auto transaction_retires_or_upgrades_installed_package =
+        [&](const std::string& installed_name, const PackageMetadata* installed_meta) {
+            if (scheduled_retirements.count(installed_name) != 0) return true;
+
+            std::string canonical_installed = canonicalize_package_name(installed_name);
+            for (const auto& candidate : out_plan.install_queue) {
+                if (canonicalize_package_name(candidate.name) == canonical_installed) {
+                    return true;
+                }
+                if (installed_meta &&
+                    package_replaces_package(candidate, installed_name, installed_meta)) {
+                    return true;
+                }
+            }
+
+            return false;
+        };
+
     for (const auto& pkg : out_plan.install_queue) {
         for (const auto& installed_name : installed) {
             if (installed_name == pkg.name) continue;
@@ -1260,14 +1300,24 @@ bool build_transaction_plan_legacy(
                 !installed_conflicts_queued) {
                 continue;
             }
+            if (transaction_retires_or_upgrades_installed_package(installed_name, installed_meta)) {
+                continue;
+            }
             if (package_replaces_package(pkg, installed_name, installed_meta)) continue;
 
             if (queued_breaks_installed) {
                 bool installed_upgrade_queued = false;
                 for (const auto& candidate : out_plan.install_queue) {
-                    if (candidate.name != installed_name) continue;
+                    bool same_family =
+                        canonicalize_package_name(candidate.name) ==
+                        canonicalize_package_name(installed_name);
+                    bool replacement_upgrade =
+                        installed_meta &&
+                        package_replaces_package(candidate, installed_name, installed_meta);
+                    if (!same_family && !replacement_upgrade) continue;
                     installed_upgrade_queued = true;
-                    if (!package_breaks_package(pkg, candidate.name, &candidate)) {
+                    if (!package_breaks_package(pkg, candidate.name, &candidate) ||
+                        replacement_upgrade) {
                         queued_breaks_installed = false;
                     }
                     break;

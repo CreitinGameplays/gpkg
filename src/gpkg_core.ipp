@@ -389,6 +389,47 @@ std::vector<PackageStatusRecord> load_dpkg_package_status_records() {
     return load_status_records_from_file(DPKG_STATUS_FILE);
 }
 
+bool get_json_value(const std::string& obj, const std::string& key, std::string& out_val);
+
+bool write_text_file_atomically_core(const std::string& path, const std::string& content) {
+    if (!mkdir_parent(path)) return false;
+
+    std::string pattern = path + ".XXXXXX";
+    std::vector<char> tmpl(pattern.begin(), pattern.end());
+    tmpl.push_back('\0');
+
+    int fd = mkstemp(tmpl.data());
+    if (fd < 0) return false;
+
+    bool ok = true;
+    ssize_t remaining = static_cast<ssize_t>(content.size());
+    const char* cursor = content.data();
+    while (remaining > 0) {
+        ssize_t written = write(fd, cursor, static_cast<size_t>(remaining));
+        if (written < 0) {
+            ok = false;
+            break;
+        }
+        remaining -= written;
+        cursor += written;
+    }
+    if (ok && fsync(fd) != 0) ok = false;
+    if (fchmod(fd, 0644) != 0) ok = false;
+    close(fd);
+
+    if (!ok) {
+        unlink(tmpl.data());
+        return false;
+    }
+
+    if (rename(tmpl.data(), path.c_str()) != 0) {
+        unlink(tmpl.data());
+        return false;
+    }
+
+    return true;
+}
+
 bool get_package_status_record(const std::string& pkg_name, PackageStatusRecord* out) {
     std::vector<PackageStatusRecord> records = load_package_status_records();
     for (const auto& record : records) {
@@ -407,6 +448,177 @@ bool get_dpkg_package_status_record(const std::string& pkg_name, PackageStatusRe
         return true;
     }
     return false;
+}
+
+std::vector<NativeSyntheticStateRecord> load_native_synthetic_state_records() {
+    std::vector<NativeSyntheticStateRecord> records;
+    std::ifstream f(NATIVE_SYNTHETIC_STATUS_FILE);
+    if (!f) return records;
+
+    NativeSyntheticStateRecord current;
+    bool have_content = false;
+    std::string line;
+    auto flush_record = [&]() {
+        if (current.package.empty()) {
+            current = NativeSyntheticStateRecord{};
+            have_content = false;
+            return;
+        }
+
+        records.push_back(current);
+        current = NativeSyntheticStateRecord{};
+        have_content = false;
+    };
+
+    while (std::getline(f, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty()) {
+            flush_record();
+            continue;
+        }
+
+        size_t colon = line.find(':');
+        if (colon == std::string::npos) continue;
+
+        std::string key = trim(line.substr(0, colon));
+        std::string value = trim(line.substr(colon + 1));
+        if (key.empty()) continue;
+
+        have_content = true;
+        if (key == "Package") current.package = value;
+        else if (key == "Version") current.version = value;
+        else if (key == "Gpkg-Provenance") current.provenance = value;
+        else if (key == "Gpkg-Version-Confidence") current.version_confidence = value;
+        else if (key == "Gpkg-Owns-Files") current.owns_files = (value != "0" && value != "false");
+        else if (key == "Gpkg-Satisfies-Versioned-Deps") {
+            current.satisfies_versioned_deps = (value == "1" || value == "true");
+        }
+    }
+
+    if (have_content) flush_record();
+    return records;
+}
+
+bool get_native_synthetic_state_record(const std::string& pkg_name, NativeSyntheticStateRecord* out) {
+    std::vector<NativeSyntheticStateRecord> records = load_native_synthetic_state_records();
+    for (const auto& record : records) {
+        if (record.package != pkg_name) continue;
+        if (out) *out = record;
+        return true;
+    }
+    return false;
+}
+
+bool save_native_synthetic_state_records(const std::vector<NativeSyntheticStateRecord>& records) {
+    if (records.empty()) {
+        return unlink(NATIVE_SYNTHETIC_STATUS_FILE.c_str()) == 0 || errno == ENOENT;
+    }
+
+    std::ostringstream out;
+    for (const auto& record : records) {
+        if (record.package.empty()) continue;
+        out << "Package: " << record.package << "\n";
+        if (!record.version.empty()) out << "Version: " << record.version << "\n";
+        out << "Gpkg-Provenance: " << (record.provenance.empty() ? "unknown" : record.provenance) << "\n";
+        out << "Gpkg-Version-Confidence: "
+            << (record.version_confidence.empty() ? "unknown" : record.version_confidence) << "\n";
+        out << "Gpkg-Owns-Files: " << (record.owns_files ? "1" : "0") << "\n";
+        out << "Gpkg-Satisfies-Versioned-Deps: "
+            << (record.satisfies_versioned_deps ? "1" : "0") << "\n\n";
+    }
+
+    return write_text_file_atomically_core(NATIVE_SYNTHETIC_STATUS_FILE, out.str());
+}
+
+bool native_dpkg_package_has_real_control_artifacts(const std::string& pkg_name) {
+    if (pkg_name.empty()) return false;
+
+    DIR* dir = opendir(DPKG_INFO_DIR.c_str());
+    if (!dir) return false;
+
+    std::string prefix = pkg_name + ".";
+    std::string plain_list = prefix + "list";
+    bool found = false;
+
+    while (true) {
+        errno = 0;
+        dirent* entry = readdir(dir);
+        if (!entry) break;
+
+        std::string name = entry->d_name;
+        if (name.empty() || name == "." || name == "..") continue;
+        if (name.rfind(prefix, 0) != 0) continue;
+        if (name == plain_list) continue;
+        found = true;
+        break;
+    }
+
+    closedir(dir);
+    return found;
+}
+
+bool native_dpkg_package_has_exact_registered_live_version(
+    const std::string& pkg_name,
+    std::string* version_out = nullptr
+) {
+    if (version_out) version_out->clear();
+    if (pkg_name.empty()) return false;
+
+    PackageStatusRecord record;
+    if (get_package_status_record(pkg_name, &record) &&
+        !package_status_is_installed_like(record.status)) {
+        return false;
+    }
+
+    if (get_package_status_record(pkg_name, &record) &&
+        package_status_is_installed_like(record.status) &&
+        !trim(record.version).empty()) {
+        if (version_out) *version_out = trim(record.version);
+        return true;
+    }
+
+    std::ifstream f(INFO_DIR + pkg_name + ".json");
+    if (!f) return false;
+
+    std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    std::string version;
+    if (!get_json_value(content, "version", version) || trim(version).empty()) return false;
+    if (version_out) *version_out = trim(version);
+    return true;
+}
+
+std::string get_raw_base_system_registry_version_for_package(const std::string& pkg_name) {
+    if (pkg_name.empty()) return "";
+    std::string lowered = ascii_lower_copy(pkg_name);
+    for (const auto& entry : load_base_system_registry_entries()) {
+        if (entry.package == pkg_name || ascii_lower_copy(entry.package) == lowered) {
+            return trim(entry.version);
+        }
+    }
+    return "";
+}
+
+std::string resolve_base_system_status_version(
+    const std::string& pkg_name,
+    const std::string& registry_version
+) {
+    std::string exact_version;
+    if (native_dpkg_package_has_exact_registered_live_version(pkg_name, &exact_version)) {
+        return exact_version;
+    }
+
+    NativeSyntheticStateRecord synthetic_record;
+    if (!get_native_synthetic_state_record(pkg_name, &synthetic_record)) {
+        PackageStatusRecord dpkg_record;
+        if (get_dpkg_package_status_record(pkg_name, &dpkg_record) &&
+            package_status_is_installed_like(dpkg_record.status) &&
+            !trim(dpkg_record.version).empty()) {
+            return trim(dpkg_record.version);
+        }
+    }
+
+    (void) registry_version;
+    return NATIVE_DPKG_UNVERIFIED_VERSION;
 }
 
 bool package_status_is_installed_like(const std::string& state) {
@@ -626,7 +838,7 @@ std::vector<PackageStatusRecord> load_base_system_package_status_records() {
         if (!base_system_registry_entry_looks_present(entry)) continue;
         PackageStatusRecord record;
         record.package = entry.package;
-        record.version = entry.version;
+        record.version = resolve_base_system_status_version(entry.package, entry.version);
         record.want = "install";
         record.flag = "ok";
         record.status = "installed";
