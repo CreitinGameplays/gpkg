@@ -44,8 +44,6 @@ bool get_installed_package_metadata(const std::string& pkg_name, PackageMetadata
 }
 
 bool get_live_installed_package_metadata(const std::string& pkg_name, PackageMetadata& out_meta) {
-    if (get_installed_package_metadata(pkg_name, out_meta)) return true;
-
     PackageStatusRecord status_record;
     bool have_live_status =
         get_dpkg_package_status_record(pkg_name, &status_record) &&
@@ -55,17 +53,56 @@ bool get_live_installed_package_metadata(const std::string& pkg_name, PackageMet
             get_base_system_package_status_record(pkg_name, &status_record) &&
             package_status_is_installed_like(status_record.status);
     }
-    if (!have_live_status) return false;
 
-    if (get_repo_package_info(pkg_name, out_meta)) {
-        if (!status_record.version.empty()) out_meta.version = status_record.version;
+    PackageMetadata installed_meta;
+    bool have_installed_meta = get_installed_package_metadata(pkg_name, installed_meta);
+
+    if (have_live_status) {
+        PackageMetadata repo_meta;
+        if (get_repo_package_info(pkg_name, repo_meta)) {
+            if (!status_record.version.empty()) repo_meta.version = status_record.version;
+            if (have_installed_meta) {
+                if (repo_meta.arch.empty()) repo_meta.arch = installed_meta.arch;
+                if (repo_meta.maintainer.empty()) repo_meta.maintainer = installed_meta.maintainer;
+                if (repo_meta.description.empty()) repo_meta.description = installed_meta.description;
+                if (repo_meta.section.empty()) repo_meta.section = installed_meta.section;
+                if (repo_meta.priority.empty()) repo_meta.priority = installed_meta.priority;
+                if (repo_meta.filename.empty()) repo_meta.filename = installed_meta.filename;
+                if (repo_meta.sha256.empty()) repo_meta.sha256 = installed_meta.sha256;
+                if (repo_meta.sha512.empty()) repo_meta.sha512 = installed_meta.sha512;
+                if (repo_meta.source_kind.empty()) repo_meta.source_kind = installed_meta.source_kind;
+                if (repo_meta.source_url.empty()) repo_meta.source_url = installed_meta.source_url;
+                if (repo_meta.debian_package.empty()) repo_meta.debian_package = installed_meta.debian_package;
+                if (repo_meta.debian_version.empty()) repo_meta.debian_version = installed_meta.debian_version;
+                if (repo_meta.package_scope.empty()) repo_meta.package_scope = installed_meta.package_scope;
+                if (repo_meta.installed_from.empty()) repo_meta.installed_from = installed_meta.installed_from;
+                if (repo_meta.size.empty()) repo_meta.size = installed_meta.size;
+                if (repo_meta.installed_size_bytes.empty()) {
+                    repo_meta.installed_size_bytes = installed_meta.installed_size_bytes;
+                }
+            }
+            out_meta = repo_meta;
+            return true;
+        }
+
+        if (have_installed_meta) {
+            if (!status_record.version.empty()) installed_meta.version = status_record.version;
+            out_meta = installed_meta;
+            return true;
+        }
+
+        out_meta = {};
+        out_meta.name = pkg_name;
+        out_meta.version = status_record.version;
+        return !out_meta.version.empty();
+    }
+
+    if (have_installed_meta) {
+        out_meta = installed_meta;
         return true;
     }
 
-    out_meta = {};
-    out_meta.name = pkg_name;
-    out_meta.version = status_record.version;
-    return !out_meta.version.empty();
+    return false;
 }
 
 Dependency parse_dependency(const std::string& dep_str) {

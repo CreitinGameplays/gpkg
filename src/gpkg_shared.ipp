@@ -971,6 +971,7 @@ struct ScopedServiceSuppression {
         char* wrapper_root = mkdtemp(wrapper_template);
         if (wrapper_root) {
             wrapper_dir = wrapper_root;
+            std::string worker_command = resolve_gpkg_worker_command();
 
             struct WrapperSpec {
                 const char* name;
@@ -994,6 +995,50 @@ struct ScopedServiceSuppression {
                         build_service_action_wrapper_script(spec.candidates, spec.parse_mode))) {
                     wrappers_ok = false;
                     break;
+                }
+            }
+
+            auto write_worker_compat_wrapper = [&](const std::string& name, const std::string& action) {
+                std::ostringstream script;
+                script << "#!/bin/sh\n";
+                if (!worker_command.empty()) {
+                    script << "exec " << shell_quote(worker_command) << " "
+                           << action << " \"$@\"\n";
+                } else {
+                    script << "exit 0\n";
+                }
+                return write_executable_script(wrapper_dir + "/" + name, script.str());
+            };
+
+            auto write_real_command_wrapper = [&](const std::string& name, const std::vector<std::string>& candidates) {
+                std::ostringstream script;
+                script << "#!/bin/sh\n";
+                for (const auto& candidate : candidates) {
+                    script << "if [ -x " << shell_quote(candidate) << " ]; then\n"
+                           << "  exec " << shell_quote(candidate) << " \"$@\"\n"
+                           << "fi\n";
+                }
+                script << "exit 0\n";
+                return write_executable_script(wrapper_dir + "/" + name, script.str());
+            };
+
+            if (wrappers_ok) {
+                wrappers_ok = write_worker_compat_wrapper(
+                    "deb-systemd-helper",
+                    verbose ? "--verbose --compat-deb-systemd-helper" : "--compat-deb-systemd-helper"
+                );
+            }
+            if (wrappers_ok) {
+                if (!worker_command.empty()) {
+                    wrappers_ok = write_worker_compat_wrapper(
+                        "update-alternatives",
+                        verbose ? "--verbose --compat-update-alternatives" : "--compat-update-alternatives"
+                    );
+                } else {
+                    wrappers_ok = write_real_command_wrapper(
+                        "update-alternatives",
+                        {"/usr/bin/update-alternatives", "/bin/update-alternatives"}
+                    );
                 }
             }
 

@@ -77,67 +77,92 @@ bool get_local_installed_package_version(
     if (pkg_name.empty()) return false;
 
     if (context) {
-        if (context->registered_package_set.count(pkg_name) != 0) {
-            auto status_it = context->registered_status_by_package.find(pkg_name);
-            if (status_it != context->registered_status_by_package.end() &&
-                !package_status_is_installed_like(status_it->second.status)) {
-                return false;
-            }
-            if (!version_out) return true;
+        const ImportPolicy& policy = get_import_policy(false);
+        bool found = false;
+        std::string best_version;
+        bool best_is_placeholder = true;
 
-            if (status_it != context->registered_status_by_package.end() &&
-                !status_it->second.version.empty()) {
-                *version_out = status_it->second.version;
-                return true;
+        auto consider_version = [&](const std::string& candidate_version) {
+            std::string normalized = trim(candidate_version);
+            if (normalized.empty()) return;
+
+            bool placeholder =
+                is_native_dpkg_compat_placeholder_version(pkg_name, normalized, policy);
+            if (!found) {
+                found = true;
+                best_version = normalized;
+                best_is_placeholder = placeholder;
+                return;
             }
 
-            auto cached_it = context->registered_version_cache.find(pkg_name);
-            if (cached_it != context->registered_version_cache.end()) {
-                *version_out = cached_it->second;
-                return true;
+            if (best_is_placeholder && !placeholder) {
+                best_version = normalized;
+                best_is_placeholder = false;
+                return;
             }
-            if (context->missing_registered_versions.count(pkg_name) != 0) return false;
+            if (!best_is_placeholder && placeholder) return;
 
+            if (compare_versions(normalized, best_version) > 0) {
+                best_version = normalized;
+                best_is_placeholder = placeholder;
+            }
+        };
+
+        auto status_it = context->registered_status_by_package.find(pkg_name);
+        if (status_it != context->registered_status_by_package.end()) {
+            if (!package_status_is_installed_like(status_it->second.status)) {
+                auto dpkg_it = context->dpkg_status_by_package.find(pkg_name);
+                auto base_it = context->base_status_by_package.find(pkg_name);
+                bool live_elsewhere =
+                    (dpkg_it != context->dpkg_status_by_package.end() &&
+                     package_status_is_installed_like(dpkg_it->second.status)) ||
+                    (base_it != context->base_status_by_package.end() &&
+                     package_status_is_installed_like(base_it->second.status));
+                if (!live_elsewhere) return false;
+            }
+            consider_version(status_it->second.version);
+        }
+
+        auto cached_it = context->registered_version_cache.find(pkg_name);
+        if (cached_it != context->registered_version_cache.end()) {
+            consider_version(cached_it->second);
+        } else if (context->registered_package_set.count(pkg_name) != 0 &&
+                   context->missing_registered_versions.count(pkg_name) == 0) {
             std::string info_path = INFO_DIR + pkg_name + ".json";
             std::ifstream f(info_path);
-            if (!f) {
+            if (f) {
+                std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+                std::string parsed_version;
+                if (get_json_value(content, "version", parsed_version) && !parsed_version.empty()) {
+                    context->registered_version_cache[pkg_name] = parsed_version;
+                    consider_version(parsed_version);
+                } else {
+                    context->missing_registered_versions.insert(pkg_name);
+                }
+            } else {
                 context->missing_registered_versions.insert(pkg_name);
-                return false;
             }
-
-            std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-            std::string parsed_version;
-            if (!get_json_value(content, "version", parsed_version) || parsed_version.empty()) {
-                context->missing_registered_versions.insert(pkg_name);
-                return false;
-            }
-
-            context->registered_version_cache[pkg_name] = parsed_version;
-            *version_out = parsed_version;
-            return true;
         }
 
         auto dpkg_it = context->dpkg_status_by_package.find(pkg_name);
         if (dpkg_it != context->dpkg_status_by_package.end() &&
             package_status_is_installed_like(dpkg_it->second.status)) {
-            std::string resolved_version = resolve_context_synthetic_live_version(
+            consider_version(resolve_context_synthetic_live_version(
                 pkg_name,
                 dpkg_it->second.version,
                 *context
-            );
-            if (version_out) *version_out = resolved_version;
-            return true;
+            ));
         }
 
         auto base_it = context->base_status_by_package.find(pkg_name);
         if (base_it != context->base_status_by_package.end() &&
-            package_status_is_installed_like(base_it->second.status) &&
-            !base_it->second.version.empty()) {
-            if (version_out) *version_out = base_it->second.version;
-            return true;
+            package_status_is_installed_like(base_it->second.status)) {
+            consider_version(base_it->second.version);
         }
 
-        return false;
+        if (!found) return false;
+        if (version_out) *version_out = best_version;
+        return true;
     }
 
     if (is_installed(pkg_name, version_out)) return true;
@@ -1549,6 +1574,7 @@ UpgradeContext build_upgrade_context(bool verbose) {
         if (!present) continue;
 
         context.present_base_packages.insert(entry.package);
+        context.exact_live_packages.insert(entry.package);
         PackageStatusRecord record;
         record.package = entry.package;
         record.version = entry.version;
@@ -2470,9 +2496,42 @@ bool pending_native_dpkg_configurations_wait_for_remaining_batch(
     }
 
     for (const auto& pkg_name : pending) {
-        PackageMetadata pending_meta;
-        if (!get_live_installed_package_metadata(pkg_name, pending_meta)) continue;
+        std::string canonical_pending = canonicalize_package_name(pkg_name, verbose);
+        if (remaining_names.count(canonical_pending) != 0) {
+            if (reason_out) {
+                *reason_out = pkg_name + " is scheduled for upgrade later in the current Debian batch";
+            }
+            return true;
+        }
 
+        PackageMetadata pending_meta;
+        bool have_pending_meta = get_live_installed_package_metadata(pkg_name, pending_meta);
+
+        for (const auto& candidate : remaining_batch) {
+            std::string provider_name = debian_backend_package_name(candidate);
+            std::string canonical_provider = canonicalize_package_name(provider_name, verbose);
+            std::string canonical_candidate = canonicalize_package_name(candidate.name, verbose);
+            if ((!canonical_provider.empty() && canonical_provider == canonical_pending) ||
+                (!canonical_candidate.empty() && canonical_candidate == canonical_pending)) {
+                if (reason_out) {
+                    *reason_out = pkg_name + " is scheduled for upgrade later in the current Debian batch";
+                }
+                return true;
+            }
+
+            if (have_pending_meta &&
+                (package_replaces_package(candidate, pkg_name, &pending_meta) ||
+                 package_breaks_package(candidate, pkg_name, &pending_meta))) {
+                if (reason_out) {
+                    *reason_out = pkg_name + " is blocked until " +
+                        (provider_name.empty() ? candidate.name : provider_name) +
+                        " is unpacked from the current Debian batch";
+                }
+                return true;
+            }
+        }
+
+        if (!have_pending_meta) continue;
         for (const auto& dep_str : collect_required_transaction_dependency_edges(pending_meta)) {
             Dependency dep = parse_dependency(dep_str);
             if (dep.name.empty()) continue;
@@ -2592,7 +2651,7 @@ InstallCommandResult install_native_debian_batch(
         return {false, "", batch.front().name, 0, ""};
     }
 
-    InstallCommandResult pending_result = reconcile_pending_native_dpkg_configurations(verbose);
+    InstallCommandResult pending_result = reconcile_pending_native_dpkg_configurations(verbose, &batch);
     if (!pending_result.success) {
         std::cerr << "E: Failed to configure pending Debian packages before starting new batch";
         if (!pending_result.failed_package.empty()) {
@@ -2688,9 +2747,9 @@ InstallCommandResult install_native_debian_batch(
         }
 
         CommandCaptureResult result = run_command_captured_argv(
-            build_dpkg_command_argv({"--install", get_cached_debian_archive_path(meta)}),
+            build_dpkg_command_argv({"--unpack", get_cached_debian_archive_path(meta)}),
             verbose,
-            "dpkg-install"
+            "dpkg-unpack"
         );
         batch_result.last_processed_package = debian_backend_package_name(meta);
         if (batch_result.last_processed_package.empty()) batch_result.last_processed_package = meta.name;
