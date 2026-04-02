@@ -1255,6 +1255,142 @@ struct ScopedMaintscriptShellOverride {
     }
 };
 
+std::string build_native_dpkg_maintscript_search_path(const std::string& wrapper_dir) {
+    std::vector<std::string> parts;
+    std::set<std::string> seen;
+
+    auto append = [&](const std::string& entry) {
+        size_t begin = 0;
+        size_t end = entry.size();
+        while (begin < end &&
+               std::isspace(static_cast<unsigned char>(entry[begin]))) {
+            ++begin;
+        }
+        while (end > begin &&
+               std::isspace(static_cast<unsigned char>(entry[end - 1]))) {
+            --end;
+        }
+        std::string value = entry.substr(begin, end - begin);
+        if (value.empty()) return;
+        if (!seen.insert(value).second) return;
+        parts.push_back(value);
+    };
+
+    append(wrapper_dir);
+
+    const char* current_path = getenv("PATH");
+    if (current_path && *current_path) {
+        std::string path = current_path;
+        size_t start = 0;
+        while (start <= path.size()) {
+            size_t end = path.find(':', start);
+            append(path.substr(start, end == std::string::npos ? std::string::npos : end - start));
+            if (end == std::string::npos) break;
+            start = end + 1;
+        }
+    }
+
+    const char* standard_paths[] = {
+        "/usr/local/sbin",
+        "/usr/local/bin",
+        "/usr/sbin",
+        "/usr/bin",
+        "/sbin",
+        "/bin",
+    };
+    for (const char* standard_path : standard_paths) append(standard_path);
+
+    std::ostringstream rendered;
+    for (size_t i = 0; i < parts.size(); ++i) {
+        if (i != 0) rendered << ":";
+        rendered << parts[i];
+    }
+    return rendered.str();
+}
+
+struct ScopedNativeDpkgMaintscriptCompat {
+    bool verbose = false;
+    ScopedEnvOverrides env;
+    std::string wrapper_dir;
+
+    explicit ScopedNativeDpkgMaintscriptCompat(bool active, bool v) : verbose(v) {
+        if (!active) return;
+
+        if (!getenv("HOME") || !*getenv("HOME")) {
+            env.set("HOME", ROOT_PREFIX.empty() ? "/root" : "/");
+        }
+        if (!getenv("TMPDIR") || !*getenv("TMPDIR")) {
+            env.set("TMPDIR", "/tmp");
+        }
+
+        char wrapper_template[] = "/tmp/gpkg-dpkg-maintscript-XXXXXX";
+        char* wrapper_root = mkdtemp(wrapper_template);
+        if (wrapper_root) {
+            wrapper_dir = wrapper_root;
+            std::string worker_command = resolve_gpkg_worker_command();
+
+            struct WrapperSpec {
+                const char* name;
+                const char* action;
+            };
+
+            const WrapperSpec wrappers[] = {
+                {"dpkg", "--compat-dpkg"},
+                {"dpkg-query", "--compat-dpkg-query"},
+                {"dpkg-trigger", "--compat-dpkg-trigger"},
+                {"update-alternatives", "--compat-update-alternatives"},
+                {"update-rc.d", "--compat-update-rc.d"},
+                {"invoke-rc.d", "--compat-invoke-rc.d"},
+                {"service", "--compat-service"},
+                {"systemctl", "--compat-systemctl"},
+                {"deb-systemd-invoke", "--compat-deb-systemd-invoke"},
+                {"deb-systemd-helper", "--compat-deb-systemd-helper"},
+                {"initctl", "--compat-initctl"},
+            };
+
+            bool wrappers_ok = !worker_command.empty();
+            for (const auto& spec : wrappers) {
+                if (!wrappers_ok) break;
+
+                std::ostringstream script;
+                script << "#!/bin/sh\n"
+                       << "worker=" << shell_quote(worker_command) << "\n"
+                       << "exec \"$worker\"";
+                if (verbose) script << " --verbose";
+                if (!ROOT_PREFIX.empty()) {
+                    script << " --root " << shell_quote(ROOT_PREFIX);
+                }
+                script << " " << spec.action << " \"$@\"\n";
+
+                if (!write_executable_script(wrapper_dir + "/" + spec.name, script.str())) {
+                    wrappers_ok = false;
+                }
+            }
+
+            if (!wrappers_ok) {
+                if (verbose) {
+                    std::cout << "[DEBUG] Failed to create one or more native dpkg maintscript wrappers in "
+                              << wrapper_dir << std::endl;
+                }
+                remove_path_recursive(wrapper_dir);
+                wrapper_dir.clear();
+            } else if (verbose) {
+                std::cout << "[DEBUG] Native dpkg maintscript compatibility wrappers active from "
+                          << wrapper_dir << std::endl;
+            }
+        } else if (verbose) {
+            std::cout << "[DEBUG] Failed to allocate a native dpkg maintscript wrapper directory in /tmp."
+                      << std::endl;
+        }
+
+        env.set("PATH", build_native_dpkg_maintscript_search_path(wrapper_dir));
+    }
+
+    ~ScopedNativeDpkgMaintscriptCompat() {
+        if (!wrapper_dir.empty()) remove_path_recursive(wrapper_dir);
+    }
+};
+
 void run_triggers(bool verbose) {
     bool pending_dpkg_triggers = has_pending_dpkg_trigger_state();
     bool pending_runtime_refresh = g_pending_runtime_linker_refresh;
@@ -1468,6 +1604,67 @@ struct PackageMetadata {
     std::vector<std::string> provides;
     std::vector<std::string> replaces;
 };
+
+bool package_metadata_relations_match_version_exactly(
+    const PackageMetadata& meta,
+    const std::string& live_version
+) {
+    return !meta.version.empty() &&
+           !live_version.empty() &&
+           compare_versions(meta.version, live_version) == 0;
+}
+
+PackageMetadata build_minimal_live_package_metadata(
+    const std::string& pkg_name,
+    const std::string& live_version
+) {
+    PackageMetadata meta;
+    meta.name = pkg_name;
+    meta.version = live_version;
+    return meta;
+}
+
+void overlay_missing_package_metadata_descriptive_fields(
+    PackageMetadata& target,
+    const PackageMetadata& source
+) {
+    if (target.name.empty()) target.name = source.name;
+    if (target.version.empty()) target.version = source.version;
+    if (target.arch.empty()) target.arch = source.arch;
+    if (target.description.empty()) target.description = source.description;
+    if (target.maintainer.empty()) target.maintainer = source.maintainer;
+    if (target.section.empty()) target.section = source.section;
+    if (target.priority.empty()) target.priority = source.priority;
+    if (target.filename.empty()) target.filename = source.filename;
+    if (target.sha256.empty()) target.sha256 = source.sha256;
+    if (target.sha512.empty()) target.sha512 = source.sha512;
+    if (target.source_url.empty()) target.source_url = source.source_url;
+    if (target.source_kind.empty()) target.source_kind = source.source_kind;
+    if (target.debian_package.empty()) target.debian_package = source.debian_package;
+    if (target.debian_version.empty()) target.debian_version = source.debian_version;
+    if (target.package_scope.empty()) target.package_scope = source.package_scope;
+    if (target.installed_from.empty()) target.installed_from = source.installed_from;
+    if (target.size.empty()) target.size = source.size;
+    if (target.installed_size_bytes.empty()) {
+        target.installed_size_bytes = source.installed_size_bytes;
+    }
+}
+
+void overlay_missing_package_metadata_relations(
+    PackageMetadata& target,
+    const PackageMetadata& source,
+    bool provides_only = false
+) {
+    if (!provides_only) {
+        if (target.depends.empty()) target.depends = source.depends;
+        if (target.recommends.empty()) target.recommends = source.recommends;
+        if (target.suggests.empty()) target.suggests = source.suggests;
+        if (target.breaks.empty()) target.breaks = source.breaks;
+        if (target.conflicts.empty()) target.conflicts = source.conflicts;
+        if (target.replaces.empty()) target.replaces = source.replaces;
+    }
+    if (target.provides.empty()) target.provides = source.provides;
+}
 
 struct Dependency;
 

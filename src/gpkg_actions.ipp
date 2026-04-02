@@ -1618,48 +1618,38 @@ bool get_context_live_installed_package_metadata(
 
     PackageMetadata installed_meta;
     bool have_installed_meta = get_installed_package_metadata(pkg_name, installed_meta);
+    bool installed_relations_exact =
+        have_installed_meta &&
+        package_metadata_relations_match_version_exactly(installed_meta, installed_version);
 
-    PackageMetadata meta;
-    if (get_repo_package_info(pkg_name, meta)) {
-        if (!installed_version.empty()) meta.version = installed_version;
-        if (have_installed_meta) {
-            if (meta.arch.empty()) meta.arch = installed_meta.arch;
-            if (meta.maintainer.empty()) meta.maintainer = installed_meta.maintainer;
-            if (meta.description.empty()) meta.description = installed_meta.description;
-            if (meta.section.empty()) meta.section = installed_meta.section;
-            if (meta.priority.empty()) meta.priority = installed_meta.priority;
-            if (meta.filename.empty()) meta.filename = installed_meta.filename;
-            if (meta.sha256.empty()) meta.sha256 = installed_meta.sha256;
-            if (meta.sha512.empty()) meta.sha512 = installed_meta.sha512;
-            if (meta.source_kind.empty()) meta.source_kind = installed_meta.source_kind;
-            if (meta.source_url.empty()) meta.source_url = installed_meta.source_url;
-            if (meta.debian_package.empty()) meta.debian_package = installed_meta.debian_package;
-            if (meta.debian_version.empty()) meta.debian_version = installed_meta.debian_version;
-            if (meta.package_scope.empty()) meta.package_scope = installed_meta.package_scope;
-            if (meta.installed_from.empty()) meta.installed_from = installed_meta.installed_from;
-            if (meta.size.empty()) meta.size = installed_meta.size;
-            if (meta.installed_size_bytes.empty()) {
-                meta.installed_size_bytes = installed_meta.installed_size_bytes;
-            }
-        }
-        context.live_metadata_cache[pkg_name] = meta;
-        out_meta = meta;
-        return true;
+    PackageMetadata repo_meta;
+    bool have_repo_meta = get_repo_package_info(pkg_name, repo_meta);
+    bool repo_relations_exact =
+        have_repo_meta &&
+        package_metadata_relations_match_version_exactly(repo_meta, installed_version);
+
+    PackageMetadata meta = build_minimal_live_package_metadata(pkg_name, installed_version);
+    if (repo_relations_exact) {
+        meta = repo_meta;
+    } else if (installed_relations_exact) {
+        meta = installed_meta;
     }
 
-    if (have_installed_meta) {
-        if (!installed_version.empty()) installed_meta.version = installed_version;
-        context.live_metadata_cache[pkg_name] = installed_meta;
-        out_meta = installed_meta;
-        return true;
-    }
-
-    meta = {};
     meta.name = pkg_name;
     meta.version = installed_version;
     if (meta.version.empty()) {
         context.missing_live_metadata.insert(pkg_name);
         return false;
+    }
+
+    if (have_installed_meta) {
+        overlay_missing_package_metadata_descriptive_fields(meta, installed_meta);
+    }
+    if (have_repo_meta) {
+        overlay_missing_package_metadata_descriptive_fields(meta, repo_meta);
+        if (!repo_relations_exact && !installed_relations_exact) {
+            overlay_missing_package_metadata_relations(meta, repo_meta, true);
+        }
     }
 
     context.live_metadata_cache[pkg_name] = meta;
@@ -2247,6 +2237,7 @@ InstallCommandResult remove_package_by_name(const std::string& pkg_name, bool ve
         have_native_dpkg &&
         get_dpkg_package_status_record(pkg_name, &dpkg_record) &&
         package_status_is_installed_like(dpkg_record.status)) {
+        ScopedNativeDpkgMaintscriptCompat maintscript_compat(true, verbose);
         ScopedMaintscriptShellOverride maintscript_shell(true, verbose);
         CommandCaptureResult result = run_command_captured_argv(
             build_dpkg_command_argv({"--remove", pkg_name}),
@@ -2273,6 +2264,7 @@ InstallCommandResult purge_package_by_name(const std::string& pkg_name, bool ver
         have_native_dpkg &&
         get_dpkg_package_status_record(pkg_name, &dpkg_record) &&
         (package_status_is_installed_like(dpkg_record.status) || dpkg_record.status == "config-files")) {
+        ScopedNativeDpkgMaintscriptCompat maintscript_compat(true, verbose);
         ScopedMaintscriptShellOverride maintscript_shell(true, verbose);
         CommandCaptureResult result = run_command_captured_argv(
             build_dpkg_command_argv({"--purge", pkg_name}),
@@ -2651,6 +2643,9 @@ InstallCommandResult install_native_debian_batch(
         return {false, "", batch.front().name, 0, ""};
     }
 
+    ScopedNativeDpkgMaintscriptCompat maintscript_compat(true, verbose);
+    ScopedMaintscriptShellOverride maintscript_shell(true, verbose);
+
     InstallCommandResult pending_result = reconcile_pending_native_dpkg_configurations(verbose, &batch);
     if (!pending_result.success) {
         std::cerr << "E: Failed to configure pending Debian packages before starting new batch";
@@ -2730,7 +2725,6 @@ InstallCommandResult install_native_debian_batch(
                      << remaining.size() << " package(s).");
     }
 
-    ScopedMaintscriptShellOverride maintscript_shell(true, verbose);
     InstallCommandResult batch_result;
     for (size_t index : order) {
         const PackageMetadata& meta = batch[index];

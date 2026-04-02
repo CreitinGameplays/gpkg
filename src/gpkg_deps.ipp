@@ -56,45 +56,40 @@ bool get_live_installed_package_metadata(const std::string& pkg_name, PackageMet
 
     PackageMetadata installed_meta;
     bool have_installed_meta = get_installed_package_metadata(pkg_name, installed_meta);
+    bool installed_relations_exact =
+        have_installed_meta &&
+        package_metadata_relations_match_version_exactly(installed_meta, status_record.version);
 
     if (have_live_status) {
         PackageMetadata repo_meta;
-        if (get_repo_package_info(pkg_name, repo_meta)) {
-            if (!status_record.version.empty()) repo_meta.version = status_record.version;
-            if (have_installed_meta) {
-                if (repo_meta.arch.empty()) repo_meta.arch = installed_meta.arch;
-                if (repo_meta.maintainer.empty()) repo_meta.maintainer = installed_meta.maintainer;
-                if (repo_meta.description.empty()) repo_meta.description = installed_meta.description;
-                if (repo_meta.section.empty()) repo_meta.section = installed_meta.section;
-                if (repo_meta.priority.empty()) repo_meta.priority = installed_meta.priority;
-                if (repo_meta.filename.empty()) repo_meta.filename = installed_meta.filename;
-                if (repo_meta.sha256.empty()) repo_meta.sha256 = installed_meta.sha256;
-                if (repo_meta.sha512.empty()) repo_meta.sha512 = installed_meta.sha512;
-                if (repo_meta.source_kind.empty()) repo_meta.source_kind = installed_meta.source_kind;
-                if (repo_meta.source_url.empty()) repo_meta.source_url = installed_meta.source_url;
-                if (repo_meta.debian_package.empty()) repo_meta.debian_package = installed_meta.debian_package;
-                if (repo_meta.debian_version.empty()) repo_meta.debian_version = installed_meta.debian_version;
-                if (repo_meta.package_scope.empty()) repo_meta.package_scope = installed_meta.package_scope;
-                if (repo_meta.installed_from.empty()) repo_meta.installed_from = installed_meta.installed_from;
-                if (repo_meta.size.empty()) repo_meta.size = installed_meta.size;
-                if (repo_meta.installed_size_bytes.empty()) {
-                    repo_meta.installed_size_bytes = installed_meta.installed_size_bytes;
-                }
-            }
-            out_meta = repo_meta;
-            return true;
+        bool have_repo_meta = get_repo_package_info(pkg_name, repo_meta);
+        bool repo_relations_exact =
+            have_repo_meta &&
+            package_metadata_relations_match_version_exactly(repo_meta, status_record.version);
+
+        PackageMetadata meta = build_minimal_live_package_metadata(pkg_name, status_record.version);
+        if (repo_relations_exact) {
+            meta = repo_meta;
+        } else if (installed_relations_exact) {
+            meta = installed_meta;
         }
+
+        meta.name = pkg_name;
+        meta.version = status_record.version;
+        if (meta.version.empty()) return false;
 
         if (have_installed_meta) {
-            if (!status_record.version.empty()) installed_meta.version = status_record.version;
-            out_meta = installed_meta;
-            return true;
+            overlay_missing_package_metadata_descriptive_fields(meta, installed_meta);
+        }
+        if (have_repo_meta) {
+            overlay_missing_package_metadata_descriptive_fields(meta, repo_meta);
+            if (!repo_relations_exact && !installed_relations_exact) {
+                overlay_missing_package_metadata_relations(meta, repo_meta, true);
+            }
         }
 
-        out_meta = {};
-        out_meta.name = pkg_name;
-        out_meta.version = status_record.version;
-        return !out_meta.version.empty();
+        out_meta = meta;
+        return true;
     }
 
     if (have_installed_meta) {
