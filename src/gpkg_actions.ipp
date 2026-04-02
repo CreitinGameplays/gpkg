@@ -41,6 +41,7 @@ bool is_native_dpkg_compat_placeholder_version(
     const std::string& version,
     const ImportPolicy& policy
 );
+bool package_name_is_debian_control_sidecar_package(const std::string& pkg_name);
 std::string resolve_context_synthetic_live_version(
     const std::string& pkg_name,
     const std::string& raw_version,
@@ -260,18 +261,28 @@ std::string resolve_context_synthetic_live_version(
     return version;
 }
 
+bool paragraph_line_has_field_key(const std::string& line, const std::string& key) {
+    size_t colon = line.find(':');
+    if (colon == std::string::npos) return false;
+    return trim(line.substr(0, colon)) == key;
+}
+
 std::vector<std::string> collect_registered_package_names_from_status_records(
     const std::vector<PackageStatusRecord>& status_records
 ) {
     std::set<std::string> package_names;
     std::map<std::string, std::string> status_by_package;
     for (const auto& record : status_records) {
-        if (record.package.empty()) continue;
+        if (record.package.empty() ||
+            package_name_is_debian_control_sidecar_package(record.package)) {
+            continue;
+        }
         status_by_package[record.package] = record.status;
         if (!package_status_is_installed_like(record.status)) continue;
         package_names.insert(record.package);
     }
     for (const auto& pkg : get_installed_packages(".json")) {
+        if (package_name_is_debian_control_sidecar_package(pkg)) continue;
         auto status_it = status_by_package.find(pkg);
         if (status_it != status_by_package.end() &&
             !package_status_is_installed_like(status_it->second)) {
@@ -280,6 +291,7 @@ std::vector<std::string> collect_registered_package_names_from_status_records(
         package_names.insert(pkg);
     }
     for (const auto& pkg : get_installed_packages(".list")) {
+        if (package_name_is_debian_control_sidecar_package(pkg)) continue;
         auto status_it = status_by_package.find(pkg);
         if (status_it != status_by_package.end() &&
             !package_status_is_installed_like(status_it->second)) {
@@ -296,8 +308,14 @@ struct NativeDpkgBootstrapEntry {
     PackageStatusRecord status;
     PackageMetadata meta;
     std::string multi_arch;
+    bool emit_solver_relations = true;
     std::set<std::string> files;
 };
+
+bool package_name_is_debian_control_sidecar_package(const std::string& pkg_name) {
+    return pkg_name.size() > 7 &&
+           pkg_name.compare(pkg_name.size() - 7, 7, ".debctl") == 0;
+}
 
 std::string normalize_dpkg_architecture_name(const std::string& raw_arch) {
     std::string arch = ascii_lower_copy(trim(raw_arch));
@@ -528,7 +546,8 @@ void seed_native_dpkg_bootstrap_entry(
     const PackageMetadata* meta,
     const PackageStatusRecord* status_record,
     const std::vector<std::string>* files,
-    const std::string& fallback_version = ""
+    const std::string& fallback_version = "",
+    bool emit_solver_relations = true
 ) {
     std::string dpkg_name = source_pkg_name;
     if (meta) {
@@ -538,6 +557,7 @@ void seed_native_dpkg_bootstrap_entry(
     if (dpkg_name.empty()) return;
 
     NativeDpkgBootstrapEntry& entry = ensure_native_dpkg_bootstrap_entry(entries, dpkg_name);
+    if (!emit_solver_relations) entry.emit_solver_relations = false;
     if (meta) merge_bootstrap_metadata(entry, *meta, source_pkg_name);
     if (entry.multi_arch.empty()) {
         entry.multi_arch = resolve_native_dpkg_bootstrap_multi_arch(dpkg_name, meta, false);
@@ -788,7 +808,8 @@ bool repair_native_dpkg_status_database(bool verbose, std::string* error_out) {
         if (!pkg_name.empty()) {
             PackageMetadata resolved_meta;
             bool have_resolved_meta = false;
-            if (native_dpkg_package_looks_synthetic(pkg_name)) {
+            bool synthetic_package = native_dpkg_package_looks_synthetic(pkg_name);
+            if (synthetic_package) {
                 std::string target_pkg_name = resolve_native_dpkg_bootstrap_name(pkg_name, &resolved_meta);
                 have_resolved_meta = !resolved_meta.name.empty();
                 if (!target_pkg_name.empty() &&
@@ -807,7 +828,8 @@ bool repair_native_dpkg_status_database(bool verbose, std::string* error_out) {
             }
 
             std::string effective_version = version;
-            if (native_dpkg_package_looks_synthetic(pkg_name)) {
+            synthetic_package = native_dpkg_package_looks_synthetic(pkg_name);
+            if (synthetic_package) {
                 if (!have_resolved_meta) {
                     have_resolved_meta = !resolve_native_dpkg_bootstrap_name(pkg_name, &resolved_meta).empty() &&
                         !resolved_meta.name.empty();
@@ -825,6 +847,23 @@ bool repair_native_dpkg_status_database(bool verbose, std::string* error_out) {
                 if (!resolved_version.empty() &&
                     is_native_dpkg_compat_placeholder_version(pkg_name, effective_version, policy)) {
                     effective_version = resolved_version;
+                }
+            }
+
+            if (synthetic_package) {
+                auto new_end = std::remove_if(
+                    paragraph.begin(),
+                    paragraph.end(),
+                    [&](const std::string& line) {
+                        return paragraph_line_has_field_key(line, "Depends") ||
+                               paragraph_line_has_field_key(line, "Breaks") ||
+                               paragraph_line_has_field_key(line, "Conflicts") ||
+                               paragraph_line_has_field_key(line, "Replaces");
+                    }
+                );
+                if (new_end != paragraph.end()) {
+                    paragraph.erase(new_end, paragraph.end());
+                    changed = true;
                 }
             }
 
@@ -1254,7 +1293,9 @@ bool bootstrap_native_dpkg_status_database(bool verbose, std::string* error_out)
             pkg_name,
             have_meta ? &meta : nullptr,
             record_ptr,
-            &files
+            &files,
+            "",
+            true
         );
     }
 
@@ -1284,7 +1325,8 @@ bool bootstrap_native_dpkg_status_database(bool verbose, std::string* error_out)
             have_meta ? &meta : nullptr,
             &record,
             &base_entry.files,
-            base_entry.version
+            base_entry.version,
+            false
         );
     }
 
@@ -1319,7 +1361,8 @@ bool bootstrap_native_dpkg_status_database(bool verbose, std::string* error_out)
             have_meta ? &meta : nullptr,
             nullptr,
             &files,
-            fallback_version
+            fallback_version,
+            false
         );
     }
 
@@ -1391,19 +1434,19 @@ bool bootstrap_native_dpkg_status_database(bool verbose, std::string* error_out)
         if (!installed_size_field.empty()) {
             status_stream << "Installed-Size: " << installed_size_field << "\n";
         }
-        if (!entry.meta.depends.empty()) {
+        if (entry.emit_solver_relations && !entry.meta.depends.empty()) {
             status_stream << "Depends: " << join_strings(entry.meta.depends) << "\n";
         }
         if (!entry.meta.provides.empty()) {
             status_stream << "Provides: " << join_strings(entry.meta.provides) << "\n";
         }
-        if (!entry.meta.breaks.empty()) {
+        if (entry.emit_solver_relations && !entry.meta.breaks.empty()) {
             status_stream << "Breaks: " << join_strings(entry.meta.breaks) << "\n";
         }
-        if (!entry.meta.conflicts.empty()) {
+        if (entry.emit_solver_relations && !entry.meta.conflicts.empty()) {
             status_stream << "Conflicts: " << join_strings(entry.meta.conflicts) << "\n";
         }
-        if (!entry.meta.replaces.empty()) {
+        if (entry.emit_solver_relations && !entry.meta.replaces.empty()) {
             status_stream << "Replaces: " << join_strings(entry.meta.replaces) << "\n";
         }
         status_stream << "Description: " << description << "\n\n";
@@ -1539,23 +1582,49 @@ bool get_context_live_installed_package_metadata(
     }
     if (context.missing_live_metadata.count(pkg_name) != 0) return false;
 
+    std::string installed_version;
+    bool have_live_version =
+        get_local_installed_package_version(pkg_name, &installed_version, &context);
+    if (!have_live_version) {
+        context.missing_live_metadata.insert(pkg_name);
+        return false;
+    }
+
+    PackageMetadata installed_meta;
+    bool have_installed_meta = get_installed_package_metadata(pkg_name, installed_meta);
+
     PackageMetadata meta;
-    if (get_installed_package_metadata(pkg_name, meta)) {
+    if (get_repo_package_info(pkg_name, meta)) {
+        if (!installed_version.empty()) meta.version = installed_version;
+        if (have_installed_meta) {
+            if (meta.arch.empty()) meta.arch = installed_meta.arch;
+            if (meta.maintainer.empty()) meta.maintainer = installed_meta.maintainer;
+            if (meta.description.empty()) meta.description = installed_meta.description;
+            if (meta.section.empty()) meta.section = installed_meta.section;
+            if (meta.priority.empty()) meta.priority = installed_meta.priority;
+            if (meta.filename.empty()) meta.filename = installed_meta.filename;
+            if (meta.sha256.empty()) meta.sha256 = installed_meta.sha256;
+            if (meta.sha512.empty()) meta.sha512 = installed_meta.sha512;
+            if (meta.source_kind.empty()) meta.source_kind = installed_meta.source_kind;
+            if (meta.source_url.empty()) meta.source_url = installed_meta.source_url;
+            if (meta.debian_package.empty()) meta.debian_package = installed_meta.debian_package;
+            if (meta.debian_version.empty()) meta.debian_version = installed_meta.debian_version;
+            if (meta.package_scope.empty()) meta.package_scope = installed_meta.package_scope;
+            if (meta.installed_from.empty()) meta.installed_from = installed_meta.installed_from;
+            if (meta.size.empty()) meta.size = installed_meta.size;
+            if (meta.installed_size_bytes.empty()) {
+                meta.installed_size_bytes = installed_meta.installed_size_bytes;
+            }
+        }
         context.live_metadata_cache[pkg_name] = meta;
         out_meta = meta;
         return true;
     }
 
-    std::string installed_version;
-    if (!get_local_installed_package_version(pkg_name, &installed_version, &context)) {
-        context.missing_live_metadata.insert(pkg_name);
-        return false;
-    }
-
-    if (get_repo_package_info(pkg_name, meta)) {
-        if (!installed_version.empty()) meta.version = installed_version;
-        context.live_metadata_cache[pkg_name] = meta;
-        out_meta = meta;
+    if (have_installed_meta) {
+        if (!installed_version.empty()) installed_meta.version = installed_version;
+        context.live_metadata_cache[pkg_name] = installed_meta;
+        out_meta = installed_meta;
         return true;
     }
 
@@ -4106,7 +4175,7 @@ bool get_live_package_metadata_for_upgrade_resolution(
     if (context && get_context_live_installed_package_metadata(*context, pkg_name, out_meta)) {
         return true;
     }
-    return get_installed_package_metadata(pkg_name, out_meta);
+    return get_live_installed_package_metadata(pkg_name, out_meta);
 }
 
 bool resolve_upgrade_target_metadata(
