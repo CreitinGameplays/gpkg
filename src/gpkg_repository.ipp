@@ -1022,7 +1022,10 @@ std::string build_upgrade_catalog_fingerprint() {
     return "v1|" +
         upgrade_catalog_file_fingerprint_component(get_repo_catalog_state_path()) + "|" +
         upgrade_catalog_file_fingerprint_component(IMPORT_POLICY_PATH) + "|" +
-        upgrade_catalog_file_fingerprint_component(UPGRADE_COMPANIONS_PATH);
+        upgrade_catalog_file_fingerprint_component(UPGRADE_COMPANIONS_PATH) + "|" +
+        upgrade_catalog_file_fingerprint_component(BASE_SYSTEM_REGISTRY_PATH) + "|" +
+        upgrade_catalog_file_fingerprint_component(SYSTEM_PROVIDES_PATH) + "|" +
+        upgrade_catalog_file_fingerprint_component(UPGRADEABLE_SYSTEM_PATH);
 }
 
 std::set<std::string> load_present_base_registry_package_names() {
@@ -1666,57 +1669,26 @@ bool load_upgrade_catalog(
 
     JsonValue root;
     if (!load_json_document(UPGRADE_CATALOG_PATH, root)) {
-        std::string rebuild_error;
-        if (ensure_current_upgrade_catalog(verbose, &rebuild_error) &&
-            load_json_document(UPGRADE_CATALOG_PATH, root)) {
-            // Rebuilt on demand.
-        } else {
-            if (problem_out) {
-                if (!rebuild_error.empty()) {
-                    *problem_out = rebuild_error;
-                } else if (access(UPGRADE_CATALOG_PATH.c_str(), F_OK) == 0) {
-                    *problem_out = "upgrade catalog is unreadable; run 'gpkg update'";
-                } else {
-                    *problem_out = "upgrade catalog is missing; run 'gpkg update'";
-                }
+        if (problem_out) {
+            if (access(UPGRADE_CATALOG_PATH.c_str(), F_OK) == 0) {
+                *problem_out = "upgrade catalog is unreadable; run 'gpkg update'";
+            } else {
+                *problem_out = "upgrade catalog is missing; run 'gpkg update'";
             }
-            return false;
         }
+        return false;
     }
 
     out_catalog.fingerprint = json_string_or(json_object_get(root, "fingerprint"));
     if (out_catalog.fingerprint.empty()) {
-        std::string rebuild_error;
-        if (!ensure_current_upgrade_catalog(verbose, &rebuild_error) ||
-            !load_json_document(UPGRADE_CATALOG_PATH, root)) {
-            if (problem_out) {
-                *problem_out = rebuild_error.empty()
-                    ? "upgrade catalog is missing its fingerprint; run 'gpkg update'"
-                    : rebuild_error;
-            }
-            return false;
-        }
-        out_catalog.fingerprint = json_string_or(json_object_get(root, "fingerprint"));
+        if (problem_out) *problem_out = "upgrade catalog is missing its fingerprint; run 'gpkg update'";
+        return false;
     }
 
     std::string expected_fingerprint = build_upgrade_catalog_fingerprint();
     if (out_catalog.fingerprint != expected_fingerprint) {
-        std::string rebuild_error;
-        if (!ensure_current_upgrade_catalog(verbose, &rebuild_error) ||
-            !load_json_document(UPGRADE_CATALOG_PATH, root)) {
-            if (problem_out) {
-                *problem_out = rebuild_error.empty()
-                    ? "upgrade catalog is stale; run 'gpkg update'"
-                    : rebuild_error;
-            }
-            return false;
-        }
-
-        out_catalog.fingerprint = json_string_or(json_object_get(root, "fingerprint"));
-        if (out_catalog.fingerprint != expected_fingerprint) {
-            if (problem_out) *problem_out = "upgrade catalog is stale; run 'gpkg update'";
-            return false;
-        }
+        if (problem_out) *problem_out = "upgrade catalog is stale; run 'gpkg update'";
+        return false;
     }
 
     out_catalog.resolved_roots = json_string_array(json_object_get(root, "resolved_roots"));

@@ -4373,11 +4373,15 @@ bool ensure_raw_debian_context_loaded(
     context.policy = get_import_policy(verbose);
     context.compiled_cache_path = get_debian_compiled_record_cache_path();
 
-    std::string import_prepare_error;
-    if (!ensure_current_debian_imported_index_cache(verbose, &import_prepare_error)) {
-        context.problem = import_prepare_error.empty()
-            ? "cached Debian metadata is stale or incomplete; run 'gpkg update'"
-            : import_prepare_error;
+    std::string packages_txt = get_debian_packages_cache_path();
+    if (access(packages_txt.c_str(), F_OK) != 0) {
+        context.problem = "cached Debian metadata is unavailable; run 'gpkg update'";
+        if (error_out) *error_out = context.problem;
+        return false;
+    }
+    if (!debian_imported_index_cache_is_current(packages_txt) ||
+        !debian_compiled_record_cache_is_current()) {
+        context.problem = "cached Debian metadata is stale or incomplete; run 'gpkg update'";
         if (error_out) *error_out = context.problem;
         return false;
     }
@@ -4390,21 +4394,12 @@ bool ensure_raw_debian_context_loaded(
             &index_error
         )) {
         VLOG(verbose, "Raw Debian context index unavailable: " << index_error);
-        std::string rebuild_error;
-        if (!rebuild_debian_raw_context_index(verbose, &rebuild_error) ||
-            !load_debian_raw_context_index(
-                context.raw_package_offsets,
-                context.import_name_to_raw_names,
-                context.provider_map,
-                &index_error
-            )) {
-            context.problem = rebuild_error.empty() ? index_error : rebuild_error;
-            if (context.problem.empty()) {
-                context.problem = "cached Debian metadata is stale or incomplete; run 'gpkg update'";
-            }
-            if (error_out) *error_out = context.problem;
-            return false;
+        context.problem = index_error;
+        if (context.problem.empty()) {
+            context.problem = "cached Debian metadata is stale or incomplete; run 'gpkg update'";
         }
+        if (error_out) *error_out = context.problem;
+        return false;
     }
 
     context.available = true;
