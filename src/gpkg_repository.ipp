@@ -1807,12 +1807,8 @@ bool ensure_repo_index_available() {
     auto urls = get_repo_urls();
     if (repo_catalog_matches_current_sources(urls)) return true;
 
-    std::string build_error;
-    if (build_current_repo_catalog(false, &build_error)) return true;
-
     std::cerr << Color::RED
-              << "E: No package index available. "
-              << (build_error.empty() ? "Run 'gpkg update' first." : build_error)
+              << "E: Local package index is missing or stale. Run 'gpkg update' first."
               << Color::RESET << std::endl;
     return false;
 }
