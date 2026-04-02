@@ -6,6 +6,7 @@
 #include "gpkg_debian.ipp"
 #include "gpkg_repository.ipp"
 #include "gpkg_deps.ipp"
+#include "gpkg_libapt.ipp"
 #include "gpkg_downloads.ipp"
 #include "gpkg_actions.ipp"
 #include "gpkg_cli.ipp"

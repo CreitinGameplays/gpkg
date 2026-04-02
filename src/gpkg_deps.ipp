@@ -33,6 +33,7 @@ bool get_installed_package_metadata(const std::string& pkg_name, PackageMetadata
     get_json_value(content, "installed_from", out_meta.installed_from);
     get_json_value(content, "size", out_meta.size);
     get_json_value(content, "installed_size_bytes", out_meta.installed_size_bytes);
+    get_json_array(content, "pre_depends", out_meta.pre_depends);
     get_json_array(content, "depends", out_meta.depends);
     get_json_array(content, "recommends", out_meta.recommends);
     get_json_array(content, "suggests", out_meta.suggests);
@@ -531,7 +532,7 @@ std::string find_provider(const std::string& capability, const std::string& op, 
     return result;
 }
 
-bool resolve_dependencies(
+bool resolve_dependencies_legacy(
     const std::string& pkg,
     const std::string& op,
     const std::string& req_version,
@@ -662,7 +663,7 @@ bool resolve_dependencies(
                      << " from the "
                      << (universe_result.raw_only ? "full cached Debian" : "repository")
                      << " universe");
-        return resolve_dependencies(
+        return resolve_dependencies_legacy(
             meta.name,
             "",
             "",
@@ -694,6 +695,9 @@ bool resolve_dependencies(
 
     VLOG(verbose, "Found " << canonical_pkg << " in repository (version: " << meta.version << ")");
     if (verbose) {
+        if (!meta.pre_depends.empty()) {
+            VLOG(verbose, canonical_pkg << " pre-depends on: " << join_strings(meta.pre_depends));
+        }
         if (!meta.depends.empty()) {
             VLOG(verbose, canonical_pkg << " depends on: " << join_strings(meta.depends));
         }
@@ -720,7 +724,7 @@ bool resolve_dependencies(
         if (dep.name.empty()) continue;
 
         if (!transaction_dependency_is_optional(edge.kind)) {
-            if (!resolve_dependencies(
+            if (!resolve_dependencies_legacy(
                     dep.name,
                     dep.op,
                     dep.version,
@@ -742,7 +746,7 @@ bool resolve_dependencies(
 
         auto optional_queue = install_queue;
         auto optional_visited = visited;
-        if (!resolve_dependencies(
+        if (!resolve_dependencies_legacy(
                 dep.name,
                 dep.op,
                 dep.version,
@@ -773,6 +777,43 @@ bool resolve_dependencies(
     VLOG(verbose, "Adding " << canonical_pkg << " to installation queue.");
     install_queue.push_back(meta);
     return true;
+}
+
+bool resolve_dependencies(
+    const std::string& pkg,
+    const std::string& op,
+    const std::string& req_version,
+    std::vector<PackageMetadata>& install_queue,
+    std::set<std::string>& visited,
+    const std::set<std::string>& installed_cache,
+    bool verbose,
+    bool force_queue_requested = false,
+    UpgradeContext* context = nullptr,
+    bool suppress_errors = false,
+    RawDebianContext* raw_context = nullptr,
+    std::string* failure_reason_out = nullptr,
+    bool prefer_native_dpkg = false
+) {
+    DebianBackendSelection backend = select_debian_backend(
+        DebianBackendOperation::ResolveDependencies,
+        verbose
+    );
+    maybe_log_debian_backend_selection(backend, DebianBackendOperation::ResolveDependencies, verbose);
+    return resolve_dependencies_legacy(
+        pkg,
+        op,
+        req_version,
+        install_queue,
+        visited,
+        installed_cache,
+        verbose,
+        force_queue_requested,
+        context,
+        suppress_errors,
+        raw_context,
+        failure_reason_out,
+        prefer_native_dpkg
+    );
 }
 
 struct TransactionRetirement {
@@ -807,6 +848,18 @@ bool relation_matches_package(
     return canonicalize_package_name(pkg_name) == dep.name;
 }
 
+bool relation_matches_concrete_package(
+    const std::string& relation,
+    const std::string& pkg_name,
+    const PackageMetadata* pkg_meta = nullptr
+) {
+    Dependency dep = parse_relation_constraint(relation);
+    if (dep.name.empty()) return false;
+    if (canonicalize_package_name(pkg_name) != dep.name) return false;
+    if (!pkg_meta) return dep.op.empty();
+    return version_satisfies(pkg_meta->version, dep.op, dep.version);
+}
+
 bool relation_list_matches_package(
     const std::vector<std::string>& relations,
     const std::string& pkg_name,
@@ -814,6 +867,17 @@ bool relation_list_matches_package(
 ) {
     for (const auto& relation : relations) {
         if (relation_matches_package(relation, pkg_name, pkg_meta)) return true;
+    }
+    return false;
+}
+
+bool relation_list_matches_concrete_package(
+    const std::vector<std::string>& relations,
+    const std::string& pkg_name,
+    const PackageMetadata* pkg_meta = nullptr
+) {
+    for (const auto& relation : relations) {
+        if (relation_matches_concrete_package(relation, pkg_name, pkg_meta)) return true;
     }
     return false;
 }
@@ -831,7 +895,7 @@ bool package_breaks_package(
     const std::string& pkg_name,
     const PackageMetadata* pkg_meta = nullptr
 ) {
-    return relation_list_matches_package(meta.breaks, pkg_name, pkg_meta);
+    return relation_list_matches_concrete_package(meta.breaks, pkg_name, pkg_meta);
 }
 
 bool package_replaces_package(
@@ -839,7 +903,7 @@ bool package_replaces_package(
     const std::string& pkg_name,
     const PackageMetadata* pkg_meta = nullptr
 ) {
-    return relation_list_matches_package(meta.replaces, pkg_name, pkg_meta);
+    return relation_list_matches_concrete_package(meta.replaces, pkg_name, pkg_meta);
 }
 
 void sort_transaction_queue_for_install(
@@ -1030,7 +1094,7 @@ void sort_transaction_queue_for_install(
     queue.swap(ordered);
 }
 
-bool build_transaction_plan(
+bool build_transaction_plan_legacy(
     const std::vector<PackageMetadata>& queue,
     const std::set<std::string>& installed,
     bool verbose,
@@ -1224,6 +1288,29 @@ bool build_transaction_plan(
                      << " queued packages.");
     }
     return true;
+}
+
+bool build_transaction_plan(
+    const std::vector<PackageMetadata>& queue,
+    const std::set<std::string>& installed,
+    bool verbose,
+    TransactionPlan& out_plan,
+    UpgradeContext* context = nullptr,
+    std::string* error_out = nullptr
+) {
+    DebianBackendSelection backend = select_debian_backend(
+        DebianBackendOperation::BuildTransactionPlan,
+        verbose
+    );
+    maybe_log_debian_backend_selection(backend, DebianBackendOperation::BuildTransactionPlan, verbose);
+    return build_transaction_plan_legacy(
+        queue,
+        installed,
+        verbose,
+        out_plan,
+        context,
+        error_out
+    );
 }
 
 bool check_conflicts(const std::vector<PackageMetadata>& queue, const std::set<std::string>& installed, bool verbose) {

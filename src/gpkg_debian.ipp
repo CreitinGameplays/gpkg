@@ -105,6 +105,7 @@ struct DebianStanzaSpan {
 struct ImportedPackageDependencyState {
     std::string name;
     std::string version;
+    std::vector<std::string> pre_depends;
     std::vector<std::string> depends;
     std::vector<std::string> recommends;
     std::vector<std::string> suggests;
@@ -975,6 +976,7 @@ std::string package_metadata_to_json(const PackageMetadata& meta) {
     fields.push_back(json_string_field("maintainer", meta.maintainer));
     fields.push_back(json_string_field("description", meta.description));
     fields.push_back(json_string_field("package_scope", meta.package_scope));
+    fields.push_back("\"pre_depends\":" + json_array_from_strings(meta.pre_depends));
     fields.push_back("\"depends\":" + json_array_from_strings(meta.depends));
     fields.push_back("\"recommends\":" + json_array_from_strings(meta.recommends));
     fields.push_back("\"suggests\":" + json_array_from_strings(meta.suggests));
@@ -1029,12 +1031,12 @@ std::string debian_search_preview_to_json(const DebianSearchPreviewEntry& entry)
     return out.str();
 }
 
-const uint32_t DEBIAN_COMPILED_CACHE_VERSION = 2;
+const uint32_t DEBIAN_COMPILED_CACHE_VERSION = 3;
 const char DEBIAN_PARSED_RECORD_CACHE_MAGIC[8] = {'G','P','K','R','A','W','2','\0'};
-const char DEBIAN_COMPILED_RECORD_CACHE_MAGIC[8] = {'G','P','K','R','E','C','2','\0'};
+const char DEBIAN_COMPILED_RECORD_CACHE_MAGIC[8] = {'G','P','K','R','E','C','3','\0'};
 const char DEBIAN_RAW_CONTEXT_INDEX_MAGIC[8] = {'G','P','K','R','I','D','1','\0'};
-const char DEBIAN_IMPORTED_CACHE_MAGIC[8] = {'G','P','K','I','M','P','2','\0'};
-const char DEBIAN_PREVIEW_CACHE_MAGIC[8] = {'G','P','K','P','R','V','2','\0'};
+const char DEBIAN_IMPORTED_CACHE_MAGIC[8] = {'G','P','K','I','M','P','3','\0'};
+const char DEBIAN_PREVIEW_CACHE_MAGIC[8] = {'G','P','K','P','R','V','3','\0'};
 
 bool should_export_legacy_debian_json_caches() {
     const char* env = getenv("GPKG_EXPORT_LEGACY_DEBIAN_JSON_CACHE");
@@ -1170,6 +1172,7 @@ bool write_package_metadata_binary(std::ostream& out, const PackageMetadata& met
         write_binary_string(out, meta.installed_from) &&
         write_binary_string(out, meta.size) &&
         write_binary_string(out, meta.installed_size_bytes) &&
+        write_binary_string_vector(out, meta.pre_depends) &&
         write_binary_string_vector(out, meta.depends) &&
         write_binary_string_vector(out, meta.recommends) &&
         write_binary_string_vector(out, meta.suggests) &&
@@ -1200,6 +1203,7 @@ bool read_package_metadata_binary(std::istream& in, PackageMetadata& meta) {
         read_binary_string(in, meta.installed_from) &&
         read_binary_string(in, meta.size) &&
         read_binary_string(in, meta.installed_size_bytes) &&
+        read_binary_string_vector(in, meta.pre_depends) &&
         read_binary_string_vector(in, meta.depends) &&
         read_binary_string_vector(in, meta.recommends) &&
         read_binary_string_vector(in, meta.suggests) &&
@@ -1873,6 +1877,7 @@ ImportedPackageDependencyState build_imported_dependency_state(
     ImportedPackageDependencyState state;
     state.name = meta.name;
     state.version = meta.version;
+    state.pre_depends = meta.pre_depends;
     state.depends = meta.depends;
     state.recommends = meta.recommends;
     state.suggests = meta.suggests;
@@ -1919,7 +1924,7 @@ std::vector<std::string> find_missing_imported_required_dependencies(
 ) {
     std::vector<std::string> missing;
 
-    for (const auto& dep_str : meta.depends) {
+    for (const auto& dep_str : collect_required_transaction_dependency_edges(meta)) {
         if (!imported_dependency_relation_is_available(dep_str, selected, dependency_index)) {
             missing.push_back(dep_str);
         }
@@ -2136,6 +2141,11 @@ void prune_imported_packages_with_missing_required_dependencies(
 
                 const auto& entry = *entries[entry_index];
                 std::vector<std::string> missing;
+                for (const auto& dep_str : entry.second.pre_depends) {
+                    if (!imported_dependency_relation_is_available(dep_str, selected, dependency_index)) {
+                        missing.push_back(dep_str);
+                    }
+                }
                 for (const auto& dep_str : entry.second.depends) {
                     if (!imported_dependency_relation_is_available(dep_str, selected, dependency_index)) {
                         missing.push_back(dep_str);
@@ -2243,22 +2253,22 @@ bool build_debian_package_metadata(
     bool include_recommends = true;
     if (package_override.has_include_recommends) include_recommends = package_override.include_recommends;
 
-    std::string required_dependency_text;
-    if (!record.pre_depends_raw.empty()) required_dependency_text += record.pre_depends_raw;
-    if (!record.depends_raw.empty()) {
-        if (!required_dependency_text.empty()) required_dependency_text += ", ";
-        required_dependency_text += record.depends_raw;
-    }
-    required_dependency_text = apply_dependency_removals_to_raw_value(
-        required_dependency_text,
+    std::string pre_dependency_text = apply_dependency_removals_to_raw_value(
+        record.pre_depends_raw,
+        package_override,
+        config.apt_arch,
+        policy
+    );
+    std::string dependency_text = apply_dependency_removals_to_raw_value(
+        record.depends_raw,
         package_override,
         config.apt_arch,
         policy
     );
 
     std::vector<std::string> unresolved_required_groups;
-    std::vector<std::string> depends = normalize_dependency_relation_value(
-        required_dependency_text,
+    std::vector<std::string> pre_depends = normalize_dependency_relation_value(
+        pre_dependency_text,
         record.package,
         config.apt_arch,
         false,
@@ -2267,6 +2277,23 @@ bool build_debian_package_metadata(
         provider_map,
         system_drop_patterns,
         &unresolved_required_groups
+    );
+    std::vector<std::string> unresolved_dependency_groups;
+    std::vector<std::string> depends = normalize_dependency_relation_value(
+        dependency_text,
+        record.package,
+        config.apt_arch,
+        false,
+        policy,
+        available_packages,
+        provider_map,
+        system_drop_patterns,
+        &unresolved_dependency_groups
+    );
+    unresolved_required_groups.insert(
+        unresolved_required_groups.end(),
+        unresolved_dependency_groups.begin(),
+        unresolved_dependency_groups.end()
     );
     if (!unresolved_required_groups.empty()) {
         if (skip_reason_out) {
@@ -2280,6 +2307,7 @@ bool build_debian_package_metadata(
         }
         return false;
     }
+    pre_depends = apply_dependency_removals(pre_depends, package_override);
     for (const auto& dep : package_override.depends_add) depends.push_back(dep);
     depends = apply_dependency_removals(depends, package_override);
     std::vector<std::string> recommends = apply_dependency_removals(
@@ -2334,6 +2362,7 @@ bool build_debian_package_metadata(
     meta.priority = record.priority;
     meta.size = record.size;
     meta.installed_size_bytes = debian_installed_size_kib_to_bytes_string(record.installed_size);
+    meta.pre_depends = pre_depends;
     meta.depends = depends;
     meta.recommends = recommends;
     meta.suggests = suggests;
@@ -2374,22 +2403,22 @@ bool build_debian_package_metadata(
     bool include_recommends = true;
     if (package_override.has_include_recommends) include_recommends = package_override.include_recommends;
 
-    std::string required_dependency_text;
-    if (!record.pre_depends_raw.empty()) required_dependency_text += record.pre_depends_raw;
-    if (!record.depends_raw.empty()) {
-        if (!required_dependency_text.empty()) required_dependency_text += ", ";
-        required_dependency_text += record.depends_raw;
-    }
-    required_dependency_text = apply_dependency_removals_to_raw_value(
-        required_dependency_text,
+    std::string pre_dependency_text = apply_dependency_removals_to_raw_value(
+        record.pre_depends_raw,
+        package_override,
+        config.apt_arch,
+        policy
+    );
+    std::string dependency_text = apply_dependency_removals_to_raw_value(
+        record.depends_raw,
         package_override,
         config.apt_arch,
         policy
     );
 
     std::vector<std::string> unresolved_required_groups;
-    std::vector<std::string> depends = normalize_dependency_relation_value(
-        required_dependency_text,
+    std::vector<std::string> pre_depends = normalize_dependency_relation_value(
+        pre_dependency_text,
         record.package,
         config.apt_arch,
         false,
@@ -2398,6 +2427,23 @@ bool build_debian_package_metadata(
         provider_map,
         system_drop_patterns,
         &unresolved_required_groups
+    );
+    std::vector<std::string> unresolved_dependency_groups;
+    std::vector<std::string> depends = normalize_dependency_relation_value(
+        dependency_text,
+        record.package,
+        config.apt_arch,
+        false,
+        policy,
+        available_packages,
+        provider_map,
+        system_drop_patterns,
+        &unresolved_dependency_groups
+    );
+    unresolved_required_groups.insert(
+        unresolved_required_groups.end(),
+        unresolved_dependency_groups.begin(),
+        unresolved_dependency_groups.end()
     );
     if (!unresolved_required_groups.empty()) {
         if (skip_reason_out) {
@@ -2411,6 +2457,7 @@ bool build_debian_package_metadata(
         }
         return false;
     }
+    pre_depends = apply_dependency_removals(pre_depends, package_override);
     for (const auto& dep : package_override.depends_add) depends.push_back(dep);
     depends = apply_dependency_removals(depends, package_override);
     std::vector<std::string> recommends = apply_dependency_removals(
@@ -2465,6 +2512,7 @@ bool build_debian_package_metadata(
     meta.priority = record.priority;
     meta.size = record.size;
     meta.installed_size_bytes = debian_installed_size_kib_to_bytes_string(record.installed_size);
+    meta.pre_depends = pre_depends;
     meta.depends = depends;
     meta.recommends = recommends;
     meta.suggests = suggests;
@@ -2859,13 +2907,12 @@ DebianIncrementalImportResult load_debian_index_entries_from_current_parsed_cach
 ) {
     DebianIncrementalImportResult result;
 
-    DebianParsedRecordCacheState parsed_state;
     std::string parsed_error;
     if (!ensure_current_debian_parsed_record_cache(
             packages_path,
             config,
             verbose,
-            &parsed_state,
+            nullptr,
             nullptr,
             &parsed_error
         )) {
@@ -2990,50 +3037,6 @@ DebianIncrementalImportResult load_debian_index_entries_from_current_parsed_cach
             }
             return result;
         }
-    }
-
-    if (full_rebuild) {
-        if (verbose) {
-            std::cout << "[DEBUG] Loading Debian parsed records into memory so the compiled-record"
-                      << " cache rebuild can run in parallel." << std::endl;
-            if (!have_previous_cache && !cache_problem.empty()) {
-                std::cout << "[DEBUG] "
-                          << describe_debian_cache_rebuild_reason(
-                                 "Debian compiled record cache",
-                                 cache_problem
-                             )
-                          << std::endl;
-            }
-        }
-
-        std::vector<DebianPackageRecord> records;
-        if (parsed_state.record_count > 0) records.reserve(parsed_state.record_count);
-
-        std::string records_error;
-        if (!foreach_current_debian_parsed_record(
-                packages_path,
-                config,
-                [&](const DebianPackageRecord& record) {
-                    records.push_back(record);
-                    return true;
-                },
-                nullptr,
-                &records_error
-            )) {
-            if (verbose && !records_error.empty()) {
-                std::cout << "[DEBUG] Failed while loading Debian parsed records for the"
-                          << " parallel compiled-cache rebuild: "
-                          << records_error << std::endl;
-            }
-            return result;
-        }
-
-        return load_debian_index_entries_from_records_incremental(
-            records,
-            config,
-            policy,
-            verbose
-        );
     }
 
     if (verbose) {
@@ -4246,7 +4249,7 @@ RawDebianAvailabilityResult evaluate_raw_debian_exact_package_recursive(
         return result;
     }
 
-    for (const auto& dep_str : result.meta.depends) {
+    for (const auto& dep_str : collect_required_transaction_dependency_edges(result.meta)) {
         RelationAtom dep = normalize_relation_atom(dep_str, "any");
         if (!dep.valid || dep.name.empty()) continue;
         if (is_system_provided(dep.name, dep.op, dep.version)) continue;
@@ -6529,6 +6532,7 @@ bool materialize_imported_entries_from_compiled_cache(
                 if (entry.meta.version != selected_it->second.version) return true;
 
                 PackageMetadata meta = entry.meta;
+                meta.pre_depends = selected_it->second.pre_depends;
                 meta.depends = selected_it->second.depends;
                 meta.recommends = selected_it->second.recommends;
                 meta.suggests = selected_it->second.suggests;

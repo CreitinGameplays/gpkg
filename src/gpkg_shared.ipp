@@ -109,6 +109,7 @@ struct PackageAutoStateRecord {
 };
 
 enum class TransactionDependencyKind {
+    PreRequired,
     Required,
     Recommended,
     Suggested
@@ -148,6 +149,28 @@ enum class OptionalDependencyMode {
 struct OptionalDependencyPolicy {
     OptionalDependencyMode recommends = OptionalDependencyMode::Auto;
     OptionalDependencyMode suggests = OptionalDependencyMode::Auto;
+};
+
+enum class DebianBackendOperation {
+    SyncIndex,
+    ResolveDependencies,
+    BuildTransactionPlan,
+    PrepareUpgrade,
+    InstallNativeBatch
+};
+
+enum class DebianBackendKind {
+    Legacy,
+    LibAptPkg
+};
+
+struct DebianBackendSelection {
+    DebianBackendKind selected = DebianBackendKind::Legacy;
+    DebianBackendKind requested = DebianBackendKind::Legacy;
+    bool auto_selected = true;
+    bool libapt_pkg_compiled = false;
+    bool fell_back = false;
+    std::string reason;
 };
 
 bool mkdir_p(const std::string& path) {
@@ -319,6 +342,97 @@ std::string ascii_lower_copy(const std::string& value) {
         return static_cast<char>(std::tolower(ch));
     });
     return lowered;
+}
+
+bool libapt_pkg_backend_is_compiled() {
+#if defined(GPKG_HAVE_WORKING_LIBAPT_PKG_BACKEND)
+    return true;
+#else
+    return false;
+#endif
+}
+
+std::string describe_debian_backend_kind(DebianBackendKind kind) {
+    switch (kind) {
+        case DebianBackendKind::Legacy:
+            return "legacy";
+        case DebianBackendKind::LibAptPkg:
+            return "libapt-pkg";
+    }
+    return "legacy";
+}
+
+std::string describe_debian_backend_operation(DebianBackendOperation operation) {
+    switch (operation) {
+        case DebianBackendOperation::SyncIndex:
+            return "index sync";
+        case DebianBackendOperation::ResolveDependencies:
+            return "dependency resolution";
+        case DebianBackendOperation::BuildTransactionPlan:
+            return "transaction planning";
+        case DebianBackendOperation::PrepareUpgrade:
+            return "upgrade preparation";
+        case DebianBackendOperation::InstallNativeBatch:
+            return "native Debian install";
+    }
+    return "Debian backend operation";
+}
+
+DebianBackendSelection select_debian_backend(
+    DebianBackendOperation operation,
+    bool verbose
+) {
+    (void)operation;
+    (void)verbose;
+
+    DebianBackendSelection selection;
+    selection.selected = DebianBackendKind::Legacy;
+    selection.requested = DebianBackendKind::Legacy;
+    selection.auto_selected = true;
+    selection.libapt_pkg_compiled = libapt_pkg_backend_is_compiled();
+
+    const char* env = getenv("GPKG_DEBIAN_BACKEND");
+    std::string requested = env ? std::string(env) : "auto";
+    size_t start = requested.find_first_not_of(" \t\r\n");
+    size_t end = requested.find_last_not_of(" \t\r\n");
+    if (start == std::string::npos) requested = "auto";
+    else requested = ascii_lower_copy(requested.substr(start, end - start + 1));
+    if (requested.empty()) requested = "auto";
+
+    if (requested == "legacy") {
+        selection.selected = DebianBackendKind::Legacy;
+        selection.requested = DebianBackendKind::Legacy;
+        selection.auto_selected = false;
+        return selection;
+    }
+
+    if (requested == "libapt-pkg" || requested == "libapt" || requested == "apt") {
+        selection.requested = DebianBackendKind::LibAptPkg;
+        selection.auto_selected = false;
+        if (selection.libapt_pkg_compiled) {
+            selection.selected = DebianBackendKind::LibAptPkg;
+            return selection;
+        }
+
+        selection.selected = DebianBackendKind::Legacy;
+        selection.fell_back = true;
+        selection.reason =
+            "gpkg was built without the libapt-pkg transaction backend; falling back to the legacy Debian engine for " +
+            describe_debian_backend_operation(operation);
+        return selection;
+    }
+
+    selection.requested = DebianBackendKind::LibAptPkg;
+    selection.auto_selected = true;
+    if (selection.libapt_pkg_compiled) {
+        selection.selected = DebianBackendKind::LibAptPkg;
+        return selection;
+    }
+
+    selection.selected = DebianBackendKind::Legacy;
+    selection.reason =
+        "libapt-pkg backend is not compiled into this gpkg build yet; using the legacy Debian engine";
+    return selection;
 }
 
 bool stdout_is_interactive_terminal() {
@@ -503,6 +617,18 @@ bool g_force_reinstall = false;
 bool g_defer_services = false;
 bool g_unsafe_io = false;
 OptionalDependencyPolicy g_optional_dependency_policy;
+std::set<std::string> g_reported_debian_backend_fallbacks;
+
+void maybe_log_debian_backend_selection(
+    const DebianBackendSelection& selection,
+    DebianBackendOperation operation,
+    bool verbose
+) {
+    if (!verbose || !selection.fell_back || selection.reason.empty()) return;
+    std::string key = describe_debian_backend_operation(operation) + ":" + selection.reason;
+    if (!g_reported_debian_backend_fallbacks.insert(key).second) return;
+    std::cout << "[DEBUG] " << selection.reason << std::endl;
+}
 
 bool is_optional_dependency_option(const std::string& arg) {
     return arg == "--recommended-yes" ||
@@ -1596,6 +1722,7 @@ struct PackageMetadata {
     std::string installed_from;
     std::string size;
     std::string installed_size_bytes;
+    std::vector<std::string> pre_depends;
     std::vector<std::string> depends;
     std::vector<std::string> recommends;
     std::vector<std::string> suggests;
@@ -1656,6 +1783,7 @@ void overlay_missing_package_metadata_relations(
     bool provides_only = false
 ) {
     if (!provides_only) {
+        if (target.pre_depends.empty()) target.pre_depends = source.pre_depends;
         if (target.depends.empty()) target.depends = source.depends;
         if (target.recommends.empty()) target.recommends = source.recommends;
         if (target.suggests.empty()) target.suggests = source.suggests;
@@ -1787,6 +1915,8 @@ bool should_include_suggests_for_transaction(const PackageMetadata& meta) {
 
 const char* transaction_dependency_kind_label(TransactionDependencyKind kind) {
     switch (kind) {
+        case TransactionDependencyKind::PreRequired:
+            return "pre-depends";
         case TransactionDependencyKind::Recommended:
             return "recommended";
         case TransactionDependencyKind::Suggested:
@@ -1798,7 +1928,8 @@ const char* transaction_dependency_kind_label(TransactionDependencyKind kind) {
 }
 
 bool transaction_dependency_is_optional(TransactionDependencyKind kind) {
-    return kind != TransactionDependencyKind::Required;
+    return kind != TransactionDependencyKind::Required &&
+           kind != TransactionDependencyKind::PreRequired;
 }
 
 std::vector<TransactionDependencyEdge> collect_transaction_dependency_edge_details(const PackageMetadata& meta) {
@@ -1812,6 +1943,7 @@ std::vector<TransactionDependencyEdge> collect_transaction_dependency_edge_detai
         }
     };
 
+    append_edges(meta.pre_depends, TransactionDependencyKind::PreRequired);
     append_edges(meta.depends, TransactionDependencyKind::Required);
     if (should_include_recommends_for_transaction(meta)) {
         append_edges(meta.recommends, TransactionDependencyKind::Recommended);
@@ -1834,6 +1966,9 @@ std::vector<std::string> collect_transaction_dependency_edges(const PackageMetad
 std::vector<std::string> collect_required_transaction_dependency_edges(const PackageMetadata& meta) {
     std::vector<std::string> unique;
     std::set<std::string> seen;
+    for (const auto& edge : meta.pre_depends) {
+        if (seen.insert(edge).second) unique.push_back(edge);
+    }
     for (const auto& edge : meta.depends) {
         if (seen.insert(edge).second) unique.push_back(edge);
     }
@@ -1843,6 +1978,9 @@ std::vector<std::string> collect_required_transaction_dependency_edges(const Pac
 std::vector<std::string> collect_integrity_dependency_edges(const PackageMetadata& meta) {
     std::vector<std::string> unique;
     std::set<std::string> seen;
+    for (const auto& edge : meta.pre_depends) {
+        if (seen.insert(edge).second) unique.push_back(edge);
+    }
     for (const auto& edge : meta.depends) {
         if (seen.insert(edge).second) unique.push_back(edge);
     }

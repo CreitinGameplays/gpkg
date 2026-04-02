@@ -63,6 +63,11 @@ bool ensure_repo_package_cache_loaded(bool verbose);
 bool build_current_repo_catalog(bool verbose, std::string* error_out = nullptr);
 bool ensure_current_upgrade_catalog(bool verbose, std::string* error_out = nullptr);
 bool ensure_repo_index_available();
+bool sync_debian_testing_index(
+    bool verbose,
+    bool* changed_out = nullptr,
+    std::string* result_out = nullptr
+);
 void invalidate_repo_package_cache();
 bool should_prefer_repo_candidate(const PackageMetadata& candidate, const PackageMetadata& current);
 void populate_package_metadata_from_json(const std::string& obj, PackageMetadata& meta);
@@ -1227,7 +1232,7 @@ bool validate_catalog_package_closure_recursive(
         return false;
     }
 
-    for (const auto& dep_str : meta.depends) {
+    for (const auto& dep_str : collect_required_transaction_dependency_edges(meta)) {
         RelationAtom dep = normalize_relation_atom(dep_str, "any");
         if (!dep.valid) continue;
         if (is_system_provided(dep.name, dep.op, dep.version)) continue;
@@ -1921,6 +1926,7 @@ void populate_package_metadata_from_json(const std::string& obj, PackageMetadata
     get_json_value(obj, "installed_from", meta.installed_from);
     get_json_value(obj, "size", meta.size);
     get_json_value(obj, "installed_size_bytes", meta.installed_size_bytes);
+    get_json_array(obj, "pre_depends", meta.pre_depends);
     get_json_array(obj, "depends", meta.depends);
     get_json_array(obj, "recommends", meta.recommends);
     get_json_array(obj, "suggests", meta.suggests);
@@ -2936,7 +2942,7 @@ bool update_debian_backend_catalog(
     return true;
 }
 
-bool sync_debian_testing_index(
+bool sync_debian_testing_index_legacy(
     bool verbose,
     bool* changed_out = nullptr,
     std::string* result_out = nullptr
@@ -3036,6 +3042,19 @@ bool sync_debian_testing_index(
     if (changed_out) *changed_out = true;
     if (result_out) *result_out = "✓ Updated Debian testing Packages index";
     return true;
+}
+
+bool sync_debian_testing_index(
+    bool verbose,
+    bool* changed_out,
+    std::string* result_out
+) {
+    DebianBackendSelection backend = select_debian_backend(
+        DebianBackendOperation::SyncIndex,
+        verbose
+    );
+    maybe_log_debian_backend_selection(backend, DebianBackendOperation::SyncIndex, verbose);
+    return sync_debian_testing_index_legacy(verbose, changed_out, result_out);
 }
 
 int handle_update(bool verbose) {
@@ -3429,6 +3448,7 @@ int handle_show(const std::string& pkg_name, bool verbose) {
     if (!meta.debian_package.empty()) std::cout << "  Debian Pkg:  " << meta.debian_package << std::endl;
     if (!meta.debian_version.empty()) std::cout << "  Debian Ver:  " << meta.debian_version << std::endl;
     if (!meta.description.empty()) print_description_block("Description", meta.description);
+    if (!meta.pre_depends.empty()) print_wrapped_block("  Pre-Depends: ", join_strings(meta.pre_depends));
     if (!meta.depends.empty()) print_wrapped_block("  Depends:     ", join_strings(meta.depends));
     if (!meta.recommends.empty()) print_wrapped_block("  Recommends:  ", join_strings(meta.recommends));
     if (!meta.suggests.empty()) print_wrapped_block("  Suggests:    ", join_strings(meta.suggests));

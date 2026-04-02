@@ -27,13 +27,29 @@ endif
 
 CXXFLAGS += -Wall -Wextra -O2 -I./src -I$(GINIT_DIR)/src -I$(GLOBAL_SRC_DIR)
 CXXFLAGS += '-DGPKG_VERSION="$(GPKG_VERSION)"' '-DGPKG_CODENAME="$(GPKG_CODENAME)"'
+LIBAPT_PKG_LIBS := $(shell pkg-config --libs apt-pkg 2>/dev/null)
+ifeq ($(strip $(LIBAPT_PKG_LIBS)),)
+LIBAPT_PKG_LIBS := -lapt-pkg -pthread
+endif
+LIBAPT_PKG_HEADER_DIR := $(firstword \
+	$(wildcard $(ROOTFS)/usr/include/apt-pkg) \
+	$(wildcard $(PROJECT_ROOT)/rootfs/usr/include/apt-pkg) \
+	$(wildcard /usr/include/apt-pkg))
+ifneq ($(strip $(LIBAPT_PKG_HEADER_DIR)),)
+CXXFLAGS += -DGPKG_HAVE_WORKING_LIBAPT_PKG_BACKEND
+endif
+ifneq ($(strip $(ROOTFS)),)
+ifneq ($(wildcard $(ROOTFS)/usr/include),)
+CXXFLAGS += -I$(ROOTFS)/usr/include
+endif
+endif
 ifneq ($(strip $(TARGET_CXX_VERSION)),)
 CXXFLAGS += -nostdinc++
 CXXFLAGS += -isystem $(ROOTFS)/usr/include/c++/$(TARGET_CXX_VERSION)
 CXXFLAGS += -isystem $(ROOTFS)/usr/include/x86_64-linux-gnu/c++/$(TARGET_CXX_VERSION)
 CXXFLAGS += -isystem $(ROOTFS)/usr/include/c++/$(TARGET_CXX_VERSION)/backward
 endif
-GPKG_LDFLAGS = -L$(GINIT_DIR)/lib -lgemcore -lssl -lcrypto -lz -lzstd -ldl -lpthread -lcrypt
+GPKG_LDFLAGS = -L$(GINIT_DIR)/lib -lgemcore -lssl -lcrypto -lz -lzstd -ldl -lpthread -lcrypt $(LIBAPT_PKG_LIBS)
 ifeq ($(strip $(LZMA_STATIC)),)
 GPKG_LDFLAGS += -llzma
 else
