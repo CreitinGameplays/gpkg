@@ -3765,6 +3765,7 @@ struct PreparedUpgradeState {
     std::vector<UpgradePlanEntry> explicit_targets;
     TransactionPlan plan;
     std::vector<std::string> skipped_managed_packages;
+    std::string fatal_error;
 };
 
 void prune_shadowed_upgrade_targets(
@@ -4381,74 +4382,87 @@ bool prepare_upgrade_transaction(
                          << " at repository version " << repo_meta.version);
         }
         Dependency dep{pkg, "", ""};
-        if (allow_raw_fallback) {
-            auto queue_copy = out_state.upgrade_queue;
-            auto explicit_copy = out_state.explicit_targets;
-            auto queued_copy = queued_packages;
-            auto explicit_target_copy = explicit_target_names;
-            auto target_walk_copy = target_walk;
-            auto dependency_copy = dependency_visited;
-            std::string queue_failure_reason;
-            if (!queue_upgrade_target(
-                    dep,
-                    companion_map,
-                    queue_copy,
-                    explicit_copy,
-                    queued_copy,
-                    explicit_target_copy,
-                    target_walk_copy,
-                    dependency_copy,
-                    context.exact_live_packages,
-                    verbose,
-                    g_force_reinstall,
-                    &context,
-                    &raw_context,
-                    &queue_failure_reason
-                )) {
-                out_state.skipped_managed_packages.push_back(
-                    pkg + " was skipped: " +
-                    (queue_failure_reason.empty()
-                        ? "dependency resolution failed under current GeminiOS policy"
-                        : queue_failure_reason)
-                );
-                continue;
-            }
-            out_state.upgrade_queue.swap(queue_copy);
-            out_state.explicit_targets.swap(explicit_copy);
-            queued_packages.swap(queued_copy);
-            explicit_target_names.swap(explicit_target_copy);
-            target_walk.swap(target_walk_copy);
-            dependency_visited.swap(dependency_copy);
-            continue;
-        }
-
+        auto queue_copy = out_state.upgrade_queue;
+        auto explicit_copy = out_state.explicit_targets;
+        auto queued_copy = queued_packages;
+        auto explicit_target_copy = explicit_target_names;
+        auto target_walk_copy = target_walk;
+        auto dependency_copy = dependency_visited;
+        auto shadowed_aliases_copy = context.shadowed_aliases_by_target;
+        auto shadowed_base_alias_copy = context.shadowed_base_alias_target;
+        RawDebianContext* queue_raw_context = allow_raw_fallback ? &raw_context : nullptr;
+        std::string queue_failure_reason;
         if (!queue_upgrade_target(
                 dep,
                 companion_map,
-                out_state.upgrade_queue,
-                out_state.explicit_targets,
-                queued_packages,
-                explicit_target_names,
-                target_walk,
-                dependency_visited,
+                queue_copy,
+                explicit_copy,
+                queued_copy,
+                explicit_target_copy,
+                target_walk_copy,
+                dependency_copy,
                 context.exact_live_packages,
                 verbose,
                 g_force_reinstall,
-                &context
+                &context,
+                queue_raw_context,
+                &queue_failure_reason
             )) {
-            return false;
+            context.shadowed_aliases_by_target.swap(shadowed_aliases_copy);
+            context.shadowed_base_alias_target.swap(shadowed_base_alias_copy);
+            out_state.skipped_managed_packages.push_back(
+                pkg + " was skipped: " +
+                (queue_failure_reason.empty()
+                    ? "dependency resolution failed under current GeminiOS policy"
+                    : queue_failure_reason)
+            );
+            continue;
         }
+
+        TransactionPlan candidate_plan;
+        std::string plan_failure_reason;
+        if (!build_transaction_plan(
+                queue_copy,
+                context.exact_live_packages,
+                verbose,
+                candidate_plan,
+                &context,
+                &plan_failure_reason
+            )) {
+            context.shadowed_aliases_by_target.swap(shadowed_aliases_copy);
+            context.shadowed_base_alias_target.swap(shadowed_base_alias_copy);
+            out_state.skipped_managed_packages.push_back(
+                pkg + " was skipped: " +
+                (plan_failure_reason.empty()
+                    ? "the transaction would conflict with installed runtime state"
+                    : plan_failure_reason)
+            );
+            continue;
+        }
+
+        out_state.upgrade_queue.swap(queue_copy);
+        out_state.explicit_targets.swap(explicit_copy);
+        out_state.plan = std::move(candidate_plan);
+        queued_packages.swap(queued_copy);
+        explicit_target_names.swap(explicit_target_copy);
+        target_walk.swap(target_walk_copy);
+        dependency_visited.swap(dependency_copy);
     }
 
     if (out_state.upgrade_queue.empty()) return true;
 
+    std::string final_plan_reason;
     if (!build_transaction_plan(
             out_state.upgrade_queue,
             context.exact_live_packages,
             verbose,
             out_state.plan,
-            &context
+            &context,
+            &final_plan_reason
         )) {
+        out_state.fatal_error = final_plan_reason.empty()
+            ? "the upgrade planner could not build a safe transaction"
+            : final_plan_reason;
         return false;
     }
     out_state.upgrade_queue = out_state.plan.install_queue;
@@ -4465,6 +4479,45 @@ std::string describe_upgrade_catalog_skip_entry(const UpgradeCatalogSkipEntry& e
     }
     out << " was skipped: " << entry.reason;
     return out.str();
+}
+
+bool context_has_live_upgrade_relevance(
+    UpgradeContext& context,
+    const std::string& pkg_name,
+    bool verbose
+) {
+    if (pkg_name.empty()) return false;
+
+    std::string canonical_name = canonicalize_package_name(pkg_name, verbose);
+    if (canonical_name.empty()) canonical_name = pkg_name;
+    auto matches_name = [&](const std::set<std::string>& names) {
+        return names.count(pkg_name) != 0 || names.count(canonical_name) != 0;
+    };
+
+    if (matches_name(context.registered_package_set)) return true;
+    if (matches_name(context.exact_live_packages)) return true;
+    if (matches_name(context.present_base_packages)) return true;
+    if (context.normalized_root_by_raw.count(pkg_name) != 0 ||
+        context.normalized_root_by_raw.count(canonical_name) != 0) {
+        return true;
+    }
+
+    return std::find(
+               context.upgrade_catalog.resolved_roots.begin(),
+               context.upgrade_catalog.resolved_roots.end(),
+               canonical_name
+           ) != context.upgrade_catalog.resolved_roots.end();
+}
+
+bool should_surface_upgrade_catalog_skip_entry(
+    const UpgradeCatalogSkipEntry& entry,
+    UpgradeContext& context,
+    bool verbose
+) {
+    if (entry.kind == "companion") {
+        return context_has_live_upgrade_relevance(context, entry.trigger, verbose);
+    }
+    return context_has_live_upgrade_relevance(context, entry.configured_name, verbose);
 }
 
 RepairInspection inspect_repair_state(
@@ -4611,7 +4664,14 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
         return 1;
     }
     PreparedUpgradeState prepared;
-    if (!prepare_upgrade_transaction(context, verbose, prepared)) return 1;
+    if (!prepare_upgrade_transaction(context, verbose, prepared)) {
+        std::cerr << Color::RED << "E: "
+                  << (prepared.fatal_error.empty()
+                          ? "could not build a safe upgrade plan"
+                          : prepared.fatal_error)
+                  << Color::RESET << std::endl;
+        return 1;
+    }
     std::vector<PackageMetadata>& upgrade_queue = prepared.upgrade_queue;
     std::vector<UpgradePlanEntry>& explicit_targets = prepared.explicit_targets;
     TransactionPlan& upgrade_plan = prepared.plan;
@@ -4619,6 +4679,12 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
     if (upgrade_queue.empty()) {
         for (const auto& warning : prepared.skipped_managed_packages) {
             std::cout << Color::YELLOW << "W: " << warning << Color::RESET << std::endl;
+        }
+        if (!prepared.skipped_managed_packages.empty()) {
+            std::cerr << Color::RED
+                      << "E: No safe upgrades are currently available under the current repository and policy state."
+                      << Color::RESET << std::endl;
+            return 1;
         }
         std::cout << "All packages are up to date." << std::endl;
         return 0;
@@ -4969,7 +5035,9 @@ int handle_doctor(bool verbose) {
         );
     } else if (!prepare_upgrade_transaction(context, verbose, prepared)) {
         upgrade_section.errors.push_back(
-            "gpkg could not build a safe upgrade plan; the next 'gpkg upgrade' would likely fail"
+            prepared.fatal_error.empty()
+                ? "gpkg could not build a safe upgrade plan; the next 'gpkg upgrade' would likely fail"
+                : prepared.fatal_error
         );
     } else {
         have_valid_upgrade_plan = true;
@@ -4984,6 +5052,7 @@ int handle_doctor(bool verbose) {
             upgrade_section.ok.push_back("validated upgrade catalog has no skipped configured runtime families");
         } else {
             for (const auto& entry : context.upgrade_catalog.skipped_entries) {
+                if (!should_surface_upgrade_catalog_skip_entry(entry, context, verbose)) continue;
                 upgrade_section.warnings.push_back(describe_upgrade_catalog_skip_entry(entry));
             }
         }

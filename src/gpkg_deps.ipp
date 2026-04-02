@@ -1003,9 +1003,20 @@ bool build_transaction_plan(
     const std::set<std::string>& installed,
     bool verbose,
     TransactionPlan& out_plan,
-    UpgradeContext* context = nullptr
+    UpgradeContext* context = nullptr,
+    std::string* error_out = nullptr
 ) {
     out_plan = {};
+    if (error_out) error_out->clear();
+
+    auto fail_plan = [&](const std::string& message) {
+        if (error_out) {
+            *error_out = message;
+        } else {
+            std::cerr << Color::RED << "E: " << message << Color::RESET << std::endl;
+        }
+        return false;
+    };
 
     std::vector<PackageMetadata> working_queue;
     std::set<std::string> queued_names;
@@ -1105,10 +1116,10 @@ bool build_transaction_plan(
                 break;
             }
 
-            std::cerr << Color::RED << "E: Conflict detected in transaction! "
-                      << left.name << " conflicts with " << right.name
-                      << Color::RESET << std::endl;
-            return false;
+            return fail_plan(
+                "Conflict detected in transaction! " + left.name +
+                " conflicts with " + right.name
+            );
         }
     }
 
@@ -1168,11 +1179,11 @@ bool build_transaction_plan(
                 if (!queued_breaks_installed && installed_upgrade_queued) continue;
             }
 
-            std::cerr << Color::RED << "E: Conflict detected! " << pkg.name
-                      << (queued_breaks_installed ? " breaks " : " conflicts with installed package ")
-                      << installed_name
-                      << Color::RESET << std::endl;
-            return false;
+            return fail_plan(
+                "Conflict detected! " + pkg.name +
+                (queued_breaks_installed ? " breaks " : " conflicts with installed package ") +
+                installed_name
+            );
         }
     }
 
