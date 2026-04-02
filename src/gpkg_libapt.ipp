@@ -40,6 +40,22 @@ bool resolve_upgrade_target_metadata(
     const PackageMetadata* installed_meta,
     std::string* reason_out
 );
+bool libapt_plan_install_like_transaction(
+    const std::vector<std::string>& explicit_targets,
+    const std::set<std::string>& reinstall_targets,
+    bool fix_broken,
+    bool verbose,
+    LibAptTransactionPlanResult& out_result,
+    std::string* error_out
+);
+bool libapt_plan_remove_transaction(
+    const std::vector<std::string>& explicit_targets,
+    bool purge,
+    bool autoremove,
+    bool verbose,
+    LibAptTransactionPlanResult& out_result,
+    std::string* error_out
+);
 
 #if defined(GPKG_HAVE_WORKING_LIBAPT_PKG_BACKEND)
 
@@ -528,6 +544,42 @@ bool libapt_plan_remove_transaction(
     );
 }
 
+#endif
+
+#if !defined(GPKG_HAVE_WORKING_LIBAPT_PKG_BACKEND)
+bool libapt_plan_install_like_transaction(
+    const std::vector<std::string>& explicit_targets,
+    const std::set<std::string>& reinstall_targets,
+    bool fix_broken,
+    bool verbose,
+    LibAptTransactionPlanResult& out_result,
+    std::string* error_out
+) {
+    (void)explicit_targets;
+    (void)reinstall_targets;
+    (void)fix_broken;
+    (void)verbose;
+    out_result = {};
+    if (error_out) *error_out = "libapt-pkg backend is not available in this gpkg build";
+    return false;
+}
+
+bool libapt_plan_remove_transaction(
+    const std::vector<std::string>& explicit_targets,
+    bool purge,
+    bool autoremove,
+    bool verbose,
+    LibAptTransactionPlanResult& out_result,
+    std::string* error_out
+) {
+    (void)explicit_targets;
+    (void)purge;
+    (void)autoremove;
+    (void)verbose;
+    out_result = {};
+    if (error_out) *error_out = "libapt-pkg backend is not available in this gpkg build";
+    return false;
+}
 #endif
 
 bool libapt_can_handle_repo_install_operands(
