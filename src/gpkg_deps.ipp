@@ -36,6 +36,7 @@ bool get_installed_package_metadata(const std::string& pkg_name, PackageMetadata
     get_json_array(content, "depends", out_meta.depends);
     get_json_array(content, "recommends", out_meta.recommends);
     get_json_array(content, "suggests", out_meta.suggests);
+    get_json_array(content, "breaks", out_meta.breaks);
     get_json_array(content, "conflicts", out_meta.conflicts);
     get_json_array(content, "provides", out_meta.provides);
     get_json_array(content, "replaces", out_meta.replaces);
@@ -793,6 +794,14 @@ bool package_conflicts_with_package(
     return relation_list_matches_package(meta.conflicts, pkg_name, pkg_meta);
 }
 
+bool package_breaks_package(
+    const PackageMetadata& meta,
+    const std::string& pkg_name,
+    const PackageMetadata* pkg_meta = nullptr
+) {
+    return relation_list_matches_package(meta.breaks, pkg_name, pkg_meta);
+}
+
 bool package_replaces_package(
     const PackageMetadata& meta,
     const std::string& pkg_name,
@@ -1133,15 +1142,35 @@ bool build_transaction_plan(
             if (installed_name == pkg.name) continue;
 
             const PackageMetadata* installed_meta = get_installed_meta(installed_name);
+            bool queued_breaks_installed =
+                package_breaks_package(pkg, installed_name, installed_meta);
             bool queued_conflicts_installed =
                 package_conflicts_with_package(pkg, installed_name, installed_meta);
             bool installed_conflicts_queued =
                 installed_meta && package_conflicts_with_package(*installed_meta, pkg.name, &pkg);
-            if (!queued_conflicts_installed && !installed_conflicts_queued) continue;
+            if (!queued_breaks_installed &&
+                !queued_conflicts_installed &&
+                !installed_conflicts_queued) {
+                continue;
+            }
             if (package_replaces_package(pkg, installed_name, installed_meta)) continue;
 
+            if (queued_breaks_installed) {
+                bool installed_upgrade_queued = false;
+                for (const auto& candidate : out_plan.install_queue) {
+                    if (candidate.name != installed_name) continue;
+                    installed_upgrade_queued = true;
+                    if (!package_breaks_package(pkg, candidate.name, &candidate)) {
+                        queued_breaks_installed = false;
+                    }
+                    break;
+                }
+                if (!queued_breaks_installed && installed_upgrade_queued) continue;
+            }
+
             std::cerr << Color::RED << "E: Conflict detected! " << pkg.name
-                      << " conflicts with installed package " << installed_name
+                      << (queued_breaks_installed ? " breaks " : " conflicts with installed package ")
+                      << installed_name
                       << Color::RESET << std::endl;
             return false;
         }

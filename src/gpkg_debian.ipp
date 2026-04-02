@@ -27,6 +27,7 @@ struct DebianPackageRecord {
     std::string pre_depends_raw;
     std::string recommends_raw;
     std::string suggests_raw;
+    std::string breaks_raw;
     std::string conflicts_raw;
     std::string provides_raw;
     std::string replaces_raw;
@@ -107,6 +108,7 @@ struct ImportedPackageDependencyState {
     std::vector<std::string> depends;
     std::vector<std::string> recommends;
     std::vector<std::string> suggests;
+    std::vector<std::string> breaks;
     std::vector<std::string> provides;
 };
 
@@ -743,6 +745,7 @@ std::string* get_debian_record_field_storage(
     if (key == "Pre-Depends") return &record.pre_depends_raw;
     if (key == "Recommends") return &record.recommends_raw;
     if (key == "Suggests") return &record.suggests_raw;
+    if (key == "Breaks") return &record.breaks_raw;
     if (key == "Conflicts") return &record.conflicts_raw;
     if (key == "Provides") return &record.provides_raw;
     if (key == "Replaces") return &record.replaces_raw;
@@ -975,6 +978,7 @@ std::string package_metadata_to_json(const PackageMetadata& meta) {
     fields.push_back("\"depends\":" + json_array_from_strings(meta.depends));
     fields.push_back("\"recommends\":" + json_array_from_strings(meta.recommends));
     fields.push_back("\"suggests\":" + json_array_from_strings(meta.suggests));
+    fields.push_back("\"breaks\":" + json_array_from_strings(meta.breaks));
     fields.push_back("\"conflicts\":" + json_array_from_strings(meta.conflicts));
     fields.push_back("\"provides\":" + json_array_from_strings(meta.provides));
     fields.push_back("\"replaces\":" + json_array_from_strings(meta.replaces));
@@ -1025,12 +1029,12 @@ std::string debian_search_preview_to_json(const DebianSearchPreviewEntry& entry)
     return out.str();
 }
 
-const uint32_t DEBIAN_COMPILED_CACHE_VERSION = 1;
-const char DEBIAN_PARSED_RECORD_CACHE_MAGIC[8] = {'G','P','K','R','A','W','1','\0'};
-const char DEBIAN_COMPILED_RECORD_CACHE_MAGIC[8] = {'G','P','K','R','E','C','1','\0'};
+const uint32_t DEBIAN_COMPILED_CACHE_VERSION = 2;
+const char DEBIAN_PARSED_RECORD_CACHE_MAGIC[8] = {'G','P','K','R','A','W','2','\0'};
+const char DEBIAN_COMPILED_RECORD_CACHE_MAGIC[8] = {'G','P','K','R','E','C','2','\0'};
 const char DEBIAN_RAW_CONTEXT_INDEX_MAGIC[8] = {'G','P','K','R','I','D','1','\0'};
-const char DEBIAN_IMPORTED_CACHE_MAGIC[8] = {'G','P','K','I','M','P','1','\0'};
-const char DEBIAN_PREVIEW_CACHE_MAGIC[8] = {'G','P','K','P','R','V','1','\0'};
+const char DEBIAN_IMPORTED_CACHE_MAGIC[8] = {'G','P','K','I','M','P','2','\0'};
+const char DEBIAN_PREVIEW_CACHE_MAGIC[8] = {'G','P','K','P','R','V','2','\0'};
 
 bool should_export_legacy_debian_json_caches() {
     const char* env = getenv("GPKG_EXPORT_LEGACY_DEBIAN_JSON_CACHE");
@@ -1169,6 +1173,7 @@ bool write_package_metadata_binary(std::ostream& out, const PackageMetadata& met
         write_binary_string_vector(out, meta.depends) &&
         write_binary_string_vector(out, meta.recommends) &&
         write_binary_string_vector(out, meta.suggests) &&
+        write_binary_string_vector(out, meta.breaks) &&
         write_binary_string_vector(out, meta.conflicts) &&
         write_binary_string_vector(out, meta.provides) &&
         write_binary_string_vector(out, meta.replaces);
@@ -1198,6 +1203,7 @@ bool read_package_metadata_binary(std::istream& in, PackageMetadata& meta) {
         read_binary_string_vector(in, meta.depends) &&
         read_binary_string_vector(in, meta.recommends) &&
         read_binary_string_vector(in, meta.suggests) &&
+        read_binary_string_vector(in, meta.breaks) &&
         read_binary_string_vector(in, meta.conflicts) &&
         read_binary_string_vector(in, meta.provides) &&
         read_binary_string_vector(in, meta.replaces);
@@ -1220,6 +1226,7 @@ bool write_debian_package_record_binary(std::ostream& out, const DebianPackageRe
         write_binary_string(out, record.pre_depends_raw) &&
         write_binary_string(out, record.recommends_raw) &&
         write_binary_string(out, record.suggests_raw) &&
+        write_binary_string(out, record.breaks_raw) &&
         write_binary_string(out, record.conflicts_raw) &&
         write_binary_string(out, record.provides_raw) &&
         write_binary_string(out, record.replaces_raw) &&
@@ -1246,6 +1253,7 @@ bool read_debian_package_record_binary(std::istream& in, DebianPackageRecord& re
         read_binary_string(in, record.pre_depends_raw) &&
         read_binary_string(in, record.recommends_raw) &&
         read_binary_string(in, record.suggests_raw) &&
+        read_binary_string(in, record.breaks_raw) &&
         read_binary_string(in, record.conflicts_raw) &&
         read_binary_string(in, record.provides_raw) &&
         read_binary_string(in, record.replaces_raw) &&
@@ -1868,6 +1876,7 @@ ImportedPackageDependencyState build_imported_dependency_state(
     state.depends = meta.depends;
     state.recommends = meta.recommends;
     state.suggests = meta.suggests;
+    state.breaks = meta.breaks;
     state.provides = meta.provides;
     return state;
 }
@@ -2328,6 +2337,7 @@ bool build_debian_package_metadata(
     meta.depends = depends;
     meta.recommends = recommends;
     meta.suggests = suggests;
+    meta.breaks = normalize_relation_field_value(record.breaks_raw, config.apt_arch);
     meta.conflicts = normalize_relation_field_value(record.conflicts_raw, config.apt_arch);
     for (const auto& dep : package_override.conflicts_add) meta.conflicts.push_back(dep);
     
@@ -2458,6 +2468,7 @@ bool build_debian_package_metadata(
     meta.depends = depends;
     meta.recommends = recommends;
     meta.suggests = suggests;
+    meta.breaks = normalize_relation_field_value(record.breaks_raw, config.apt_arch);
     meta.conflicts = normalize_relation_field_value(record.conflicts_raw, config.apt_arch);
     for (const auto& dep : package_override.conflicts_add) meta.conflicts.push_back(dep);
 
@@ -4750,6 +4761,7 @@ std::string fingerprint_debian_package_record(const DebianPackageRecord& record)
         record.pre_depends_raw,
         record.recommends_raw,
         record.suggests_raw,
+        record.breaks_raw,
         record.conflicts_raw,
         record.provides_raw,
         record.replaces_raw,
@@ -6520,6 +6532,7 @@ bool materialize_imported_entries_from_compiled_cache(
                 meta.depends = selected_it->second.depends;
                 meta.recommends = selected_it->second.recommends;
                 meta.suggests = selected_it->second.suggests;
+                meta.breaks = selected_it->second.breaks;
                 meta.provides = selected_it->second.provides;
 
                 auto existing_it = selected_entries.find(meta.name);

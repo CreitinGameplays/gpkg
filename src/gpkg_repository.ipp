@@ -12,7 +12,7 @@ std::set<std::string> g_repo_available_package_cache;
 bool g_repo_package_cache_loaded = false;
 
 const char REPO_RUNTIME_INDEX_MAGIC[8] = {'G','P','K','R','I','D','1','\0'};
-const char REPO_CATALOG_SHARD_MAGIC[8] = {'G','P','K','S','H','D','1','\0'};
+const char REPO_CATALOG_SHARD_MAGIC[8] = {'G','P','K','S','H','D','2','\0'};
 const char REPO_CATALOG_SHARD_INDEX_MAGIC[8] = {'G','P','K','S','I','D','1','\0'};
 
 struct RepoIndexCacheState {
@@ -1924,6 +1924,7 @@ void populate_package_metadata_from_json(const std::string& obj, PackageMetadata
     get_json_array(obj, "depends", meta.depends);
     get_json_array(obj, "recommends", meta.recommends);
     get_json_array(obj, "suggests", meta.suggests);
+    get_json_array(obj, "breaks", meta.breaks);
     get_json_array(obj, "conflicts", meta.conflicts);
     get_json_array(obj, "provides", meta.provides);
     get_json_array(obj, "replaces", meta.replaces);

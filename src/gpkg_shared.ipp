@@ -1418,6 +1418,7 @@ struct PackageMetadata {
     std::vector<std::string> depends;
     std::vector<std::string> recommends;
     std::vector<std::string> suggests;
+    std::vector<std::string> breaks;
     std::vector<std::string> conflicts;
     std::vector<std::string> provides;
     std::vector<std::string> replaces;

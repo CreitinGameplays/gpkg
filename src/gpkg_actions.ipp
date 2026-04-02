@@ -406,6 +406,7 @@ void merge_bootstrap_metadata(
     merge_bootstrap_relation_list(entry.meta.depends, meta.depends);
     merge_bootstrap_relation_list(entry.meta.recommends, meta.recommends);
     merge_bootstrap_relation_list(entry.meta.suggests, meta.suggests);
+    merge_bootstrap_relation_list(entry.meta.breaks, meta.breaks);
     merge_bootstrap_relation_list(entry.meta.conflicts, meta.conflicts);
     merge_bootstrap_relation_list(entry.meta.provides, meta.provides);
     merge_bootstrap_relation_list(entry.meta.replaces, meta.replaces);
@@ -531,6 +532,35 @@ bool ensure_native_dpkg_admin_layout(std::string* error_out) {
     }
 
     return true;
+}
+
+std::vector<PackageStatusRecord> load_native_dpkg_update_status_records() {
+    std::vector<PackageStatusRecord> records;
+    std::string updates_dir = DPKG_ADMIN_DIR + "/updates";
+    DIR* dir = opendir(updates_dir.c_str());
+    if (!dir) return records;
+
+    std::vector<std::string> paths;
+    while (true) {
+        errno = 0;
+        dirent* entry = readdir(dir);
+        if (!entry) break;
+
+        std::string name = entry->d_name;
+        if (name.empty() || name == "." || name == "..") continue;
+        paths.push_back(updates_dir + "/" + name);
+    }
+    closedir(dir);
+    std::sort(paths.begin(), paths.end());
+
+    for (const auto& path : paths) {
+        struct stat st {};
+        if (stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) continue;
+        std::vector<PackageStatusRecord> fragment = load_status_records_from_file(path);
+        records.insert(records.end(), fragment.begin(), fragment.end());
+    }
+
+    return records;
 }
 
 bool dpkg_version_starts_with_digit(const std::string& version) {
@@ -791,7 +821,11 @@ bool repair_native_dpkg_status_database(bool verbose, std::string* error_out) {
         remember_files(resolve_native_dpkg_bootstrap_name(entry.package));
     }
 
-    for (const auto& record : load_dpkg_package_status_records()) {
+    std::vector<PackageStatusRecord> manifest_records = load_dpkg_package_status_records();
+    std::vector<PackageStatusRecord> update_records = load_native_dpkg_update_status_records();
+    manifest_records.insert(manifest_records.end(), update_records.begin(), update_records.end());
+
+    for (const auto& record : manifest_records) {
         if (record.package.empty() || !native_dpkg_status_keeps_file_manifest(record.status)) continue;
 
         std::string list_path = DPKG_INFO_DIR + "/" + record.package + ".list";
@@ -1192,6 +1226,9 @@ bool bootstrap_native_dpkg_status_database(bool verbose, std::string* error_out)
         }
         if (!entry.meta.provides.empty()) {
             status_stream << "Provides: " << join_strings(entry.meta.provides) << "\n";
+        }
+        if (!entry.meta.breaks.empty()) {
+            status_stream << "Breaks: " << join_strings(entry.meta.breaks) << "\n";
         }
         if (!entry.meta.conflicts.empty()) {
             status_stream << "Conflicts: " << join_strings(entry.meta.conflicts) << "\n";
@@ -2149,11 +2186,17 @@ bool native_dpkg_status_requires_configuration(const std::string& status) {
 
 std::vector<std::string> collect_pending_native_dpkg_configuration_packages() {
     std::vector<std::string> pending;
-    for (const auto& record : load_dpkg_package_status_records()) {
+    std::vector<PackageStatusRecord> records = load_dpkg_package_status_records();
+    std::vector<PackageStatusRecord> update_records = load_native_dpkg_update_status_records();
+    records.insert(records.end(), update_records.begin(), update_records.end());
+
+    for (const auto& record : records) {
         if (record.package.empty()) continue;
         if (!native_dpkg_status_requires_configuration(record.status)) continue;
         pending.push_back(record.package);
     }
+    std::sort(pending.begin(), pending.end());
+    pending.erase(std::unique(pending.begin(), pending.end()), pending.end());
     return pending;
 }
 
@@ -4118,6 +4161,64 @@ bool queue_upgrade_target(
 
         install_queue.swap(optional_queue);
         dependency_visited.swap(optional_visited);
+    }
+
+    std::vector<std::string> broken_installed_packages;
+    for (const auto& installed_name : installed_cache) {
+        if (installed_name.empty() || installed_name == meta.name) continue;
+
+        PackageMetadata installed_meta;
+        if (!get_live_package_metadata_for_upgrade_resolution(installed_name, installed_meta, context)) {
+            continue;
+        }
+        if (!package_breaks_package(meta, installed_name, &installed_meta)) continue;
+        if (package_replaces_package(meta, installed_name, &installed_meta)) continue;
+
+        std::string canonical_installed = canonicalize_package_name(installed_name, verbose);
+        if (canonical_installed.empty()) canonical_installed = installed_name;
+        if (queued_packages.count(canonical_installed) != 0 ||
+            explicit_target_names.count(canonical_installed) != 0) {
+            continue;
+        }
+
+        broken_installed_packages.push_back(installed_name);
+    }
+
+    for (const auto& broken_name : broken_installed_packages) {
+        std::string break_fix_reason;
+        if (!queue_upgrade_target(
+                {broken_name, "", ""},
+                companion_map,
+                install_queue,
+                explicit_targets,
+                queued_packages,
+                explicit_target_names,
+                target_walk,
+                dependency_visited,
+                installed_cache,
+                verbose,
+                force_reinstall,
+                context,
+                raw_context,
+                &break_fix_reason
+            )) {
+            target_walk.erase(meta.name);
+            return false;
+        }
+
+        std::string canonical_broken = canonicalize_package_name(broken_name, verbose);
+        if (canonical_broken.empty()) canonical_broken = broken_name;
+        if (queued_packages.count(canonical_broken) == 0 &&
+            explicit_target_names.count(canonical_broken) == 0) {
+            if (failure_reason_out) {
+                *failure_reason_out = meta.name + " breaks installed package " + broken_name +
+                    (break_fix_reason.empty()
+                        ? ", but no compatible upgrade candidate is available"
+                        : ": " + break_fix_reason);
+            }
+            target_walk.erase(meta.name);
+            return false;
+        }
     }
 
     if (queued_packages.insert(meta.name).second) {
