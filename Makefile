@@ -56,17 +56,30 @@ BINDIR = bin
 GPKG_FRAGMENTS = $(wildcard $(SRCDIR)/*.ipp)
 
 TARGETS = $(BINDIR)/gpkg $(BINDIR)/gpkg-worker
+BUILD_CONFIG_STAMP = $(OBJDIR)/build-config.stamp
 
-all: $(BINDIR) $(OBJDIR) $(TARGETS)
+all: $(BINDIR) $(OBJDIR) $(BUILD_CONFIG_STAMP) $(TARGETS)
 
 $(BINDIR) $(OBJDIR):
 	mkdir -p $@
 
-$(BINDIR)/gpkg: $(SRCDIR)/gpkg.cpp $(GPKG_FRAGMENTS)
+FORCE:
+
+$(BUILD_CONFIG_STAMP): FORCE | $(OBJDIR)
+	@tmp="$@.tmp"; \
+	printf 'GPKG_VERSION=%s\nGPKG_CODENAME=%s\nTARGET_CXX_VERSION=%s\nROOTFS=%s\n' \
+		'$(GPKG_VERSION)' '$(GPKG_CODENAME)' '$(TARGET_CXX_VERSION)' '$(ROOTFS)' > "$$tmp"; \
+	if [ -f "$@" ] && cmp -s "$@" "$$tmp"; then \
+		rm -f "$$tmp"; \
+	else \
+		mv "$$tmp" "$@"; \
+	fi
+
+$(BINDIR)/gpkg: $(SRCDIR)/gpkg.cpp $(GPKG_FRAGMENTS) $(BUILD_CONFIG_STAMP)
 	$(CXX) $(CXXFLAGS) -o $@ $< $(GPKG_LDFLAGS)
 	$(STRIP) $@
 
-$(BINDIR)/gpkg-worker: $(SRCDIR)/gpkg_worker.cpp $(GPKG_FRAGMENTS)
+$(BINDIR)/gpkg-worker: $(SRCDIR)/gpkg_worker.cpp $(GPKG_FRAGMENTS) $(BUILD_CONFIG_STAMP)
 	$(CXX) $(CXXFLAGS) -o $@ $< $(WORKER_LDFLAGS)
 	$(STRIP) $@
 
@@ -80,4 +93,4 @@ install: all
 clean:
 	rm -rf $(OBJDIR) $(BINDIR)
 
-.PHONY: all install clean
+.PHONY: all install clean FORCE
