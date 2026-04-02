@@ -107,6 +107,8 @@ std::string get_pending_dpkg_trigger_queue_path() {
     return get_trigger_state_dir() + "/dpkg-pending.list";
 }
 
+bool paths_are_identical(const std::string& left, const std::string& right);
+
 struct PackageStatusRecord {
     std::string package;
     std::string want = "install";
@@ -2561,11 +2563,13 @@ struct ScopedMaintainerScriptCompat {
             {"dpkg", "--compat-dpkg"},
             {"dpkg-query", "--compat-dpkg-query"},
             {"dpkg-trigger", "--compat-dpkg-trigger"},
+            {"update-alternatives", "--compat-update-alternatives"},
             {"update-rc.d", "--compat-update-rc.d"},
             {"invoke-rc.d", "--compat-invoke-rc.d"},
             {"service", "--compat-service"},
             {"systemctl", "--compat-systemctl"},
             {"deb-systemd-invoke", "--compat-deb-systemd-invoke"},
+            {"deb-systemd-helper", "--compat-deb-systemd-helper"},
             {"initctl", "--compat-initctl"},
         };
 
@@ -3735,7 +3739,8 @@ int action_compat_dpkg(const std::vector<std::string>& raw_args) {
         (args[0] == "--assert-multi-arch" || args[0] == "--assert-support-predepends")) {
         return 0;
     }
-    if (args.size() >= 4 && args[0] == "--compare-versions") {
+    if (args.size() >= 4 &&
+        (args[0] == "--compare-versions" || args[0] == "--compare-cversions")) {
         int cmp = compat_compare_versions(args[1], args[3]);
         return compat_version_relation_matches(cmp, args[2]) ? 0 : 1;
     }
@@ -4532,6 +4537,44 @@ int action_compat_service(const std::vector<std::string>& raw_args) {
     return action_compat_service_like(raw_args);
 }
 
+std::string compat_rooted_helper_path(const std::string& path) {
+    if (path.empty()) return "";
+    if (g_root_prefix.empty() || path[0] != '/') return path;
+    return g_root_prefix + path;
+}
+
+void compat_prepare_update_alternatives_master_link(const std::vector<std::string>& raw_args) {
+    for (size_t i = 0; i < raw_args.size(); ++i) {
+        if (raw_args[i] != "--install" || i + 4 >= raw_args.size()) continue;
+
+        std::string link_path = compat_rooted_helper_path(raw_args[i + 1]);
+        std::string target_path = compat_rooted_helper_path(raw_args[i + 3]);
+        if (link_path.empty() || target_path.empty()) continue;
+
+        struct stat st {};
+        if (lstat(link_path.c_str(), &st) != 0 || S_ISLNK(st.st_mode)) continue;
+        if (!paths_are_identical(link_path, target_path)) continue;
+
+        if (unlink(link_path.c_str()) == 0) {
+            VLOG("Removed pre-existing non-symlink alternatives master " << link_path
+                 << " so update-alternatives can recreate it as a link.");
+        }
+    }
+}
+
+int action_compat_update_alternatives(const std::vector<std::string>& raw_args) {
+    compat_prepare_update_alternatives_master_link(raw_args);
+    int real_rc = run_real_executable_with_args(
+        {"/usr/bin/update-alternatives", "/bin/update-alternatives"},
+        raw_args
+    );
+    if (real_rc == 1 &&
+        resolve_first_executable({"/usr/bin/update-alternatives", "/bin/update-alternatives"}).empty()) {
+        return 0;
+    }
+    return real_rc;
+}
+
 std::string compat_extract_first_non_option(const std::vector<std::string>& raw_args) {
     for (const auto& arg : raw_args) {
         if (!arg.empty() && arg[0] == '-') continue;
@@ -4570,6 +4613,11 @@ int action_compat_deb_systemd_invoke(const std::vector<std::string>& raw_args) {
         raw_args,
         {"/usr/bin/deb-systemd-invoke", "/bin/deb-systemd-invoke"}
     );
+}
+
+int action_compat_deb_systemd_helper(const std::vector<std::string>& raw_args) {
+    (void)raw_args;
+    return 0;
 }
 
 int action_compat_initctl(const std::vector<std::string>& raw_args) {
@@ -8599,6 +8647,11 @@ int main(int argc, char* argv[]) {
             for (int j = i + 1; j < argc; ++j) compat_args.push_back(argv[j]);
             return action_compat_dpkg_trigger(compat_args);
         }
+        if (arg == "--compat-update-alternatives") {
+            std::vector<std::string> compat_args;
+            for (int j = i + 1; j < argc; ++j) compat_args.push_back(argv[j]);
+            return action_compat_update_alternatives(compat_args);
+        }
         if (arg == "--compat-update-rc.d") {
             std::vector<std::string> compat_args;
             for (int j = i + 1; j < argc; ++j) compat_args.push_back(argv[j]);
@@ -8624,6 +8677,11 @@ int main(int argc, char* argv[]) {
             for (int j = i + 1; j < argc; ++j) compat_args.push_back(argv[j]);
             return action_compat_deb_systemd_invoke(compat_args);
         }
+        if (arg == "--compat-deb-systemd-helper") {
+            std::vector<std::string> compat_args;
+            for (int j = i + 1; j < argc; ++j) compat_args.push_back(argv[j]);
+            return action_compat_deb_systemd_helper(compat_args);
+        }
         if (arg == "--compat-initctl") {
             std::vector<std::string> compat_args;
             for (int j = i + 1; j < argc; ++j) compat_args.push_back(argv[j]);
@@ -8633,7 +8691,7 @@ int main(int argc, char* argv[]) {
 
     if (argc < 2) {
 
-        std::cout << "Usage: gpkg-worker [options]\nOptions:\n  --install <file>\n  --configure <pkg> [old-version]\n  --remove <pkg>\n  --purge <pkg>\n  --retire <pkg>\n  --verify <pkg>\n  --compat-dpkg [dpkg args...]\n  --compat-dpkg-query [dpkg-query args...]\n  --compat-dpkg-trigger [dpkg-trigger args...]\n  --compat-update-rc.d [update-rc.d args...]\n  --compat-invoke-rc.d [invoke-rc.d args...]\n  --compat-service [service args...]\n  --compat-systemctl [systemctl args...]\n  --compat-deb-systemd-invoke [args...]\n  --compat-initctl [args...]\n  --refresh-dpkg-trigger-state\n  --refresh-runtime-linker-state\n  --refresh-selinux-label-state\n  --register-file <path> --pkg <name>\n  --register-undo <cmd> --pkg <name>\n  --jobs <n>\n  --defer-runtime-linker-refresh\n  --defer-selinux-relabel\n  --defer-configure\n  --unsafe-io\n";
+        std::cout << "Usage: gpkg-worker [options]\nOptions:\n  --install <file>\n  --configure <pkg> [old-version]\n  --remove <pkg>\n  --purge <pkg>\n  --retire <pkg>\n  --verify <pkg>\n  --compat-dpkg [dpkg args...]\n  --compat-dpkg-query [dpkg-query args...]\n  --compat-dpkg-trigger [dpkg-trigger args...]\n  --compat-update-alternatives [update-alternatives args...]\n  --compat-update-rc.d [update-rc.d args...]\n  --compat-invoke-rc.d [invoke-rc.d args...]\n  --compat-service [service args...]\n  --compat-systemctl [systemctl args...]\n  --compat-deb-systemd-invoke [args...]\n  --compat-deb-systemd-helper [args...]\n  --compat-initctl [args...]\n  --refresh-dpkg-trigger-state\n  --refresh-runtime-linker-state\n  --refresh-selinux-label-state\n  --register-file <path> --pkg <name>\n  --register-undo <cmd> --pkg <name>\n  --jobs <n>\n  --defer-runtime-linker-refresh\n  --defer-selinux-relabel\n  --defer-configure\n  --unsafe-io\n";
 
         return 1;
 

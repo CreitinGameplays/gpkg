@@ -30,6 +30,7 @@ bool inspect_debian_archive_payload_for_disk_estimate(
     CachedArchivePayloadInfo* out_info
 );
 bool native_dpkg_package_looks_synthetic(const std::string& pkg_name);
+bool native_dpkg_status_keeps_file_manifest(const std::string& status);
 bool debian_archive_mutates_runtime_linker_state(const PackageMetadata& meta);
 InstallCommandResult install_native_debian_batch(
     const std::vector<PackageMetadata>& batch,
@@ -259,8 +260,12 @@ bool write_text_file_atomically(const std::string& path, const std::string& cont
 
 bool package_has_present_base_registry_entry_exact(const std::string& pkg_name) {
     if (pkg_name.empty()) return false;
+    std::string canonical_name = canonicalize_package_name(pkg_name);
     for (const auto& entry : load_base_system_registry_entries()) {
-        if (entry.package != pkg_name) continue;
+        if (entry.package != pkg_name &&
+            canonicalize_package_name(entry.package) != canonical_name) {
+            continue;
+        }
         if (base_system_registry_entry_looks_present(entry)) return true;
     }
     return false;
@@ -272,9 +277,17 @@ std::string resolve_native_dpkg_bootstrap_name(
 ) {
     if (meta_out) *meta_out = PackageMetadata{};
     if (source_pkg_name.empty()) return "";
+    std::string canonical_source = canonicalize_package_name(source_pkg_name);
 
     PackageMetadata meta;
     if (get_installed_package_metadata(source_pkg_name, meta)) {
+        if (meta_out) *meta_out = meta;
+        std::string candidate = debian_backend_package_name(meta);
+        if (!candidate.empty()) return candidate;
+    }
+    if (!canonical_source.empty() &&
+        canonical_source != source_pkg_name &&
+        get_installed_package_metadata(canonical_source, meta)) {
         if (meta_out) *meta_out = meta;
         std::string candidate = debian_backend_package_name(meta);
         if (!candidate.empty()) return candidate;
@@ -290,8 +303,19 @@ std::string resolve_native_dpkg_bootstrap_name(
         std::string candidate = debian_backend_package_name(meta);
         if (!candidate.empty()) return candidate;
     }
+    if (!canonical_source.empty() &&
+        canonical_source != source_pkg_name &&
+        query_full_universe_exact_package(canonical_source, result, false, nullptr) &&
+        result.found &&
+        result.installable &&
+        !result.meta.name.empty()) {
+        meta = result.meta;
+        if (meta_out) *meta_out = meta;
+        std::string candidate = debian_backend_package_name(meta);
+        if (!candidate.empty()) return candidate;
+    }
 
-    return source_pkg_name;
+    return canonical_source.empty() ? source_pkg_name : canonical_source;
 }
 
 const std::map<std::string, std::string>& native_dpkg_bootstrap_multi_arch_index(bool verbose) {
@@ -755,15 +779,20 @@ bool repair_native_dpkg_status_database(bool verbose, std::string* error_out) {
         if (entry.package.empty() || entry.files.empty()) continue;
         auto remember_files = [&](const std::string& pkg_name) {
             if (pkg_name.empty()) return;
-            if (base_files_by_package.count(pkg_name) != 0) return;
-            base_files_by_package[pkg_name] = entry.files;
+            std::string canonical_name = canonicalize_package_name(pkg_name);
+            if (base_files_by_package.count(pkg_name) == 0) {
+                base_files_by_package[pkg_name] = entry.files;
+            }
+            if (!canonical_name.empty() && base_files_by_package.count(canonical_name) == 0) {
+                base_files_by_package[canonical_name] = entry.files;
+            }
         };
         remember_files(entry.package);
         remember_files(resolve_native_dpkg_bootstrap_name(entry.package));
     }
 
     for (const auto& record : load_dpkg_package_status_records()) {
-        if (record.package.empty() || !package_status_is_installed_like(record.status)) continue;
+        if (record.package.empty() || !native_dpkg_status_keeps_file_manifest(record.status)) continue;
 
         std::string list_path = DPKG_INFO_DIR + "/" + record.package + ".list";
         bool list_exists = access(list_path.c_str(), F_OK) == 0;
@@ -774,6 +803,9 @@ bool repair_native_dpkg_status_database(bool verbose, std::string* error_out) {
         if (files.empty()) files = read_installed_file_list(record.package);
         if (files.empty()) {
             auto base_it = base_files_by_package.find(record.package);
+            if (base_it == base_files_by_package.end()) {
+                base_it = base_files_by_package.find(canonicalize_package_name(record.package));
+            }
             if (base_it != base_files_by_package.end()) files = base_it->second;
         }
         if (list_exists && !files.empty()) {
@@ -851,15 +883,27 @@ bool native_dpkg_package_looks_synthetic(const std::string& pkg_name) {
 
 std::vector<std::string> get_base_system_registry_files_for_package(const std::string& pkg_name) {
     if (pkg_name.empty()) return {};
+    std::string canonical_name = canonicalize_package_name(pkg_name);
     for (const auto& entry : load_base_system_registry_entries()) {
-        if (entry.package != pkg_name) continue;
+        if (entry.package != pkg_name &&
+            canonicalize_package_name(entry.package) != canonical_name) {
+            continue;
+        }
         return entry.files;
     }
     for (const auto& entry : load_base_system_registry_entries()) {
-        if (resolve_native_dpkg_bootstrap_name(entry.package) != pkg_name) continue;
+        std::string resolved = resolve_native_dpkg_bootstrap_name(entry.package);
+        if (resolved != pkg_name &&
+            canonicalize_package_name(resolved) != canonical_name) {
+            continue;
+        }
         return entry.files;
     }
     return {};
+}
+
+bool native_dpkg_status_keeps_file_manifest(const std::string& status) {
+    return !status.empty() && status != "not-installed";
 }
 
 bool prune_synthetic_dpkg_file_ownership_for_package(
@@ -2113,11 +2157,106 @@ std::vector<std::string> collect_pending_native_dpkg_configuration_packages() {
     return pending;
 }
 
-InstallCommandResult reconcile_pending_native_dpkg_configurations(bool verbose) {
+bool pending_native_dpkg_configurations_wait_for_remaining_batch(
+    const std::vector<std::string>& pending,
+    const std::vector<PackageMetadata>& remaining_batch,
+    bool verbose,
+    std::string* reason_out = nullptr
+) {
+    if (reason_out) *reason_out = "";
+    if (pending.empty() || remaining_batch.empty()) return false;
+
+    std::set<std::string> live_names;
+    for (const auto& record : load_package_status_records()) {
+        if (record.package.empty() || !package_status_is_installed_like(record.status)) continue;
+        live_names.insert(record.package);
+    }
+    for (const auto& record : load_dpkg_package_status_records()) {
+        if (record.package.empty() || !package_status_is_installed_like(record.status)) continue;
+        live_names.insert(record.package);
+    }
+    for (const auto& record : load_base_system_package_status_records()) {
+        if (record.package.empty() || !package_status_is_installed_like(record.status)) continue;
+        live_names.insert(record.package);
+    }
+
+    std::set<std::string> remaining_names;
+    for (const auto& meta : remaining_batch) {
+        std::string debian_name = debian_backend_package_name(meta);
+        if (!debian_name.empty()) remaining_names.insert(canonicalize_package_name(debian_name, verbose));
+        if (!meta.name.empty()) remaining_names.insert(canonicalize_package_name(meta.name, verbose));
+    }
+
+    for (const auto& pkg_name : pending) {
+        PackageMetadata pending_meta;
+        if (!get_live_installed_package_metadata(pkg_name, pending_meta)) continue;
+
+        for (const auto& dep_str : collect_required_transaction_dependency_edges(pending_meta)) {
+            Dependency dep = parse_dependency(dep_str);
+            if (dep.name.empty()) continue;
+            if (is_dependency_satisfied_locally(dep, live_names, verbose, nullptr, nullptr, nullptr, true)) {
+                continue;
+            }
+
+            std::string canonical_dep = canonicalize_package_name(dep.name, verbose);
+            if (remaining_names.count(canonical_dep) != 0) {
+                if (reason_out) {
+                    *reason_out = pkg_name + " still needs " + canonical_dep +
+                        " from the current Debian batch";
+                }
+                return true;
+            }
+
+            for (const auto& candidate : remaining_batch) {
+                std::string provider_name = debian_backend_package_name(candidate);
+                bool provider_matches =
+                    !provider_name.empty() &&
+                    package_metadata_satisfies_dependency(provider_name, candidate, dep);
+                bool alias_matches =
+                    !candidate.name.empty() &&
+                    candidate.name != provider_name &&
+                    package_metadata_satisfies_dependency(candidate.name, candidate, dep);
+                if (!provider_matches && !alias_matches) continue;
+
+                if (reason_out) {
+                    *reason_out = pkg_name + " still needs " +
+                        (provider_name.empty() ? candidate.name : provider_name) +
+                        " from the current Debian batch";
+                }
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+InstallCommandResult reconcile_pending_native_dpkg_configurations(
+    bool verbose,
+    const std::vector<PackageMetadata>* remaining_batch = nullptr
+) {
     InstallCommandResult result;
     std::vector<std::string> pending = collect_pending_native_dpkg_configuration_packages();
     if (pending.empty()) {
         result.success = true;
+        return result;
+    }
+
+    std::string defer_reason;
+    if (remaining_batch &&
+        pending_native_dpkg_configurations_wait_for_remaining_batch(
+            pending,
+            *remaining_batch,
+            verbose,
+            &defer_reason
+        )) {
+        result.success = true;
+        result.last_processed_package = pending.front();
+        VLOG(verbose, "Deferring pending native dpkg configuration because "
+                     << (defer_reason.empty()
+                             ? "later packages in the current batch still provide required dependencies"
+                             : defer_reason)
+                     << ".");
         return result;
     }
 
@@ -2287,7 +2426,17 @@ InstallCommandResult install_native_debian_batch(
                 }
             }
 
-            InstallCommandResult pending_after_install = reconcile_pending_native_dpkg_configurations(verbose);
+            std::vector<PackageMetadata> remaining_batch;
+            if (index + 1 < order.size()) {
+                remaining_batch.reserve(order.size() - index - 1);
+                for (size_t rest = index + 1; rest < order.size(); ++rest) {
+                    remaining_batch.push_back(batch[order[rest]]);
+                }
+            }
+            InstallCommandResult pending_after_install = reconcile_pending_native_dpkg_configurations(
+                verbose,
+                remaining_batch.empty() ? nullptr : &remaining_batch
+            );
             if (!pending_after_install.success) {
                 batch_result.success = false;
                 batch_result.log_path = pending_after_install.log_path;
@@ -2315,6 +2464,20 @@ InstallCommandResult install_native_debian_batch(
         batch_result.log_path = result.log_path;
         batch_result.failed_package = debian_backend_package_name(meta);
         if (batch_result.failed_package.empty()) batch_result.failed_package = meta.name;
+        return batch_result;
+    }
+
+    InstallCommandResult final_pending = reconcile_pending_native_dpkg_configurations(verbose);
+    if (!final_pending.success) {
+        batch_result.success = false;
+        batch_result.log_path = final_pending.log_path;
+        batch_result.failed_package = final_pending.failed_package;
+        if (batch_result.failed_package.empty() && !batch.empty()) {
+            batch_result.failed_package = debian_backend_package_name(batch.back());
+            if (batch_result.failed_package.empty()) batch_result.failed_package = batch.back().name;
+        }
+        std::cerr << "E: Failed to configure pending Debian packages after completing the batch"
+                  << std::endl;
         return batch_result;
     }
 

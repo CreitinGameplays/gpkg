@@ -1116,6 +1116,11 @@ bool build_transaction_plan(
 
             const PackageMetadata* installed_meta = get_installed_meta(installed_name);
             if (!package_replaces_package(pkg, installed_name, installed_meta)) continue;
+            bool queued_conflicts_installed =
+                package_conflicts_with_package(pkg, installed_name, installed_meta);
+            bool installed_conflicts_queued =
+                installed_meta && package_conflicts_with_package(*installed_meta, pkg.name, &pkg);
+            if (!queued_conflicts_installed && !installed_conflicts_queued) continue;
 
             if (scheduled_retirements.insert(installed_name).second) {
                 out_plan.retirements.push_back({installed_name, pkg.name});
