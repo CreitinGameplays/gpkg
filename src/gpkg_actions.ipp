@@ -2079,6 +2079,7 @@ std::vector<std::string> build_dpkg_command_argv(const std::vector<std::string>&
         "/bin/dpkg",
         "--admindir",
         DPKG_ADMIN_DIR,
+        "--auto-deconfigure",
         "--force-confdef",
         "--force-confold"
     };
