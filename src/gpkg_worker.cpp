@@ -1396,11 +1396,29 @@ std::map<std::string, std::string> build_runtime_file_owner_index() {
         if (!is_multiarch_runtime_alias_candidate(path_basename(entry.first))) continue;
         owner_index.emplace(entry.first, entry.second);
     }
+    for (const auto& entry : snapshot.base_owner_by_path) {
+        if (!runtime_alias_managed_prefix(entry.first)) continue;
+        if (!is_multiarch_runtime_alias_candidate(path_basename(entry.first))) continue;
+        owner_index.emplace(entry.first, entry.second);
+    }
     return owner_index;
+}
+
+bool runtime_link_name_matches_resolved_basename(
+    const std::string& expected_name,
+    const std::string& resolved_path
+) {
+    if (expected_name.empty()) return true;
+
+    std::string basename = path_basename(resolved_path);
+    if (basename == expected_name) return true;
+
+    return basename.rfind(expected_name + ".", 0) == 0;
 }
 
 bool runtime_path_resolves_to_valid_library(
     const std::string& full_path,
+    const std::string& expected_name = "",
     std::string* resolved_path_out = nullptr,
     std::string* error_out = nullptr
 ) {
@@ -1439,6 +1457,14 @@ bool runtime_path_resolves_to_valid_library(
         return false;
     }
 
+    if (!runtime_link_name_matches_resolved_basename(expected_name, resolved)) {
+        if (error_out) {
+            *error_out = "resolved path " + path_basename(resolved) +
+                         " does not satisfy linker name " + expected_name;
+        }
+        return false;
+    }
+
     if (resolved_path_out) *resolved_path_out = resolved;
     return true;
 }
@@ -1473,6 +1499,7 @@ std::string select_global_runtime_alias_canonical_path(
         std::string path;
         bool owned = false;
         int rank = 100;
+        std::string provider_name;
     };
 
     std::vector<Candidate> candidates;
@@ -1481,13 +1508,61 @@ std::string select_global_runtime_alias_canonical_path(
             std::string logical_path = prefix + "/" + name;
             std::string full_path = g_root_prefix + logical_path;
             if (!path_exists_no_follow(full_path)) continue;
-            if (!runtime_path_resolves_to_valid_library(full_path)) continue;
+            if (!runtime_path_resolves_to_valid_library(full_path, name)) continue;
 
             Candidate candidate;
             candidate.path = full_path;
             candidate.owned = owner_index.count(logical_path) != 0;
             candidate.rank = runtime_alias_path_rank(logical_path);
+            candidate.provider_name = name;
             candidates.push_back(candidate);
+        }
+    }
+
+    auto looks_like_runtime_linker_name = [](const std::string& candidate_name) {
+        size_t so_pos = candidate_name.find(".so");
+        if (so_pos == std::string::npos) return false;
+
+        bool valid_prefix =
+            candidate_name.rfind("lib", 0) == 0 ||
+            candidate_name.rfind("ld-linux-", 0) == 0;
+        if (!valid_prefix) return false;
+
+        std::string suffix = candidate_name.substr(so_pos + 3);
+        if (suffix.empty()) return true;
+        return suffix[0] == '.' && suffix.find('.', 1) == std::string::npos;
+    };
+
+    if (candidates.empty() && looks_like_runtime_linker_name(name)) {
+        for (const auto& family : k_runtime_alias_families) {
+            for (const auto& prefix : runtime_alias_family_prefixes(family)) {
+                std::string dir_path = g_root_prefix + prefix;
+                DIR* dir = opendir(dir_path.c_str());
+                if (!dir) continue;
+
+                struct dirent* entry = nullptr;
+                while ((entry = readdir(dir)) != nullptr) {
+                    std::string provider_name = entry->d_name;
+                    if (provider_name == "." || provider_name == "..") continue;
+                    if (provider_name.rfind(name + ".", 0) != 0) continue;
+                    if (!is_multiarch_runtime_alias_candidate(provider_name)) continue;
+
+                    std::string logical_path = canonical_multiarch_logical_path(
+                        prefix + "/" + provider_name
+                    );
+                    std::string full_path = g_root_prefix + logical_path;
+                    if (!runtime_path_resolves_to_valid_library(full_path, provider_name)) continue;
+
+                    Candidate candidate;
+                    candidate.path = full_path;
+                    candidate.owned = owner_index.count(logical_path) != 0;
+                    candidate.rank = runtime_alias_path_rank(logical_path);
+                    candidate.provider_name = provider_name;
+                    candidates.push_back(candidate);
+                }
+
+                closedir(dir);
+            }
         }
     }
 
@@ -1496,6 +1571,7 @@ std::string select_global_runtime_alias_canonical_path(
     std::sort(candidates.begin(), candidates.end(), [](const Candidate& left, const Candidate& right) {
         if (left.owned != right.owned) return left.owned && !right.owned;
         if (left.rank != right.rank) return left.rank < right.rank;
+        if (left.provider_name != right.provider_name) return left.provider_name > right.provider_name;
         return left.path < right.path;
     });
     return candidates.front().path;
@@ -1697,7 +1773,7 @@ std::vector<std::string> collect_shadowed_stale_runtime_provider_paths() {
 
             std::string full_path = g_root_prefix + logical_path;
             std::string resolved_path;
-            if (!runtime_path_resolves_to_valid_library(full_path, &resolved_path)) continue;
+            if (!runtime_path_resolves_to_valid_library(full_path, name, &resolved_path)) continue;
 
             RuntimeProviderCandidate candidate;
             candidate.logical_path = logical_path;
@@ -1741,10 +1817,16 @@ std::vector<std::string> collect_shadowed_stale_runtime_provider_paths() {
     return stale_paths;
 }
 
-bool looks_like_unversioned_runtime_linker_name(const std::string& name) {
-    return name.rfind("lib", 0) == 0 &&
-           name.size() > 3 &&
-           name.compare(name.size() - 3, 3, ".so") == 0;
+bool looks_like_runtime_linker_name(const std::string& name) {
+    size_t so_pos = name.find(".so");
+    if (so_pos == std::string::npos) return false;
+
+    bool valid_prefix = name.rfind("lib", 0) == 0 || name.rfind("ld-linux-", 0) == 0;
+    if (!valid_prefix) return false;
+
+    std::string suffix = name.substr(so_pos + 3);
+    if (suffix.empty()) return true;
+    return suffix[0] == '.' && suffix.find('.', 1) == std::string::npos;
 }
 
 int runtime_linker_provider_name_rank(const std::string& name) {
@@ -1779,7 +1861,7 @@ std::vector<std::pair<std::string, std::string>> collect_broken_runtime_linker_s
             while ((entry = readdir(dir)) != nullptr) {
                 std::string name = entry->d_name;
                 if (name == "." || name == "..") continue;
-                if (!looks_like_unversioned_runtime_linker_name(name)) continue;
+                if (!looks_like_runtime_linker_name(name)) continue;
 
                 std::string full_path = dir_path + "/" + name;
                 struct stat link_st {};
@@ -1808,7 +1890,10 @@ std::vector<std::pair<std::string, std::string>> collect_broken_runtime_linker_s
                         candidate.full_path = g_root_prefix + candidate.logical_path;
 
                         std::string resolved_path;
-                        if (!runtime_path_resolves_to_valid_library(candidate.full_path, &resolved_path)) continue;
+                        if (!runtime_path_resolves_to_valid_library(
+                                candidate.full_path,
+                                candidate_name,
+                                &resolved_path)) continue;
                         candidate.owned = owner_index.count(candidate.logical_path) != 0;
                         candidate.path_rank = runtime_alias_path_rank(candidate.logical_path);
                         candidate.name_rank = runtime_linker_provider_name_rank(candidate_name);
@@ -1857,7 +1942,7 @@ std::vector<std::string> collect_broken_unowned_runtime_linker_symlink_paths() {
         while ((entry = readdir(dir)) != nullptr) {
             std::string name = entry->d_name;
             if (name == "." || name == "..") continue;
-            if (!looks_like_unversioned_runtime_linker_name(name)) continue;
+            if (!looks_like_runtime_linker_name(name)) continue;
 
             std::string logical_path = canonical_multiarch_logical_path(
                 std::string(family.canonical_prefix) + "/" + name);
@@ -1869,7 +1954,8 @@ std::vector<std::string> collect_broken_unowned_runtime_linker_symlink_paths() {
 
             struct stat target_st {};
             if (stat(full_path.c_str(), &target_st) == 0) continue;
-            if (find_cached_file_owner("", logical_path).empty()) {
+            if (find_cached_file_owner("", logical_path).empty() &&
+                find_cached_base_file_owner(logical_path).empty()) {
                 broken_paths.push_back(full_path);
             }
         }
