@@ -21,6 +21,7 @@
 #include <fnmatch.h>
 #include <mutex>
 #include <thread>
+#include <dlfcn.h>
 #include <sys/mount.h>
 #include <sys/xattr.h>
 #include <sys/sysmacros.h>
@@ -1469,6 +1470,119 @@ bool runtime_path_resolves_to_valid_library(
     return true;
 }
 
+bool runtime_library_loadable_with_current_process(
+    const std::string& full_path,
+    std::string* error_out = nullptr
+) {
+    static std::mutex cache_mutex;
+    static std::map<std::string, std::pair<bool, std::string>> cache;
+
+    std::string resolved = canonical_existing_path(full_path);
+    if (resolved.empty()) {
+        if (error_out) *error_out = "path does not resolve to an existing file";
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        auto it = cache.find(resolved);
+        if (it != cache.end()) {
+            if (error_out) *error_out = it->second.second;
+            return it->second.first;
+        }
+    }
+
+    int pipefd[2];
+    if (pipe(pipefd) != 0) {
+        if (error_out) *error_out = strerror(errno);
+        return false;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        if (error_out) *error_out = strerror(errno);
+        return false;
+    }
+
+    if (pid == 0) {
+        close(pipefd[0]);
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            dup2(devnull, STDERR_FILENO);
+            close(devnull);
+        }
+
+        dlerror();
+        void* handle = dlopen(resolved.c_str(), RTLD_NOW | RTLD_LOCAL);
+        if (!handle) {
+            const char* err = dlerror();
+            if (err && *err) {
+                (void)!write(pipefd[1], err, strlen(err));
+            }
+            close(pipefd[1]);
+            _exit(1);
+        }
+
+        dlclose(handle);
+        close(pipefd[1]);
+        _exit(0);
+    }
+
+    close(pipefd[1]);
+    std::string child_error;
+    char buf[256];
+    ssize_t n = 0;
+    while ((n = read(pipefd[0], buf, sizeof(buf))) > 0) {
+        child_error.append(buf, static_cast<size_t>(n));
+    }
+    close(pipefd[0]);
+
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno == EINTR) continue;
+        child_error = strerror(errno);
+        status = 1 << 8;
+        break;
+    }
+
+    bool ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    if (ok) child_error.clear();
+    else if (child_error.empty()) child_error = "library is not loadable with the current runtime";
+
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        cache[resolved] = std::make_pair(ok, child_error);
+    }
+
+    if (error_out) *error_out = child_error;
+    return ok;
+}
+
+bool runtime_provider_compatible_with_current_process(
+    const std::string& full_path,
+    std::string* error_out = nullptr
+) {
+    std::string load_error;
+    if (runtime_library_loadable_with_current_process(full_path, &load_error)) {
+        if (error_out) error_out->clear();
+        return true;
+    }
+
+    if (error_out) *error_out = load_error;
+    return false;
+}
+
+std::string runtime_alias_fallback_provider_name(const std::string& name) {
+    if (name == "libform.so.6") return "libformw.so.6";
+    if (name == "libmenu.so.6") return "libmenuw.so.6";
+    if (name == "libncurses.so.6") return "libncursesw.so.6";
+    if (name == "libpanel.so.6") return "libpanelw.so.6";
+    if (name == "libtinfo.so.6") return "libtinfow.so.6";
+    return "";
+}
+
 void collect_runtime_alias_names_for_prefix(
     const std::string& live_prefix,
     std::set<std::string>& names
@@ -1502,23 +1616,6 @@ std::string select_global_runtime_alias_canonical_path(
         std::string provider_name;
     };
 
-    std::vector<Candidate> candidates;
-    for (const auto& family : k_runtime_alias_families) {
-        for (const auto& prefix : runtime_alias_family_prefixes(family)) {
-            std::string logical_path = prefix + "/" + name;
-            std::string full_path = g_root_prefix + logical_path;
-            if (!path_exists_no_follow(full_path)) continue;
-            if (!runtime_path_resolves_to_valid_library(full_path, name)) continue;
-
-            Candidate candidate;
-            candidate.path = full_path;
-            candidate.owned = owner_index.count(logical_path) != 0;
-            candidate.rank = runtime_alias_path_rank(logical_path);
-            candidate.provider_name = name;
-            candidates.push_back(candidate);
-        }
-    }
-
     auto looks_like_runtime_linker_name = [](const std::string& candidate_name) {
         size_t so_pos = candidate_name.find(".so");
         if (so_pos == std::string::npos) return false;
@@ -1533,9 +1630,30 @@ std::string select_global_runtime_alias_canonical_path(
         return suffix[0] == '.' && suffix.find('.', 1) == std::string::npos;
     };
 
-    if (candidates.empty() && looks_like_runtime_linker_name(name)) {
+    auto gather_candidates = [&](const std::string& requested_name,
+                                 const std::string& expected_name_for_validation) {
+        std::vector<Candidate> gathered;
         for (const auto& family : k_runtime_alias_families) {
             for (const auto& prefix : runtime_alias_family_prefixes(family)) {
+                std::string logical_path = prefix + "/" + requested_name;
+                std::string full_path = g_root_prefix + logical_path;
+                if (path_exists_no_follow(full_path) &&
+                    runtime_path_resolves_to_valid_library(full_path, expected_name_for_validation)) {
+                    std::string load_error;
+                    if (!runtime_provider_compatible_with_current_process(full_path, &load_error)) {
+                        VLOG("Skipping runtime provider " << full_path << ": " << load_error);
+                    } else {
+                        Candidate candidate;
+                        candidate.path = full_path;
+                        candidate.owned = owner_index.count(logical_path) != 0;
+                        candidate.rank = runtime_alias_path_rank(logical_path);
+                        candidate.provider_name = requested_name;
+                        gathered.push_back(candidate);
+                    }
+                }
+
+                if (!looks_like_runtime_linker_name(requested_name)) continue;
+
                 std::string dir_path = g_root_prefix + prefix;
                 DIR* dir = opendir(dir_path.c_str());
                 if (!dir) continue;
@@ -1544,25 +1662,40 @@ std::string select_global_runtime_alias_canonical_path(
                 while ((entry = readdir(dir)) != nullptr) {
                     std::string provider_name = entry->d_name;
                     if (provider_name == "." || provider_name == "..") continue;
-                    if (provider_name.rfind(name + ".", 0) != 0) continue;
+                    if (provider_name.rfind(requested_name + ".", 0) != 0) continue;
                     if (!is_multiarch_runtime_alias_candidate(provider_name)) continue;
 
-                    std::string logical_path = canonical_multiarch_logical_path(
+                    std::string provider_logical_path = canonical_multiarch_logical_path(
                         prefix + "/" + provider_name
                     );
-                    std::string full_path = g_root_prefix + logical_path;
-                    if (!runtime_path_resolves_to_valid_library(full_path, provider_name)) continue;
+                    std::string provider_full_path = g_root_prefix + provider_logical_path;
+                    if (!runtime_path_resolves_to_valid_library(provider_full_path, provider_name)) continue;
+
+                    std::string load_error;
+                    if (!runtime_provider_compatible_with_current_process(provider_full_path, &load_error)) {
+                        VLOG("Skipping runtime provider " << provider_full_path << ": " << load_error);
+                        continue;
+                    }
 
                     Candidate candidate;
-                    candidate.path = full_path;
-                    candidate.owned = owner_index.count(logical_path) != 0;
-                    candidate.rank = runtime_alias_path_rank(logical_path);
+                    candidate.path = provider_full_path;
+                    candidate.owned = owner_index.count(provider_logical_path) != 0;
+                    candidate.rank = runtime_alias_path_rank(provider_logical_path);
                     candidate.provider_name = provider_name;
-                    candidates.push_back(candidate);
+                    gathered.push_back(candidate);
                 }
 
                 closedir(dir);
             }
+        }
+        return gathered;
+    };
+
+    std::vector<Candidate> candidates = gather_candidates(name, name);
+    if (candidates.empty()) {
+        std::string fallback_name = runtime_alias_fallback_provider_name(name);
+        if (!fallback_name.empty()) {
+            candidates = gather_candidates(fallback_name, fallback_name);
         }
     }
 
@@ -1894,6 +2027,12 @@ std::vector<std::pair<std::string, std::string>> collect_broken_runtime_linker_s
                                 candidate.full_path,
                                 candidate_name,
                                 &resolved_path)) continue;
+                        std::string load_error;
+                        if (!runtime_provider_compatible_with_current_process(candidate.full_path, &load_error)) {
+                            VLOG("Skipping runtime linker repair candidate " << candidate.full_path
+                                 << ": " << load_error);
+                            continue;
+                        }
                         candidate.owned = owner_index.count(candidate.logical_path) != 0;
                         candidate.path_rank = runtime_alias_path_rank(candidate.logical_path);
                         candidate.name_rank = runtime_linker_provider_name_rank(candidate_name);
