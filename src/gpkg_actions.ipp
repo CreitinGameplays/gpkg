@@ -266,21 +266,14 @@ bool package_has_exact_live_install_state(
 
     if (is_installed(pkg_name, version_out)) return true;
 
-    PackageStatusRecord dpkg_record;
-    if (get_dpkg_package_status_record(pkg_name, &dpkg_record) &&
-        package_status_is_installed_like(dpkg_record.status)) {
-        std::string resolved_version = sanitize_native_dpkg_status_version(
-            pkg_name,
-            dpkg_record.version
-        );
-        if (!native_dpkg_version_is_exact(resolved_version)) {
-            return false;
-        }
-        if (version_out) *version_out = resolved_version;
-        return true;
+    NativeLivePackageState live_state;
+    if (!resolve_native_live_package_state(pkg_name, &live_state) ||
+        !live_state.exact_version_known) {
+        return false;
     }
 
-    return false;
+    if (version_out) *version_out = live_state.version;
+    return true;
 }
 
 std::string to_lower_copy(const std::string& value) {
