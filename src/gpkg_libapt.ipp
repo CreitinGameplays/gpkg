@@ -40,6 +40,13 @@ bool resolve_upgrade_target_metadata(
     const PackageMetadata* installed_meta,
     std::string* reason_out
 );
+bool get_upgrade_target_current_version(
+    const Dependency& requested_dep,
+    const PackageMetadata& target_meta,
+    std::string& current_version,
+    bool verbose,
+    UpgradeContext* context
+);
 bool libapt_plan_install_like_transaction(
     const std::vector<std::string>& explicit_targets,
     const std::set<std::string>& reinstall_targets,
@@ -466,6 +473,73 @@ bool libapt_find_package(
     return false;
 }
 
+bool libapt_lookup_compiled_debian_metadata_for_candidate(
+    const std::string& pkg_name,
+    const std::string& version,
+    PackageMetadata& out_meta,
+    std::string* error_out = nullptr
+) {
+    if (error_out) error_out->clear();
+
+    static std::string cached_policy_fingerprint;
+    static std::map<std::string, DebianCompiledRecordCacheEntry> cached_entries;
+    static bool cache_loaded = false;
+    static bool cache_available = false;
+    static std::string cached_error;
+
+    std::string policy_fingerprint = build_debian_compiled_record_cache_policy_fingerprint();
+    if (!cache_loaded || cached_policy_fingerprint != policy_fingerprint) {
+        cached_policy_fingerprint = policy_fingerprint;
+        cached_entries.clear();
+        cached_error.clear();
+        cache_available = load_debian_compiled_record_cache(
+            policy_fingerprint,
+            cached_entries,
+            &cached_error
+        );
+        cache_loaded = true;
+    }
+
+    if (!cache_available) {
+        if (error_out) {
+            *error_out = cached_error.empty()
+                ? "compiled Debian metadata cache is unavailable"
+                : cached_error;
+        }
+        return false;
+    }
+
+    auto it = cached_entries.find(pkg_name);
+    if (it == cached_entries.end()) {
+        if (error_out) *error_out = "package is absent from cached Debian compiled metadata";
+        return false;
+    }
+
+    const DebianCompiledRecordCacheEntry& entry = it->second;
+    if (!entry.importable || entry.meta.name.empty()) {
+        if (error_out) {
+            *error_out = entry.skip_reason.empty()
+                ? ("package " + pkg_name + " is not importable under current GeminiOS policy")
+                : entry.skip_reason;
+        }
+        return false;
+    }
+
+    if (!version.empty() &&
+        !entry.meta.version.empty() &&
+        compare_versions(entry.meta.version, version) != 0) {
+        if (error_out) {
+            *error_out = "compiled Debian metadata version mismatch for " + pkg_name +
+                " (expected " + version + ", cached " + entry.meta.version + ")";
+        }
+        return false;
+    }
+
+    out_meta = entry.meta;
+    if (out_meta.debian_package.empty()) out_meta.debian_package = entry.raw_package;
+    return true;
+}
+
 bool libapt_resolve_metadata_for_candidate(
     const std::string& pkg_name,
     const std::string& version,
@@ -485,6 +559,16 @@ bool libapt_resolve_metadata_for_candidate(
             out_meta = repo_meta;
             return true;
         }
+    }
+
+    std::string compiled_error;
+    if (libapt_lookup_compiled_debian_metadata_for_candidate(
+            pkg_name,
+            version,
+            out_meta,
+            &compiled_error
+        )) {
+        return true;
     }
 
     RawDebianAvailabilityResult raw_result;
@@ -510,9 +594,14 @@ bool libapt_resolve_metadata_for_candidate(
     }
 
     if (error_out) {
-        *error_out = reason.empty()
-            ? "no Debian metadata candidate is available for " + pkg_name
-            : reason;
+        if (!compiled_error.empty() &&
+            (reason.empty() || reason == "raw Debian context index is unavailable")) {
+            *error_out = compiled_error;
+        } else {
+            *error_out = reason.empty()
+                ? "no Debian metadata candidate is available for " + pkg_name
+                : reason;
+        }
     }
     return false;
 }
@@ -643,7 +732,21 @@ bool libapt_plan_install_like_transaction(
 
         {
             pkgDepCache::ActionGroup group(cache);
-            if (!cache.MarkInstall(pkg, true, 0, true)) {
+            pkgCache::VerIterator candidate_version = cache.GetCandidateVersion(pkg);
+            bool same_version_candidate =
+                pkg->CurrentVer != 0 &&
+                !candidate_version.end() &&
+                compare_versions(candidate_version.VerStr(), pkg.CurrentVer().VerStr()) == 0;
+
+            bool marked_install = cache.MarkInstall(pkg, true, 0, true);
+            if (!marked_install &&
+                reinstall_targets.count(target) != 0 &&
+                same_version_candidate) {
+                cache.SetReInstall(pkg, true);
+                marked_install = true;
+            }
+
+            if (!marked_install) {
                 if (error_out) *error_out = "apt refused to mark " + target + " for installation";
                 return false;
             }
@@ -805,12 +908,17 @@ bool libapt_can_handle_upgrade_roots(
     UpgradeContext& context,
     const std::vector<std::string>& normalized_roots,
     bool verbose,
+    std::vector<std::string>* apt_targets_out = nullptr,
+    std::set<std::string>* reinstall_targets_out = nullptr,
     std::string* error_out = nullptr
 ) {
     if (error_out) error_out->clear();
+    if (apt_targets_out) apt_targets_out->clear();
+    if (reinstall_targets_out) reinstall_targets_out->clear();
     if (normalized_roots.empty()) return false;
 
     RawDebianContext raw_context;
+    std::set<std::string> seen_targets;
     for (const auto& pkg : normalized_roots) {
         PackageMetadata repo_meta;
         std::string resolve_reason;
@@ -835,6 +943,51 @@ bool libapt_can_handle_upgrade_roots(
                 *error_out = pkg + " resolves to an upgrade target that is not available in the native planner cache yet";
             }
             return false;
+        }
+
+        std::string apt_target = trim(repo_meta.debian_package);
+        if (apt_target.empty()) apt_target = trim(repo_meta.name);
+        if (apt_target.empty()) apt_target = canonicalize_package_name(pkg, verbose);
+        if (apt_target.empty()) {
+            if (error_out) *error_out = "no native planner operand is available for " + pkg;
+            return false;
+        }
+
+        bool needs_apt_action = true;
+        bool needs_reinstall = g_force_reinstall;
+        if (!needs_reinstall) {
+            std::string current_version;
+            bool was_installed = get_upgrade_target_current_version(
+                {pkg, "", ""},
+                repo_meta,
+                current_version,
+                verbose,
+                &context
+            );
+            if (was_installed) {
+                int version_cmp = compare_versions(repo_meta.version, current_version);
+                if (version_cmp <= 0) {
+                    bool managed_locally =
+                        get_local_installed_package_version(repo_meta.name, nullptr, &context);
+                    if (!managed_locally && repo_meta.name != pkg) {
+                        managed_locally = get_local_installed_package_version(pkg, nullptr, &context);
+                    }
+
+                    if (version_cmp == 0 && !managed_locally) {
+                        needs_reinstall = true;
+                    } else {
+                        needs_apt_action = false;
+                    }
+                }
+            }
+        }
+
+        if (!needs_apt_action) continue;
+        if (seen_targets.insert(apt_target).second && apt_targets_out) {
+            apt_targets_out->push_back(apt_target);
+        }
+        if (needs_reinstall && reinstall_targets_out) {
+            reinstall_targets_out->insert(apt_target);
         }
     }
 

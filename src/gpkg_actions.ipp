@@ -6157,16 +6157,22 @@ bool prepare_upgrade_transaction(
         std::vector<std::string> normalized_roots = collect_normalized_upgrade_roots(context, verbose);
         if (!normalized_roots.empty()) {
             std::string unsupported_reason;
-            if (libapt_can_handle_upgrade_roots(context, normalized_roots, verbose, &unsupported_reason)) {
-                std::set<std::string> reinstall_targets;
-                if (g_force_reinstall) {
-                    reinstall_targets.insert(normalized_roots.begin(), normalized_roots.end());
-                }
+            std::vector<std::string> apt_targets;
+            std::set<std::string> reinstall_targets;
+            if (libapt_can_handle_upgrade_roots(
+                    context,
+                    normalized_roots,
+                    verbose,
+                    &apt_targets,
+                    &reinstall_targets,
+                    &unsupported_reason
+                )) {
+                if (apt_targets.empty()) return true;
 
                 LibAptTransactionPlanResult apt_plan;
                 std::string apt_error;
                 if (!libapt_plan_install_like_transaction(
-                        normalized_roots,
+                        apt_targets,
                         reinstall_targets,
                         false,
                         verbose,
