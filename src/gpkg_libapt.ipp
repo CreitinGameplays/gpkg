@@ -82,6 +82,162 @@ std::string libapt_seeded_packages_list_name(const std::string& repo_dir) {
     return libapt_sanitize_cache_key(repo_dir) + "._Packages";
 }
 
+bool libapt_copy_file(const std::string& src, const std::string& dst, std::string* error_out);
+bool libapt_write_text_file(const std::string& path, const std::string& content, std::string* error_out);
+
+std::string libapt_normalize_architecture_name(
+    const std::string& raw_arch,
+    const std::string& fallback_arch
+) {
+    std::string arch = trim(raw_arch);
+    if (arch.empty()) arch = fallback_arch;
+    if (arch.empty()) return "amd64";
+
+    std::string lowered = ascii_lower_copy(arch);
+    if (lowered == "x86_64" || lowered == "amd64") return "amd64";
+    if (lowered == "aarch64" || lowered == "arm64") return "arm64";
+    if (lowered == "i386" || lowered == "i486" || lowered == "i586" || lowered == "i686") {
+        return "i386";
+    }
+    if (lowered == "all" || lowered == "noarch") return "all";
+    return lowered;
+}
+
+bool package_can_use_libapt_native_planner(const PackageMetadata& meta) {
+    return package_is_debian_source(meta) || meta.source_kind == "gpkg_repo";
+}
+
+bool libapt_append_seeded_packages_source(
+    const ScopedLibAptSessionRoot& session_root,
+    const std::string& repo_dir,
+    const std::string& packages_path,
+    std::string& source_list,
+    std::string* error_out = nullptr
+) {
+    if (error_out) error_out->clear();
+    if (repo_dir.empty() || packages_path.empty()) {
+        if (error_out) *error_out = "invalid seeded apt source";
+        return false;
+    }
+
+    std::string list_name = libapt_seeded_packages_list_name(repo_dir);
+    std::string list_path = session_root.path + "/state/lists/" + list_name;
+    if (!libapt_copy_file(packages_path, list_path, error_out)) return false;
+
+    source_list += "deb [trusted=yes] file:" + repo_dir + " ./\n";
+    return true;
+}
+
+std::string libapt_render_repo_native_packages_paragraph(
+    const PackageMetadata& meta,
+    const DebianBackendConfig& config
+) {
+    std::vector<std::string> lines;
+    std::string package_name = canonicalize_package_name(meta.name);
+    if (package_name.empty()) package_name = meta.name;
+    std::string description = description_summary(meta.description, 200);
+    if (description.empty()) description = "GeminiOS native package";
+
+    lines.push_back("Package: " + package_name);
+    lines.push_back("Version: " + trim(meta.version));
+    lines.push_back("Architecture: " + libapt_normalize_architecture_name(meta.arch, config.apt_arch));
+
+    std::string priority = trim(meta.priority);
+    if (!priority.empty()) lines.push_back("Priority: " + priority);
+
+    std::string section = trim(meta.section);
+    if (!section.empty()) lines.push_back("Section: " + section);
+
+    std::string maintainer = trim(meta.maintainer);
+    if (!maintainer.empty()) lines.push_back("Maintainer: " + maintainer);
+
+    std::string installed_size_text = trim(meta.installed_size_bytes);
+    if (!installed_size_text.empty()) {
+        char* end = nullptr;
+        errno = 0;
+        unsigned long long installed_size_bytes = std::strtoull(installed_size_text.c_str(), &end, 10);
+        if (errno == 0 &&
+            end != nullptr &&
+            *end == '\0' &&
+            installed_size_bytes > 0) {
+            lines.push_back("Installed-Size: " + std::to_string((installed_size_bytes + 1023ULL) / 1024ULL));
+        }
+    }
+
+    auto append_relation_field = [&](const std::string& key, const std::vector<std::string>& values) {
+        std::vector<std::string> normalized;
+        normalized.reserve(values.size());
+        for (const auto& value : values) {
+            std::string trimmed = trim(value);
+            if (!trimmed.empty()) normalized.push_back(trimmed);
+        }
+        if (!normalized.empty()) lines.push_back(key + ": " + join_strings(normalized));
+    };
+
+    append_relation_field("Pre-Depends", meta.pre_depends);
+    append_relation_field("Depends", meta.depends);
+    append_relation_field("Recommends", meta.recommends);
+    append_relation_field("Suggests", meta.suggests);
+    append_relation_field("Breaks", meta.breaks);
+    append_relation_field("Conflicts", meta.conflicts);
+    append_relation_field("Provides", meta.provides);
+    append_relation_field("Replaces", meta.replaces);
+
+    if (!meta.filename.empty()) lines.push_back("Filename: " + meta.filename);
+    if (!meta.size.empty()) lines.push_back("Size: " + trim(meta.size));
+    if (!meta.sha256.empty()) lines.push_back("SHA256: " + trim(meta.sha256));
+    lines.push_back("Description: " + description);
+    return join_strings(lines, "\n");
+}
+
+bool libapt_seed_repo_native_packages_index(
+    const ScopedLibAptSessionRoot& session_root,
+    const DebianBackendConfig& config,
+    std::string& source_list,
+    bool verbose,
+    std::string* error_out = nullptr
+) {
+    if (error_out) error_out->clear();
+    if (!try_ensure_repo_package_cache_loaded(verbose)) return true;
+
+    std::ostringstream packages_stream;
+    size_t package_count = 0;
+    for (const auto& package_name : g_repo_available_package_cache) {
+        PackageMetadata meta;
+        if (!get_loaded_repo_package_info(package_name, meta)) continue;
+        if (meta.source_kind != "gpkg_repo") continue;
+        if (trim(meta.name).empty() || trim(meta.version).empty()) continue;
+
+        packages_stream << libapt_render_repo_native_packages_paragraph(meta, config) << "\n\n";
+        ++package_count;
+    }
+
+    if (package_count == 0) return true;
+
+    std::string repo_dir = session_root.path + "/repo-native";
+    if (!mkdir_p(repo_dir)) {
+        if (error_out) *error_out = "failed to prepare " + repo_dir;
+        return false;
+    }
+
+    std::string packages_path = repo_dir + "/Packages";
+    if (!libapt_write_text_file(packages_path, packages_stream.str(), error_out)) return false;
+    if (!libapt_append_seeded_packages_source(
+            session_root,
+            repo_dir,
+            packages_path,
+            source_list,
+            error_out
+        )) {
+        return false;
+    }
+
+    VLOG(verbose, "Seeded libapt-pkg with " << package_count
+                 << " GeminiOS repository package entr"
+                 << (package_count == 1 ? "y." : "ies."));
+    return true;
+}
+
 bool libapt_copy_file(const std::string& src, const std::string& dst, std::string* error_out = nullptr) {
     if (error_out) error_out->clear();
 
@@ -169,17 +325,28 @@ bool libapt_prepare_session_root(
 bool libapt_seed_debian_packages_index(
     const ScopedLibAptSessionRoot& session_root,
     const std::string& packages_path,
+    const DebianBackendConfig& config,
     bool verbose,
     std::string* error_out = nullptr
 ) {
     if (error_out) error_out->clear();
 
     std::string repo_dir = path_dirname(packages_path);
-    std::string list_name = libapt_seeded_packages_list_name(repo_dir);
-    std::string list_path = session_root.path + "/state/lists/" + list_name;
-    if (!libapt_copy_file(packages_path, list_path, error_out)) return false;
+    std::string source_list;
+    if (!libapt_append_seeded_packages_source(
+            session_root,
+            repo_dir,
+            packages_path,
+            source_list,
+            error_out
+        )) {
+        return false;
+    }
 
-    std::string source_list = "deb [trusted=yes] file:" + repo_dir + " ./\n";
+    if (!libapt_seed_repo_native_packages_index(session_root, config, source_list, verbose, error_out)) {
+        return false;
+    }
+
     if (!libapt_write_text_file(session_root.path + "/etc/sources.list", source_list, error_out)) {
         return false;
     }
@@ -305,6 +472,17 @@ bool libapt_resolve_metadata_for_candidate(
 ) {
     if (error_out) error_out->clear();
 
+    if (try_ensure_repo_package_cache_loaded(verbose)) {
+        PackageMetadata repo_meta;
+        std::string canonical_name = canonicalize_package_name(pkg_name, verbose);
+        if (get_loaded_repo_package_info(canonical_name, repo_meta) &&
+            package_can_use_libapt_native_planner(repo_meta) &&
+            compare_versions(repo_meta.version, version) == 0) {
+            out_meta = repo_meta;
+            return true;
+        }
+    }
+
     RawDebianAvailabilityResult raw_result;
     std::string reason;
     if (resolve_raw_debian_relation_candidate(
@@ -420,7 +598,7 @@ bool libapt_open_seeded_cache(
 
     DebianBackendConfig config = load_debian_backend_config(verbose);
     if (!libapt_prepare_session_root(session_root, error_out)) return false;
-    if (!libapt_seed_debian_packages_index(session_root, packages_path, verbose, error_out)) return false;
+    if (!libapt_seed_debian_packages_index(session_root, packages_path, config, verbose, error_out)) return false;
     if (!libapt_initialize_globals(session_root, config, verbose, error_out)) return false;
     if (!libapt_build_cache_file(cache_file, verbose, error_out)) return false;
     libapt_seed_auto_install_state(cache_file);
@@ -604,9 +782,9 @@ bool libapt_can_handle_repo_install_operands(
             if (error_out) *error_out = "no repository candidate is available for " + operand;
             return false;
         }
-        if (!package_is_debian_source(result.meta)) {
+        if (!package_can_use_libapt_native_planner(result.meta)) {
             if (error_out) {
-                *error_out = operand + " resolves to a non-Debian package, so the legacy planner is still required";
+                *error_out = operand + " resolves to a package source that is not available in the native planner cache yet";
             }
             return false;
         }
@@ -644,9 +822,9 @@ bool libapt_can_handle_upgrade_roots(
             if (error_out) *error_out = resolve_reason.empty() ? ("no upgrade candidate is available for " + pkg) : resolve_reason;
             return false;
         }
-        if (!package_is_debian_source(repo_meta)) {
+        if (!package_can_use_libapt_native_planner(repo_meta)) {
             if (error_out) {
-                *error_out = pkg + " resolves to a non-Debian upgrade target, so the legacy planner is still required";
+                *error_out = pkg + " resolves to an upgrade target that is not available in the native planner cache yet";
             }
             return false;
         }
@@ -663,9 +841,9 @@ bool libapt_can_handle_repair_queue(
     if (repair_queue.empty()) return false;
 
     for (const auto& meta : repair_queue) {
-        if (!package_is_debian_source(meta)) {
+        if (!package_can_use_libapt_native_planner(meta)) {
             if (error_out) {
-                *error_out = meta.name + " is not a Debian-backed package, so the legacy repair path is still required";
+                *error_out = meta.name + " is not available in the native planner cache yet, so the legacy repair path is still required";
             }
             return false;
         }
