@@ -187,6 +187,7 @@ void print_help() {
         {"gpkg update", "Refresh local package indices"},
         {"gpkg search <query>", "Find packages by name or description"},
         {"gpkg install <pkg>", "Download and install packages"},
+        {"gpkg selfupgrade", "Upgrade gpkg itself directly from the GeminiOS repo"},
         {"gpkg upgrade", "Upgrade all installed packages"},
         {"gpkg doctor", "Inspect repository and install health"},
     };
@@ -208,6 +209,7 @@ void print_help() {
     };
     const std::vector<GpkgHelpEntry> commands = {
         {"install <pkg>", "Download and install packages (up to 5 archives in parallel)"},
+        {"selfupgrade", "Upgrade gpkg itself directly from the GeminiOS repository (alias: self)"},
         {"remove <pkg>", "Remove an installed package (--purge to purge conffiles too)"},
         {"autoremove", "Remove automatically installed packages that are no longer needed"},
         {"repair", "Repair broken dependencies and reinstall damaged packages"},
@@ -311,6 +313,12 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    if (action == "self" ||
+        action == "self-upgrade" ||
+        action == "upgrade-self") {
+        action = "selfupgrade";
+    }
+
     if (recommended_yes && recommended_no) {
         std::cerr << Color::RED
                   << "E: --recommended-yes and --recommended-no cannot be used together."
@@ -337,9 +345,10 @@ int main(int argc, char* argv[]) {
 
     if (reinstall &&
         action != "install" &&
-        action != "upgrade") {
+        action != "upgrade" &&
+        action != "selfupgrade") {
         std::cerr << Color::RED
-                  << "E: --reinstall is only valid with install or upgrade."
+                  << "E: --reinstall is only valid with install, upgrade, or selfupgrade."
                   << Color::RESET << std::endl;
         return 1;
     }
@@ -369,6 +378,7 @@ int main(int argc, char* argv[]) {
 
     bool mutates_package_runtime = (
         action == "install" ||
+        action == "selfupgrade" ||
         action == "remove" ||
         action == "autoremove" ||
         action == "repair" ||
@@ -376,7 +386,7 @@ int main(int argc, char* argv[]) {
     );
     if ((defer_services || unsafe_io) && !mutates_package_runtime) {
         std::cerr << Color::RED
-                  << "E: --defer-services and --unsafe-io are only valid with install, remove, autoremove, repair, or upgrade."
+                  << "E: --defer-services and --unsafe-io are only valid with install, selfupgrade, remove, autoremove, repair, or upgrade."
                   << Color::RESET << std::endl;
         return 1;
     }
@@ -392,7 +402,8 @@ int main(int argc, char* argv[]) {
 
 #ifndef DEV_MODE
     if (geteuid() != 0 &&
-        (action == "install" || action == "remove" || action == "autoremove" || action == "update" ||
+        (action == "install" || action == "selfupgrade" ||
+         action == "remove" || action == "autoremove" || action == "update" ||
          action == "add-repo" || action == "clean" || action == "upgrade" ||
          action == "repair")) {
         std::cerr << Color::RED << "E: This command requires root privileges." << Color::RESET << std::endl;
@@ -402,6 +413,7 @@ int main(int argc, char* argv[]) {
 
     bool needs_trans = (
         action == "install" ||
+        action == "selfupgrade" ||
         action == "remove" ||
         action == "autoremove" ||
         action == "repair" ||
@@ -432,6 +444,7 @@ int main(int argc, char* argv[]) {
         return 0;
     }
     if (action == "update") return handle_update(verbose);
+    if (action == "selfupgrade") return handle_selfupgrade(argc, argv, installed_cache, verbose);
     if (action == "upgrade") return handle_upgrade(installed_cache, verbose);
     if (action == "repair") return handle_repair(verbose);
     if (action == "doctor") return handle_doctor(verbose);

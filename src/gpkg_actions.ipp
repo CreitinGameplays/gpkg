@@ -2437,42 +2437,20 @@ std::vector<std::string> collect_normalized_upgrade_roots(
     context.shadowed_base_alias_target.clear();
 
     std::set<std::string> raw_roots;
-    for (const auto& pkg : context.registered_package_names) {
-        if (!pkg.empty()) raw_roots.insert(canonicalize_package_name(pkg, verbose));
-    }
-    for (const auto& pkg : context.upgrade_catalog.resolved_roots) {
-        if (!pkg.empty()) raw_roots.insert(canonicalize_package_name(pkg, verbose));
-    }
-
-    auto seed_repo_native_base_image_upgrade_root = [&](const std::string& pkg_name,
-                                                        const std::vector<std::string>& probe_paths) {
+    auto add_upgrade_root = [&](const std::string& pkg_name) {
         if (pkg_name.empty()) return;
-        if (package_has_exact_live_install_state(pkg_name, nullptr, &context)) return;
 
-        bool live_payload_present = false;
-        for (const auto& probe_path : probe_paths) {
-            if (probe_path.empty()) continue;
-            if (access((ROOT_PREFIX + probe_path).c_str(), F_OK) == 0) {
-                live_payload_present = true;
-                break;
-            }
+        std::string canonical_name = canonicalize_package_name(pkg_name, verbose);
+        if (canonical_name.empty()) return;
+        if (canonical_name == "gpkg") {
+            VLOG(verbose, "Skipping gpkg from the general upgrade sweep; use 'gpkg selfupgrade' instead.");
+            return;
         }
-        if (!live_payload_present) return;
 
-        PackageMetadata repo_meta;
-        if (!get_repo_package_info(pkg_name, repo_meta)) return;
-
-        VLOG(verbose, "Seeding repo-native base-image upgrade root " << pkg_name
-                     << " because its live payload exists without exact package state.");
-        raw_roots.insert(canonicalize_package_name(pkg_name, verbose));
+        raw_roots.insert(canonical_name);
     };
-
-    // Some GeminiOS-native tools ship in the base image before gpkg owns them by exact
-    // package name. Seed those roots so a later repository package can self-upgrade/import.
-    seed_repo_native_base_image_upgrade_root("gpkg", {
-        "/bin/apps/system/gpkg",
-        "/bin/gpkg",
-    });
+    for (const auto& pkg : context.registered_package_names) add_upgrade_root(pkg);
+    for (const auto& pkg : context.upgrade_catalog.resolved_roots) add_upgrade_root(pkg);
 
     std::vector<std::string> normalized_roots;
     std::set<std::string> emitted_targets;
@@ -2489,6 +2467,10 @@ std::vector<std::string> collect_normalized_upgrade_roots(
         if (target.empty()) {
             VLOG(verbose, "No repository candidate available for normalized upgrade root "
                          << raw_name);
+            continue;
+        }
+        if (target == "gpkg") {
+            VLOG(verbose, "Skipping gpkg normalized upgrade target; use 'gpkg selfupgrade' instead.");
             continue;
         }
 
@@ -7361,24 +7343,217 @@ bool maybe_report_unavailable_install_target(
     return true;
 }
 
-bool install_operand_prefers_direct_self_upgrade(
-    const std::string& requested_name,
-    bool verbose
-) {
-    std::string canonical_name = canonicalize_package_name(requested_name, verbose);
-    if (canonical_name != "gpkg") return false;
-    if (!try_ensure_repo_package_cache_loaded(verbose)) return false;
+int handle_selfupgrade(int argc, char* argv[], const std::set<std::string>& installed_cache, bool verbose) {
+    std::vector<std::string> operands = collect_cli_operands(argc, argv, 2);
+    if (!operands.empty()) {
+        std::cerr << Color::RED
+                  << "E: gpkg selfupgrade does not take package names. Use 'gpkg selfupgrade' or the alias 'gpkg self'."
+                  << Color::RESET << std::endl;
+        return 1;
+    }
 
-    PackageMetadata repo_meta;
-    return get_loaded_repo_package_info(canonical_name, repo_meta);
+    if (!ensure_repo_index_available()) return 1;
+
+    std::cout << "Checking gpkg self-upgrade target..." << std::endl;
+    if (!ensure_repo_package_cache_loaded(verbose)) {
+        std::cerr << Color::RED
+                  << "E: Failed to load GeminiOS repository metadata for gpkg self-upgrade."
+                  << Color::RESET << std::endl;
+        return 1;
+    }
+
+    PackageMetadata self_meta;
+    if (!get_loaded_repo_package_info("gpkg", self_meta)) {
+        std::cerr << Color::RED
+                  << "E: No gpkg self-upgrade package was found in the configured GeminiOS repositories."
+                  << Color::RESET << std::endl;
+        return 1;
+    }
+
+    std::string canonical_target = canonicalize_package_name(self_meta.name, verbose);
+    if (canonical_target != "gpkg") {
+        std::cerr << Color::RED
+                  << "E: Refusing self-upgrade because the resolved repository candidate was '"
+                  << self_meta.name << "' instead of 'gpkg'."
+                  << Color::RESET << std::endl;
+        return 1;
+    }
+    if (package_is_debian_source(self_meta)) {
+        std::cerr << Color::RED
+                  << "E: Refusing self-upgrade because gpkg self-upgrade must come from a GeminiOS repository package, not a Debian package."
+                  << Color::RESET << std::endl;
+        return 1;
+    }
+
+    std::string current_version;
+    bool have_exact_version = get_local_installed_package_version("gpkg", &current_version, nullptr);
+    if (have_exact_version) {
+        int version_cmp = compare_versions(self_meta.version, current_version);
+        if (version_cmp < 0) {
+            std::cerr << Color::RED
+                      << "E: Refusing to downgrade gpkg (" << current_version
+                      << " -> " << self_meta.version << ") via selfupgrade."
+                      << Color::RESET << std::endl;
+            return 1;
+        }
+        if (version_cmp == 0 && !g_force_reinstall) {
+            std::cout << "gpkg is already up to date (" << self_meta.version << ")." << std::endl;
+            return 0;
+        }
+    }
+
+    std::vector<PackageMetadata> install_queue = {self_meta};
+    UpgradeContext self_context = build_upgrade_context(verbose);
+    const std::set<std::string>& live_set =
+        self_context.exact_live_packages.empty() ? installed_cache : self_context.exact_live_packages;
+    TransactionPlan self_plan;
+    std::string plan_error;
+    if (!build_transaction_plan(
+            install_queue,
+            live_set,
+            verbose,
+            self_plan,
+            &self_context,
+            &plan_error
+        )) {
+        std::cerr << Color::RED << "E: "
+                  << (plan_error.empty()
+                          ? "could not build a safe gpkg self-upgrade transaction"
+                          : plan_error)
+                  << Color::RESET << std::endl;
+        return 1;
+    }
+
+    PlannedPackageKind plan_kind = classify_planned_package(self_meta, &current_version);
+    if (plan_kind == PlannedPackageKind::Reinstall && !g_force_reinstall) {
+        std::cout << "gpkg is already up to date (" << self_meta.version << ")." << std::endl;
+        return 0;
+    }
+
+    std::string origin = format_package_origin(self_meta);
+    if (!origin.empty()) {
+        std::cout << "Self-upgrade source: " << origin << std::endl;
+    }
+
+    if (plan_kind == PlannedPackageKind::NewInstall) {
+        std::cout << "The following package will be installed:" << std::endl;
+        std::cout << "  " << Color::GREEN << self_meta.name << Color::RESET
+                  << " (" << self_meta.version << ")" << std::endl;
+    } else if (plan_kind == PlannedPackageKind::Reinstall) {
+        std::cout << "The following package will be reinstalled:" << std::endl;
+        std::cout << "  " << Color::BLUE << self_meta.name << Color::RESET
+                  << " (" << self_meta.version << ")" << std::endl;
+    } else {
+        std::cout << "The following package will be upgraded:" << std::endl;
+        std::cout << "  " << Color::GREEN << self_meta.name << Color::RESET
+                  << " (" << current_version << " -> " << self_meta.version << ")" << std::endl;
+    }
+
+    if (!self_plan.retirements.empty()) {
+        std::cout << "The following installed packages will be retired as replacements:" << std::endl;
+        for (const auto& entry : self_plan.retirements) {
+            std::cout << "  " << Color::YELLOW << entry.installed_name << Color::RESET
+                      << " -> " << Color::GREEN << entry.replacement_name << Color::RESET << std::endl;
+        }
+    }
+
+    print_transaction_disk_change_summary(
+        estimate_install_transaction_disk_change(
+            install_queue,
+            !self_plan.retirements.empty()
+        )
+    );
+
+    if (!ask_confirmation("Do you want to continue?")) return 0;
+
+    std::cout << Color::CYAN << "[*] Downloading gpkg self-upgrade..." << Color::RESET << std::endl;
+    DownloadBatchReport download_report = download_package_archives(
+        install_queue,
+        verbose,
+        1
+    );
+    std::cout << Color::CYAN << "[*] Download summary: "
+              << download_report.downloaded_count << " downloaded, "
+              << download_report.reused_count << " reused from cache, "
+              << format_total_bytes(download_report.downloaded_bytes) << " transferred."
+              << Color::RESET << std::endl;
+    if (download_report.results.empty() || !download_report.results.front().success) {
+        std::string reason =
+            (!download_report.results.empty() ? download_report.results.front().error : std::string{});
+        std::cerr << Color::RED
+                  << "E: Failed to download the gpkg self-upgrade package";
+        if (!reason.empty()) std::cerr << " (" << reason << ")";
+        std::cerr << Color::RESET << std::endl;
+        return 1;
+    }
+
+    std::vector<std::string> failed_preparation;
+    if (!prepare_install_archives(install_queue, download_report, verbose, failed_preparation)) {
+        std::cerr << Color::RED
+                  << "E: Aborting self-upgrade because these packages could not be prepared safely: "
+                  << join_strings(failed_preparation)
+                  << Color::RESET << std::endl;
+        return 1;
+    }
+
+    std::cout << Color::CYAN << "[*] Installing gpkg self-upgrade..." << Color::RESET << std::endl;
+    InstallCommandResult install_result = install_package_v2(self_meta, verbose);
+    if (!install_result.success) {
+        std::cerr << Color::RED << "E: Failed to install the gpkg self-upgrade package"
+                  << Color::RESET;
+        if (!verbose && !install_result.log_path.empty()) {
+            std::cerr << " See " << install_result.log_path << " for details.";
+        }
+        std::cerr << std::endl;
+        return 1;
+    }
+
+    std::string failed_pkg;
+    std::string failed_log;
+    if (!retire_replaced_packages_live(
+            self_plan,
+            self_meta.name,
+            verbose,
+            &failed_pkg,
+            &failed_log
+        )) {
+        std::cerr << Color::RED << "E: Failed to retire replaced package "
+                  << failed_pkg << Color::RESET << std::endl;
+        if (!verbose && !failed_log.empty()) {
+            std::cerr << " See " << failed_log << " for details.";
+        }
+        std::cerr << std::endl;
+        return 1;
+    }
+
+    if (!update_package_auto_install_state_after_install(
+            self_meta.name,
+            true,
+            installed_cache)) {
+        std::cerr << Color::RED
+                  << "E: Failed to mark gpkg as a manually installed package after self-upgrade."
+                  << Color::RESET << std::endl;
+        return 1;
+    }
+
+    queue_triggers_for_package(self_meta.name);
+    if (plan_kind == PlannedPackageKind::NewInstall) {
+        std::cout << Color::GREEN << "✓ Installed gpkg (" << self_meta.version << ")."
+                  << Color::RESET << std::endl;
+    } else if (plan_kind == PlannedPackageKind::Reinstall) {
+        std::cout << Color::GREEN << "✓ Reinstalled gpkg (" << self_meta.version << ")."
+                  << Color::RESET << std::endl;
+    } else {
+        std::cout << Color::GREEN << "✓ Upgraded gpkg to " << self_meta.version << "."
+                  << Color::RESET << std::endl;
+    }
+    return 0;
 }
 
 int handle_install(int argc, char* argv[], const std::set<std::string>& installed_cache, bool verbose) {
     std::vector<PackageMetadata> install_queue;
     std::vector<std::string> local_files;
     std::vector<std::string> repo_operands;
-    std::vector<std::string> prioritized_repo_operands;
-    std::vector<std::string> deferred_repo_operands;
     std::vector<std::string> operands = collect_cli_operands(argc, argv, 2);
     bool needs_repo_index = false;
     bool mutated_runtime_state = false;
@@ -7403,16 +7578,13 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
     if (needs_repo_index && !ensure_repo_index_available()) return 1;
 
     for (const auto& arg : repo_operands) {
-        if (install_operand_prefers_direct_self_upgrade(arg, verbose)) {
-            prioritized_repo_operands.push_back(arg);
-            continue;
+        std::string requested_name = canonicalize_package_name(relation_name_from_text(arg), verbose);
+        if (requested_name == "gpkg") {
+            std::cerr << Color::RED
+                      << "E: gpkg no longer self-upgrades through 'gpkg install gpkg'. Use 'gpkg selfupgrade' or the alias 'gpkg self' instead."
+                      << Color::RESET << std::endl;
+            return 1;
         }
-        deferred_repo_operands.push_back(arg);
-    }
-
-    if (verbose && !prioritized_repo_operands.empty()) {
-        std::cout << "[DEBUG] Prioritizing direct GeminiOS repository resolution for explicit self-upgrade target(s): "
-                  << join_strings(prioritized_repo_operands) << std::endl;
     }
 
     for (const auto& arg : repo_operands) {
@@ -7422,8 +7594,7 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
     }
 
     if (!repo_operands.empty()) {
-        std::vector<std::string> apt_targets = prioritized_repo_operands;
-        apt_targets.insert(apt_targets.end(), deferred_repo_operands.begin(), deferred_repo_operands.end());
+        std::vector<std::string> apt_targets = repo_operands;
         std::string unsupported_reason;
         if (!libapt_can_handle_repo_install_operands(apt_targets, verbose, &unsupported_reason)) {
             std::cerr << Color::RED << "E: "
