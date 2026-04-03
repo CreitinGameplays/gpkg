@@ -29,11 +29,11 @@ ifeq ($(strip $(GPKG_CODENAME)),)
 GPKG_CODENAME := $(shell sed -n 's/^#define OS_CODENAME "\(.*\)"/\1/p' $(SYS_INFO_HEADER) | head -n1)
 endif
 
-CXXFLAGS += -Wall -Wextra -O2 -I./src -I$(GINIT_DIR)/src -I$(GLOBAL_SRC_DIR)
-CXXFLAGS += '-DGPKG_VERSION="$(GPKG_VERSION)"' '-DGPKG_CODENAME="$(GPKG_CODENAME)"'
+BASE_CXXFLAGS += -Wall -Wextra -O2 -I./src -I$(GINIT_DIR)/src -I$(GLOBAL_SRC_DIR)
+BASE_CXXFLAGS += '-DGPKG_VERSION="$(GPKG_VERSION)"' '-DGPKG_CODENAME="$(GPKG_CODENAME)"'
 ifneq ($(wildcard $(TARGET_ROOTFS)),)
-CXXFLAGS += --sysroot=$(TARGET_ROOTFS)
-LDFLAGS += --sysroot=$(TARGET_ROOTFS)
+BASE_CXXFLAGS += --sysroot=$(TARGET_ROOTFS)
+BASE_LDFLAGS += --sysroot=$(TARGET_ROOTFS)
 endif
 ifneq ($(wildcard $(TARGET_ROOTFS)),)
 LIBAPT_PKG_HEADER_DIR := $(firstword \
@@ -50,7 +50,7 @@ LIBAPT_PKG_RUNTIME_LIB := $(realpath $(LIBAPT_PKG_RUNTIME_LIB_CANDIDATE))
 LIBAPT_PKG_RUNTIME_DIR := $(dir $(LIBAPT_PKG_RUNTIME_LIB))
 ifneq ($(strip $(LIBAPT_PKG_HEADER_DIR)),)
 ifneq ($(strip $(LIBAPT_PKG_RUNTIME_LIB)),)
-CXXFLAGS += -DGPKG_HAVE_WORKING_LIBAPT_PKG_BACKEND
+BASE_CXXFLAGS += -DGPKG_HAVE_WORKING_LIBAPT_PKG_BACKEND
 LIBAPT_PKG_LIBS := -L$(LIBAPT_PKG_RUNTIME_DIR) -lapt-pkg -pthread
 else
 LIBAPT_PKG_LIBS :=
@@ -60,22 +60,22 @@ LIBAPT_PKG_LIBS :=
 endif
 ifneq ($(strip $(TARGET_ROOTFS)),)
 ifneq ($(wildcard $(TARGET_ROOTFS)/usr/include),)
-CXXFLAGS += -I$(TARGET_ROOTFS)/usr/include
+BASE_CXXFLAGS += -I$(TARGET_ROOTFS)/usr/include
 endif
 endif
 ifneq ($(strip $(TARGET_CXX_VERSION)),)
-CXXFLAGS += -nostdinc++
-CXXFLAGS += -isystem $(TARGET_ROOTFS)/usr/include/c++/$(TARGET_CXX_VERSION)
-CXXFLAGS += -isystem $(TARGET_ROOTFS)/usr/include/x86_64-linux-gnu/c++/$(TARGET_CXX_VERSION)
-CXXFLAGS += -isystem $(TARGET_ROOTFS)/usr/include/c++/$(TARGET_CXX_VERSION)/backward
+BASE_CXXFLAGS += -nostdinc++
+BASE_CXXFLAGS += -isystem $(TARGET_ROOTFS)/usr/include/c++/$(TARGET_CXX_VERSION)
+BASE_CXXFLAGS += -isystem $(TARGET_ROOTFS)/usr/include/x86_64-linux-gnu/c++/$(TARGET_CXX_VERSION)
+BASE_CXXFLAGS += -isystem $(TARGET_ROOTFS)/usr/include/c++/$(TARGET_CXX_VERSION)/backward
 endif
-GPKG_LDFLAGS = $(LDFLAGS) -L$(GINIT_DIR)/lib -lgemcore -lssl -lcrypto -lz -lzstd -ldl -lpthread -lcrypt $(LIBAPT_PKG_LIBS)
+GPKG_LDFLAGS = $(BASE_LDFLAGS) $(LDFLAGS) -L$(GINIT_DIR)/lib -lgemcore -lssl -lcrypto -lz -lzstd -ldl -lpthread -lcrypt $(LIBAPT_PKG_LIBS)
 ifeq ($(strip $(LZMA_STATIC)),)
 GPKG_LDFLAGS += -llzma
 else
 GPKG_LDFLAGS += $(LZMA_STATIC)
 endif
-WORKER_LDFLAGS = $(LDFLAGS) -lssl -lcrypto -lz -lzstd -ldl -lpthread
+WORKER_LDFLAGS = $(BASE_LDFLAGS) $(LDFLAGS) -lssl -lcrypto -lz -lzstd -ldl -lpthread
 ifeq ($(strip $(LZMA_STATIC)),)
 WORKER_LDFLAGS += -llzma
 else
@@ -112,11 +112,11 @@ $(BUILD_CONFIG_STAMP): FORCE | $(OBJDIR)
 	fi
 
 $(BINDIR)/gpkg: $(SRCDIR)/gpkg.cpp $(GPKG_FRAGMENTS) $(BUILD_CONFIG_STAMP)
-	$(CXX) $(CXXFLAGS) -o $@ $< $(GPKG_LDFLAGS)
+	$(CXX) $(BASE_CXXFLAGS) $(CXXFLAGS) -o $@ $< $(GPKG_LDFLAGS)
 	$(STRIP) $@
 
 $(BINDIR)/gpkg-worker: $(SRCDIR)/gpkg_worker.cpp $(GPKG_FRAGMENTS) $(BUILD_CONFIG_STAMP)
-	$(CXX) $(CXXFLAGS) -o $@ $< $(WORKER_LDFLAGS)
+	$(CXX) $(BASE_CXXFLAGS) $(CXXFLAGS) -o $@ $< $(WORKER_LDFLAGS)
 	$(STRIP) $@
 
 install: all
