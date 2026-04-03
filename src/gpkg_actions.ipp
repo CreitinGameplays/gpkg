@@ -351,12 +351,10 @@ bool get_native_dpkg_exact_live_version_hint(
         return true;
     }
 
-    if (base_registry_identity_has_exact_registry_version(pkg_name)) {
-        exact_version = trim(get_raw_base_system_registry_version_for_package(pkg_name));
-        if (!exact_version.empty()) {
-            if (version_out) *version_out = exact_version;
-            return true;
-        }
+    exact_version = trim(get_raw_base_system_registry_version_for_package(pkg_name));
+    if (!exact_version.empty()) {
+        if (version_out) *version_out = exact_version;
+        return true;
     }
 
     return false;
@@ -1069,6 +1067,30 @@ std::vector<std::string> list_native_dpkg_update_fragment_paths() {
     return paths;
 }
 
+bool clear_native_dpkg_update_fragments(
+    bool verbose,
+    std::string* error_out = nullptr
+) {
+    if (error_out) error_out->clear();
+
+    std::vector<std::string> fragment_paths = list_native_dpkg_update_fragment_paths();
+    for (const auto& path : fragment_paths) {
+        if (unlink(path.c_str()) == 0 || errno == ENOENT) continue;
+        if (error_out) {
+            *error_out = "failed to clear stale native dpkg update fragment " + path +
+                ": " + std::strerror(errno);
+        }
+        return false;
+    }
+
+    if (!fragment_paths.empty()) {
+        VLOG(verbose, "Cleared " << fragment_paths.size()
+                     << " stale native dpkg update fragment(s) before rebuilding status.");
+    }
+
+    return true;
+}
+
 bool dpkg_version_starts_with_digit(const std::string& version) {
     return !version.empty() &&
            std::isdigit(static_cast<unsigned char>(version.front())) != 0;
@@ -1690,6 +1712,7 @@ bool bootstrap_native_dpkg_status_database(bool verbose, std::string* error_out)
     if (error_out) error_out->clear();
 
     if (!ensure_native_dpkg_admin_layout(error_out)) return false;
+    if (!clear_native_dpkg_update_fragments(verbose, error_out)) return false;
 
     std::map<std::string, NativeDpkgBootstrapEntry> synthetic_entries;
     const ImportPolicy& policy = get_import_policy(verbose);
@@ -3602,11 +3625,16 @@ std::set<std::string> collect_skipped_libapt_exact_reinstalls(
     return skipped;
 }
 
-InstallCommandResult unpack_native_debian_package_in_apt_order(
-    const PackageMetadata& meta,
+InstallCommandResult unpack_native_debian_packages_in_apt_order(
+    const std::vector<PackageMetadata>& batch,
     bool verbose
 ) {
-    if (!package_is_debian_source(meta)) return {false, "", meta.name, 0, ""};
+    if (batch.empty()) return {true, "", "", 0, ""};
+    for (const auto& meta : batch) {
+        if (!package_is_debian_source(meta)) {
+            return {false, "", meta.name, 0, ""};
+        }
+    }
 
     std::string dpkg_bootstrap_error;
     if (!ensure_native_dpkg_backend_ready(verbose, &dpkg_bootstrap_error)) {
@@ -3615,10 +3643,9 @@ InstallCommandResult unpack_native_debian_package_in_apt_order(
             std::cerr << ": " << dpkg_bootstrap_error;
         }
         std::cerr << std::endl;
-        return {false, "", meta.name, 0, ""};
+        return {false, "", batch.front().name, 0, ""};
     }
 
-    std::vector<PackageMetadata> batch = {meta};
     ScopedNativeDebianBatchStage staged_batch_scope;
     StagedNativeDebianBatch staged_batch;
     std::string stage_error;
@@ -3627,15 +3654,26 @@ InstallCommandResult unpack_native_debian_package_in_apt_order(
             staged_batch_scope.adopt(staged_batch.stage_root);
             staged_batch_scope.keep_for_debugging();
         }
-        std::cerr << "E: Failed to stage native Debian package";
+        std::cerr << "E: Failed to stage native Debian batch";
         if (!stage_error.empty()) std::cerr << ": " << stage_error;
         std::cerr << std::endl;
-        return {false, "", meta.name, 0, ""};
+        return {false, "", batch.front().name, 0, ""};
     }
     staged_batch_scope.adopt(staged_batch.stage_root);
 
     ScopedNativeDpkgMaintscriptCompat maintscript_compat(true, verbose);
     ScopedMaintscriptShellOverride maintscript_shell(true, verbose);
+
+    InstallCommandResult pending_result = reconcile_pending_native_dpkg_configurations(verbose, &batch);
+    if (!pending_result.success) {
+        std::cerr << "E: Failed to configure pending Debian packages before starting new batch";
+        if (!pending_result.failed_package.empty()) {
+            std::cerr << ": " << pending_result.failed_package;
+        }
+        std::cerr << std::endl;
+        if (verbose) staged_batch_scope.keep_for_debugging();
+        return pending_result;
+    }
 
     std::vector<std::string> prepared_parent_dirs;
     std::string prepare_error;
@@ -3650,49 +3688,57 @@ InstallCommandResult unpack_native_debian_package_in_apt_order(
         std::cerr << "E: Failed to prepare native Debian transaction";
         if (!prepare_error.empty()) std::cerr << ": " << prepare_error;
         std::cerr << std::endl;
-        return {false, "", meta.name, 0, ""};
+        return {false, "", batch.front().name, 0, ""};
     }
 
-    std::string overlap_repair_error;
-    if (!prune_synthetic_dpkg_file_ownership_for_package(meta, verbose, &overlap_repair_error)) {
-        if (!overlap_repair_error.empty()) std::cerr << "E: " << overlap_repair_error << std::endl;
-        if (verbose) staged_batch_scope.keep_for_debugging();
-        return {false, "", meta.name, 0, ""};
-    }
-
-    std::string incoming_name = debian_backend_package_name(meta);
-    if (incoming_name.empty()) incoming_name = meta.name;
-    NativeSyntheticStateRecord removed_synthetic_record;
-    bool incoming_had_synthetic_record =
-        get_native_synthetic_state_record(incoming_name, &removed_synthetic_record);
-    std::string synthetic_state_error;
-    if (!remove_native_synthetic_state_record(incoming_name, nullptr, &synthetic_state_error)) {
-        if (!synthetic_state_error.empty()) std::cerr << "E: " << synthetic_state_error << std::endl;
-        if (verbose) staged_batch_scope.keep_for_debugging();
-        return {false, "", incoming_name, 0, ""};
-    }
-
-    CommandCaptureResult result = run_command_captured_argv(
-        build_dpkg_command_argv({"--unpack", get_cached_debian_archive_path(meta)}),
-        verbose,
-        "dpkg-unpack"
-    );
-    if (result.exit_code == 0) {
-        return {true, "", incoming_name, 1, ""};
-    }
-
-    if (incoming_had_synthetic_record) {
-        std::string restore_state_error;
-        if (!restore_native_synthetic_state_record(
-                removed_synthetic_record,
-                &restore_state_error
-            ) && verbose) {
-            std::cout << "[DEBUG] Failed to restore synthetic native state for "
-                      << incoming_name << ": " << restore_state_error << std::endl;
+    InstallCommandResult batch_result;
+    for (const auto& meta : batch) {
+        std::string overlap_repair_error;
+        if (!prune_synthetic_dpkg_file_ownership_for_package(meta, verbose, &overlap_repair_error)) {
+            if (!overlap_repair_error.empty()) std::cerr << "E: " << overlap_repair_error << std::endl;
+            if (verbose) staged_batch_scope.keep_for_debugging();
+            return {false, "", meta.name, batch_result.completed_count, batch_result.last_processed_package};
         }
+
+        std::string incoming_name = debian_backend_package_name(meta);
+        if (incoming_name.empty()) incoming_name = meta.name;
+        NativeSyntheticStateRecord removed_synthetic_record;
+        bool incoming_had_synthetic_record =
+            get_native_synthetic_state_record(incoming_name, &removed_synthetic_record);
+        std::string synthetic_state_error;
+        if (!remove_native_synthetic_state_record(incoming_name, nullptr, &synthetic_state_error)) {
+            if (!synthetic_state_error.empty()) std::cerr << "E: " << synthetic_state_error << std::endl;
+            if (verbose) staged_batch_scope.keep_for_debugging();
+            return {false, "", incoming_name, batch_result.completed_count, batch_result.last_processed_package};
+        }
+
+        CommandCaptureResult result = run_command_captured_argv(
+            build_dpkg_command_argv({"--unpack", get_cached_debian_archive_path(meta)}),
+            verbose,
+            "dpkg-unpack"
+        );
+        batch_result.last_processed_package = incoming_name;
+        if (result.exit_code == 0) {
+            ++batch_result.completed_count;
+            continue;
+        }
+
+        if (incoming_had_synthetic_record) {
+            std::string restore_state_error;
+            if (!restore_native_synthetic_state_record(
+                    removed_synthetic_record,
+                    &restore_state_error
+                ) && verbose) {
+                std::cout << "[DEBUG] Failed to restore synthetic native state for "
+                          << incoming_name << ": " << restore_state_error << std::endl;
+            }
+        }
+        if (verbose) staged_batch_scope.keep_for_debugging();
+        return {false, result.log_path, incoming_name, batch_result.completed_count, batch_result.last_processed_package};
     }
-    if (verbose) staged_batch_scope.keep_for_debugging();
-    return {false, result.log_path, incoming_name, 0, ""};
+
+    batch_result.success = true;
+    return batch_result;
 }
 
 InstallCommandResult configure_native_debian_package_in_apt_order(
@@ -3747,8 +3793,25 @@ LibAptExecutionResult execute_libapt_install_like_plan(
 
     std::vector<PackageMetadata> debian_installs;
     std::vector<PackageMetadata> non_debian_installs;
+    std::vector<PackageMetadata> pending_debian_batch;
     std::set<std::string> seen_debian_installs;
     std::set<std::string> seen_non_debian_installs;
+
+    auto flush_pending_debian_batch = [&]() -> InstallCommandResult {
+        if (pending_debian_batch.empty()) return {true, "", "", 0, ""};
+
+        InstallCommandResult batch_result =
+            unpack_native_debian_packages_in_apt_order(pending_debian_batch, verbose);
+        if (batch_result.success) {
+            for (const auto& meta : pending_debian_batch) {
+                if (seen_debian_installs.insert(meta.name).second) {
+                    debian_installs.push_back(meta);
+                }
+            }
+        }
+        pending_debian_batch.clear();
+        return batch_result;
+    };
 
     for (const auto& operation : apt_plan.ordered_operations) {
         if (skipped_exact_reinstalls.count(operation.apt_package_name) != 0) {
@@ -3760,6 +3823,16 @@ LibAptExecutionResult execute_libapt_install_like_plan(
 
         if (operation.type == LibAptOperationType::Remove ||
             operation.type == LibAptOperationType::Purge) {
+            InstallCommandResult pending_flush = flush_pending_debian_batch();
+            if (!pending_flush.success) {
+                exec_result.failed_package = pending_flush.failed_package;
+                exec_result.log_path = pending_flush.log_path;
+                return exec_result;
+            }
+            if (pending_flush.completed_count > 0) {
+                exec_result.mutated_runtime_state = true;
+                exec_result.installed_count += pending_flush.completed_count;
+            }
             InstallCommandResult removal_result =
                 operation.type == LibAptOperationType::Purge
                     ? purge_package_by_name(operation.apt_package_name, verbose)
@@ -3778,9 +3851,24 @@ LibAptExecutionResult execute_libapt_install_like_plan(
         if (operation.type == LibAptOperationType::Install) {
             if (action == nullptr) continue;
 
-            InstallCommandResult install_result = package_uses_native_dpkg_backend(action->meta)
-                ? unpack_native_debian_package_in_apt_order(action->meta, verbose)
-                : install_package_from_file(get_install_archive_path(action->meta), verbose);
+            if (package_uses_native_dpkg_backend(action->meta)) {
+                pending_debian_batch.push_back(action->meta);
+                continue;
+            }
+
+            InstallCommandResult pending_flush = flush_pending_debian_batch();
+            if (!pending_flush.success) {
+                exec_result.failed_package = pending_flush.failed_package;
+                exec_result.log_path = pending_flush.log_path;
+                return exec_result;
+            }
+            if (pending_flush.completed_count > 0) {
+                exec_result.mutated_runtime_state = true;
+                exec_result.installed_count += pending_flush.completed_count;
+            }
+
+            InstallCommandResult install_result =
+                install_package_from_file(get_install_archive_path(action->meta), verbose);
             if (!install_result.success) {
                 exec_result.failed_package = install_result.failed_package.empty()
                     ? action->meta.name
@@ -3789,11 +3877,7 @@ LibAptExecutionResult execute_libapt_install_like_plan(
                 return exec_result;
             }
 
-            if (package_uses_native_dpkg_backend(action->meta)) {
-                if (seen_debian_installs.insert(action->meta.name).second) {
-                    debian_installs.push_back(action->meta);
-                }
-            } else if (seen_non_debian_installs.insert(action->meta.name).second) {
+            if (seen_non_debian_installs.insert(action->meta.name).second) {
                 non_debian_installs.push_back(action->meta);
             }
 
@@ -3803,6 +3887,17 @@ LibAptExecutionResult execute_libapt_install_like_plan(
         }
 
         if (operation.type == LibAptOperationType::Configure) {
+            InstallCommandResult pending_flush = flush_pending_debian_batch();
+            if (!pending_flush.success) {
+                exec_result.failed_package = pending_flush.failed_package;
+                exec_result.log_path = pending_flush.log_path;
+                return exec_result;
+            }
+            if (pending_flush.completed_count > 0) {
+                exec_result.mutated_runtime_state = true;
+                exec_result.installed_count += pending_flush.completed_count;
+            }
+
             if (action != nullptr && !package_uses_native_dpkg_backend(action->meta)) {
                 continue;
             }
@@ -3818,6 +3913,17 @@ LibAptExecutionResult execute_libapt_install_like_plan(
             }
             exec_result.mutated_runtime_state = true;
         }
+    }
+
+    InstallCommandResult pending_flush = flush_pending_debian_batch();
+    if (!pending_flush.success) {
+        exec_result.failed_package = pending_flush.failed_package;
+        exec_result.log_path = pending_flush.log_path;
+        return exec_result;
+    }
+    if (pending_flush.completed_count > 0) {
+        exec_result.mutated_runtime_state = true;
+        exec_result.installed_count += pending_flush.completed_count;
     }
 
     InstallCommandResult final_pending = reconcile_pending_native_dpkg_configurations(verbose);

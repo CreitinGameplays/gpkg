@@ -82,6 +82,7 @@ bool libapt_plan_remove_transaction(
     std::string* error_out
 );
 bool package_can_use_libapt_native_planner(const PackageMetadata& meta);
+bool ensure_native_dpkg_backend_ready(bool verbose, std::string* error_out);
 
 #if defined(GPKG_HAVE_WORKING_LIBAPT_PKG_BACKEND)
 
@@ -791,6 +792,16 @@ bool libapt_open_seeded_cache(
     std::string* error_out = nullptr
 ) {
     if (error_out) error_out->clear();
+
+    std::string dpkg_bootstrap_error;
+    if (!ensure_native_dpkg_backend_ready(verbose, &dpkg_bootstrap_error)) {
+        if (error_out) {
+            *error_out = dpkg_bootstrap_error.empty()
+                ? "native dpkg state is unavailable"
+                : dpkg_bootstrap_error;
+        }
+        return false;
+    }
 
     DebianBackendConfig config = load_debian_backend_config(verbose);
     if (!libapt_prepare_session_root(session_root, error_out)) return false;
