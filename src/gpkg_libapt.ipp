@@ -88,9 +88,10 @@ bool ensure_native_dpkg_backend_ready(bool verbose, std::string* error_out);
 
 struct ScopedLibAptSessionRoot {
     std::string path;
+    bool cleanup_on_destroy = false;
 
     ~ScopedLibAptSessionRoot() {
-        if (!path.empty()) remove_path_recursive(path);
+        if (cleanup_on_destroy && !path.empty()) remove_path_recursive(path);
     }
 };
 
@@ -113,6 +114,14 @@ std::string libapt_seeded_packages_list_name(const std::string& repo_dir) {
 
 bool libapt_copy_file(const std::string& src, const std::string& dst, std::string* error_out);
 bool libapt_write_text_file(const std::string& path, const std::string& content, std::string* error_out);
+
+std::string libapt_make_absolute_path(const std::string& path) {
+    if (path.empty() || path.front() == '/') return path;
+
+    char cwd[4096];
+    if (!getcwd(cwd, sizeof(cwd))) return path;
+    return std::string(cwd) + "/" + path;
+}
 
 std::string libapt_normalize_architecture_name(
     const std::string& raw_arch,
@@ -149,6 +158,7 @@ bool libapt_append_seeded_packages_source(
     if (!normalized_repo_dir.empty() && normalized_repo_dir.back() != '/') {
         normalized_repo_dir += "/";
     }
+    normalized_repo_dir = libapt_make_absolute_path(normalized_repo_dir);
 
     std::string list_name = libapt_seeded_packages_list_name(normalized_repo_dir);
     std::string list_path = session_root.path + "/state/lists/" + list_name;
@@ -324,14 +334,8 @@ bool libapt_prepare_session_root(
 ) {
     if (error_out) error_out->clear();
 
-    char temp_template[] = "/tmp/gpkg-libapt-XXXXXX";
-    char* created = mkdtemp(temp_template);
-    if (!created) {
-        if (error_out) *error_out = "failed to create a temporary libapt-pkg workspace";
-        return false;
-    }
-
-    session_root.path = created;
+    session_root.path = libapt_make_absolute_path(ROOT_PREFIX + "/var/lib/gpkg/libapt-session");
+    session_root.cleanup_on_destroy = false;
     std::vector<std::string> needed_dirs = {
         session_root.path + "/etc",
         session_root.path + "/etc/sources.list.d",
@@ -407,7 +411,7 @@ bool libapt_initialize_globals(
     _config->Set("Dir", session_root.path + "/");
     _config->Set("Dir::Etc::sourcelist", session_root.path + "/etc/sources.list");
     _config->Set("Dir::Etc::sourceparts", session_root.path + "/etc/sources.list.d");
-    _config->Set("Dir::State::status", DPKG_STATUS_FILE);
+    _config->Set("Dir::State::status", libapt_make_absolute_path(DPKG_STATUS_FILE));
     _config->Set("Dir::State::lists", session_root.path + "/state/lists/");
     _config->Set("Dir::State::extended_states", session_root.path + "/state/extended_states");
     _config->Set("Dir::Cache::pkgcache", session_root.path + "/cache/pkgcache.bin");

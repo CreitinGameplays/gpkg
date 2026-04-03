@@ -450,6 +450,11 @@ bool get_dpkg_package_status_record(const std::string& pkg_name, PackageStatusRe
     return false;
 }
 
+bool get_base_system_exact_live_version_hint(
+    const std::string& pkg_name,
+    std::string* version_out = nullptr
+);
+
 NativeSyntheticStateRecord normalize_native_synthetic_state_record(const NativeSyntheticStateRecord& record) {
     NativeSyntheticStateRecord normalized = record;
     normalized.package = trim(normalized.package);
@@ -464,6 +469,15 @@ NativeSyntheticStateRecord normalize_native_synthetic_state_record(const NativeS
         normalized.version_confidence == "exact" &&
         normalized.satisfies_versioned_deps &&
         native_dpkg_version_is_exact(normalized.version);
+    if (exact) {
+        std::string live_exact_version;
+        if ((normalized.provenance == "base_registry" ||
+             package_has_present_base_registry_entry_exact(normalized.package)) &&
+            (!get_base_system_exact_live_version_hint(normalized.package, &live_exact_version) ||
+             trim(live_exact_version) != normalized.version)) {
+            exact = false;
+        }
+    }
     if (!exact) {
         normalized.version.clear();
         normalized.version_confidence = "unknown";
@@ -647,6 +661,134 @@ bool get_repo_native_live_payload_version_hint(
     return true;
 }
 
+bool base_system_package_prefers_live_version_inference(const std::string& pkg_name) {
+    std::string canonical_name = canonicalize_package_name(pkg_name);
+    return canonical_name == "libc6" ||
+           canonical_name == "libform6" ||
+           canonical_name == "libmenu6" ||
+           canonical_name == "libncurses6" ||
+           canonical_name == "libncursesw6" ||
+           canonical_name == "libpanel6" ||
+           canonical_name == "libtinfo6";
+}
+
+std::string base_system_runtime_family_for_package(const std::string& pkg_name) {
+    std::string canonical_name = canonicalize_package_name(pkg_name);
+    if (canonical_name == "libform6") return "libform.so.6";
+    if (canonical_name == "libmenu6") return "libmenu.so.6";
+    if (canonical_name == "libncurses6") return "libncurses.so.6";
+    if (canonical_name == "libncursesw6") return "libncursesw.so.6";
+    if (canonical_name == "libpanel6") return "libpanel.so.6";
+    if (canonical_name == "libtinfo6") return "libtinfo.so.6";
+    return "";
+}
+
+std::string extract_leading_numeric_version(const std::string& value) {
+    std::string normalized = trim(value);
+    std::string extracted;
+    extracted.reserve(normalized.size());
+
+    bool saw_digit = false;
+    for (char ch : normalized) {
+        if (std::isdigit(static_cast<unsigned char>(ch))) {
+            extracted += ch;
+            saw_digit = true;
+            continue;
+        }
+        if (ch == '.' && saw_digit) {
+            extracted += ch;
+            continue;
+        }
+        break;
+    }
+
+    while (!extracted.empty() && extracted.back() == '.') extracted.pop_back();
+    return extracted;
+}
+
+std::string resolve_existing_realpath(const std::string& path) {
+    char resolved[4096];
+    if (!realpath(path.c_str(), resolved)) return "";
+    return std::string(resolved);
+}
+
+std::string extract_glibc_release_version_from_binary(const std::string& binary_path) {
+    std::ifstream in(binary_path, std::ios::binary);
+    if (!in) return "";
+
+    std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    static const std::string needle = "GNU C Library (GNU libc) stable release version ";
+    size_t pos = content.find(needle);
+    if (pos == std::string::npos) return "";
+
+    pos += needle.size();
+    size_t end = pos;
+    while (end < content.size()) {
+        char ch = content[end];
+        if (!std::isdigit(static_cast<unsigned char>(ch)) && ch != '.') break;
+        ++end;
+    }
+
+    return content.substr(pos, end - pos);
+}
+
+bool infer_base_system_runtime_library_version_hint(
+    const std::string& pkg_name,
+    std::string* version_out = nullptr
+) {
+    if (version_out) version_out->clear();
+
+    std::string family = base_system_runtime_family_for_package(pkg_name);
+    if (family.empty()) return false;
+
+    const std::vector<std::string> prefixes = {
+        ROOT_PREFIX + "/usr/lib/x86_64-linux-gnu",
+        ROOT_PREFIX + "/lib/x86_64-linux-gnu",
+    };
+    for (const auto& prefix : prefixes) {
+        std::string resolved = resolve_existing_realpath(prefix + "/" + family);
+        if (resolved.empty()) continue;
+
+        std::string basename = path_basename(resolved);
+        size_t so_pos = basename.find(".so.");
+        if (so_pos == std::string::npos) continue;
+
+        std::string version = extract_leading_numeric_version(basename.substr(so_pos + 4));
+        if (version.empty()) continue;
+
+        if (version_out) *version_out = version;
+        return true;
+    }
+
+    return false;
+}
+
+bool infer_base_system_glibc_version_hint(std::string* version_out = nullptr) {
+    if (version_out) version_out->clear();
+
+    static bool cached = false;
+    static std::string cached_version;
+    if (cached) {
+        if (version_out) *version_out = cached_version;
+        return !cached_version.empty();
+    }
+    cached = true;
+
+    const std::vector<std::string> candidates = {
+        ROOT_PREFIX + "/lib/x86_64-linux-gnu/libc.so.6",
+        ROOT_PREFIX + "/usr/lib/x86_64-linux-gnu/libc.so.6",
+    };
+    for (const auto& candidate : candidates) {
+        std::string version = trim(extract_glibc_release_version_from_binary(candidate));
+        if (version.empty()) continue;
+        cached_version = version;
+        break;
+    }
+
+    if (version_out) *version_out = cached_version;
+    return !cached_version.empty();
+}
+
 std::string get_raw_base_system_registry_version_for_package(const std::string& pkg_name) {
     if (pkg_name.empty()) return "";
     std::string canonical_name = canonicalize_package_name(pkg_name);
@@ -671,6 +813,29 @@ std::string get_raw_base_system_registry_version_for_package(const std::string& 
     return "";
 }
 
+bool get_base_system_exact_live_version_hint(
+    const std::string& pkg_name,
+    std::string* version_out
+) {
+    if (version_out) version_out->clear();
+    if (pkg_name.empty()) return false;
+
+    std::string canonical_name = canonicalize_package_name(pkg_name);
+    if (canonical_name == "libc6") {
+        return infer_base_system_glibc_version_hint(version_out);
+    }
+
+    if (base_system_package_prefers_live_version_inference(canonical_name)) {
+        return infer_base_system_runtime_library_version_hint(canonical_name, version_out);
+    }
+
+    std::string registry_version = trim(get_raw_base_system_registry_version_for_package(canonical_name));
+    if (registry_version.empty()) return false;
+
+    if (version_out) *version_out = registry_version;
+    return true;
+}
+
 std::string resolve_base_system_status_version(
     const std::string& pkg_name,
     const std::string& registry_version
@@ -679,6 +844,11 @@ std::string resolve_base_system_status_version(
     std::string exact_version;
     if (native_dpkg_package_has_exact_registered_live_version(pkg_name, &exact_version)) {
         return exact_version;
+    }
+
+    if (get_base_system_exact_live_version_hint(pkg_name, &exact_version) &&
+        !trim(exact_version).empty()) {
+        return trim(exact_version);
     }
 
     NativeSyntheticStateRecord synthetic_record;
@@ -691,13 +861,16 @@ std::string resolve_base_system_status_version(
         }
     }
 
-    if (!normalized_registry_version.empty()) {
+    if (!normalized_registry_version.empty() &&
+        !base_system_package_prefers_live_version_inference(pkg_name)) {
         return normalized_registry_version;
     }
 
-    std::string exact_registry_version = get_raw_base_system_registry_version_for_package(pkg_name);
-    if (!exact_registry_version.empty()) {
-        return exact_registry_version;
+    if (!base_system_package_prefers_live_version_inference(pkg_name)) {
+        std::string exact_registry_version = get_raw_base_system_registry_version_for_package(pkg_name);
+        if (!exact_registry_version.empty()) {
+            return exact_registry_version;
+        }
     }
 
     return "";
@@ -736,6 +909,12 @@ bool get_native_dpkg_exact_live_version_hint(
         return true;
     }
 
+    if (get_base_system_exact_live_version_hint(pkg_name, &exact_version) &&
+        !trim(exact_version).empty()) {
+        if (version_out) *version_out = trim(exact_version);
+        return true;
+    }
+
     NativeSyntheticStateRecord synthetic_record;
     if (get_native_synthetic_state_record(pkg_name, &synthetic_record) &&
         native_synthetic_state_record_has_exact_version(synthetic_record)) {
@@ -743,10 +922,12 @@ bool get_native_dpkg_exact_live_version_hint(
         return true;
     }
 
-    exact_version = trim(get_raw_base_system_registry_version_for_package(pkg_name));
-    if (!exact_version.empty()) {
-        if (version_out) *version_out = exact_version;
-        return true;
+    if (!base_system_package_prefers_live_version_inference(pkg_name)) {
+        exact_version = trim(get_raw_base_system_registry_version_for_package(pkg_name));
+        if (!exact_version.empty()) {
+            if (version_out) *version_out = exact_version;
+            return true;
+        }
     }
 
     PackageStatusRecord dpkg_record;
@@ -783,6 +964,8 @@ bool resolve_native_live_package_state(const std::string& pkg_name, NativeLivePa
             state.provenance = "registered";
         } else if (get_repo_native_live_payload_version_hint(pkg_name)) {
             state.provenance = "live_payload";
+        } else if (get_base_system_exact_live_version_hint(pkg_name)) {
+            state.provenance = "base_runtime";
         } else if (!get_raw_base_system_registry_version_for_package(pkg_name).empty()) {
             state.provenance = "base_registry";
         } else {

@@ -7517,9 +7517,88 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
         mutated_runtime_state = true;
     }
 
+    UpgradeContext install_context = build_upgrade_context(verbose);
+    const std::set<std::string>& install_live_set =
+        install_context.exact_live_packages.empty() ? installed_cache : install_context.exact_live_packages;
+
     TransactionPlan install_plan;
-    if (!build_transaction_plan(install_queue, installed_cache, verbose, install_plan)) return 1;
+    if (!build_transaction_plan(
+            install_queue,
+            install_live_set,
+            verbose,
+            install_plan,
+            &install_context
+        )) {
+        return 1;
+    }
     install_queue = install_plan.install_queue;
+
+    auto resolve_planned_or_live_runtime_version = [&](const std::string& pkg_name) {
+        std::string canonical_name = canonicalize_package_name(pkg_name, verbose);
+        for (const auto& meta : install_queue) {
+            if (canonicalize_package_name(meta.name, verbose) != canonical_name) continue;
+            return extract_leading_numeric_version(meta.version);
+        }
+
+        std::string live_version;
+        if (!get_native_dpkg_exact_live_version_hint(canonical_name, &live_version)) return std::string{};
+        return extract_leading_numeric_version(live_version);
+    };
+
+    auto queue_touches_shell_runtime_family = [&]() {
+        static const std::set<std::string> watched_packages = {
+            "libform6",
+            "libmenu6",
+            "libncurses6",
+            "libncursesw6",
+            "libpanel6",
+            "libtinfo6",
+        };
+
+        for (const auto& meta : install_queue) {
+            if (watched_packages.count(canonicalize_package_name(meta.name, verbose)) != 0) {
+                return true;
+            }
+
+            for (const auto& relation : collect_required_transaction_dependency_edges(meta)) {
+                Dependency dep = parse_dependency(relation);
+                if (watched_packages.count(canonicalize_package_name(dep.name, verbose)) != 0) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+
+    if (queue_touches_shell_runtime_family()) {
+        struct RuntimePair {
+            const char* consumer;
+            const char* provider;
+        };
+        static const RuntimePair pairs[] = {
+            {"libform6", "libtinfo6"},
+            {"libmenu6", "libtinfo6"},
+            {"libncurses6", "libtinfo6"},
+            {"libncursesw6", "libtinfo6"},
+            {"libpanel6", "libtinfo6"},
+        };
+
+        for (const auto& pair : pairs) {
+            std::string consumer_version = resolve_planned_or_live_runtime_version(pair.consumer);
+            std::string provider_version = resolve_planned_or_live_runtime_version(pair.provider);
+            if (consumer_version.empty() || provider_version.empty()) continue;
+            if (consumer_version == provider_version) continue;
+
+            std::cerr << Color::RED
+                      << "E: GeminiOS runtime family mismatch: "
+                      << pair.consumer << " resolves to " << consumer_version
+                      << " while " << pair.provider << " resolves to " << provider_version
+                      << ". Install matching ncurses/tinfo runtime companions before "
+                      << "installing packages that use the shell runtime stack."
+                      << Color::RESET << std::endl;
+            return 1;
+        }
+    }
 
     std::set<std::string> explicit_manual_targets;
     for (const auto& action : libapt_plan.install_actions) {
