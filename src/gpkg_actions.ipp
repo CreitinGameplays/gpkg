@@ -4615,10 +4615,6 @@ bool prepare_live_root_for_staged_debian_batch(
         if (meta_it == metadata_by_package.end()) continue;
         const PackageMetadata& incoming_meta = meta_it->second;
 
-        std::string payload_root;
-        auto payload_it = stage.payload_root_by_package.find(package_name);
-        if (payload_it != stage.payload_root_by_package.end()) payload_root = payload_it->second;
-
         for (const auto& raw_path : pair.second) {
             std::string logical_path = normalize_native_debian_preflight_path(raw_path);
             if (logical_path.empty()) continue;
