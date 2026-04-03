@@ -79,7 +79,9 @@ std::string libapt_sanitize_cache_key(const std::string& value) {
 }
 
 std::string libapt_seeded_packages_list_name(const std::string& repo_dir) {
-    return libapt_sanitize_cache_key(repo_dir) + "._Packages";
+    std::string normalized = repo_dir;
+    if (!normalized.empty() && normalized.back() != '/') normalized += "/";
+    return libapt_sanitize_cache_key(normalized) + "._Packages";
 }
 
 bool libapt_copy_file(const std::string& src, const std::string& dst, std::string* error_out);
@@ -120,11 +122,16 @@ bool libapt_append_seeded_packages_source(
         return false;
     }
 
-    std::string list_name = libapt_seeded_packages_list_name(repo_dir);
+    std::string normalized_repo_dir = repo_dir;
+    if (!normalized_repo_dir.empty() && normalized_repo_dir.back() != '/') {
+        normalized_repo_dir += "/";
+    }
+
+    std::string list_name = libapt_seeded_packages_list_name(normalized_repo_dir);
     std::string list_path = session_root.path + "/state/lists/" + list_name;
     if (!libapt_copy_file(packages_path, list_path, error_out)) return false;
 
-    source_list += "deb [trusted=yes] file:" + repo_dir + " ./\n";
+    source_list += "deb [trusted=yes] file:" + normalized_repo_dir + " ./\n";
     return true;
 }
 
