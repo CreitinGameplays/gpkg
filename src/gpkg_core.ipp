@@ -450,6 +450,36 @@ bool get_dpkg_package_status_record(const std::string& pkg_name, PackageStatusRe
     return false;
 }
 
+NativeSyntheticStateRecord normalize_native_synthetic_state_record(const NativeSyntheticStateRecord& record) {
+    NativeSyntheticStateRecord normalized = record;
+    normalized.package = trim(normalized.package);
+    normalized.version = trim(normalized.version);
+    normalized.provenance = trim(normalized.provenance);
+    normalized.version_confidence = trim(normalized.version_confidence);
+
+    if (normalized.provenance.empty()) normalized.provenance = "unknown";
+    if (normalized.version_confidence.empty()) normalized.version_confidence = "unknown";
+
+    bool exact =
+        normalized.version_confidence == "exact" &&
+        normalized.satisfies_versioned_deps &&
+        native_dpkg_version_is_exact(normalized.version);
+    if (!exact) {
+        normalized.version.clear();
+        normalized.version_confidence = "unknown";
+        normalized.satisfies_versioned_deps = false;
+    }
+
+    return normalized;
+}
+
+bool native_synthetic_state_record_has_exact_version(const NativeSyntheticStateRecord& record) {
+    NativeSyntheticStateRecord normalized = normalize_native_synthetic_state_record(record);
+    return normalized.version_confidence == "exact" &&
+           normalized.satisfies_versioned_deps &&
+           native_dpkg_version_is_exact(normalized.version);
+}
+
 std::vector<NativeSyntheticStateRecord> load_native_synthetic_state_records() {
     std::vector<NativeSyntheticStateRecord> records;
     std::ifstream f(NATIVE_SYNTHETIC_STATUS_FILE);
@@ -465,7 +495,7 @@ std::vector<NativeSyntheticStateRecord> load_native_synthetic_state_records() {
             return;
         }
 
-        records.push_back(current);
+        records.push_back(normalize_native_synthetic_state_record(current));
         current = NativeSyntheticStateRecord{};
         have_content = false;
     };
@@ -516,15 +546,16 @@ bool save_native_synthetic_state_records(const std::vector<NativeSyntheticStateR
 
     std::ostringstream out;
     for (const auto& record : records) {
-        if (record.package.empty()) continue;
-        out << "Package: " << record.package << "\n";
-        if (!record.version.empty()) out << "Version: " << record.version << "\n";
-        out << "Gpkg-Provenance: " << (record.provenance.empty() ? "unknown" : record.provenance) << "\n";
+        NativeSyntheticStateRecord normalized = normalize_native_synthetic_state_record(record);
+        if (normalized.package.empty()) continue;
+        out << "Package: " << normalized.package << "\n";
+        if (!normalized.version.empty()) out << "Version: " << normalized.version << "\n";
+        out << "Gpkg-Provenance: " << normalized.provenance << "\n";
         out << "Gpkg-Version-Confidence: "
-            << (record.version_confidence.empty() ? "unknown" : record.version_confidence) << "\n";
-        out << "Gpkg-Owns-Files: " << (record.owns_files ? "1" : "0") << "\n";
+            << normalized.version_confidence << "\n";
+        out << "Gpkg-Owns-Files: " << (normalized.owns_files ? "1" : "0") << "\n";
         out << "Gpkg-Satisfies-Versioned-Deps: "
-            << (record.satisfies_versioned_deps ? "1" : "0") << "\n\n";
+            << (normalized.satisfies_versioned_deps ? "1" : "0") << "\n\n";
     }
 
     return write_text_file_atomically_core(NATIVE_SYNTHETIC_STATUS_FILE, out.str());
@@ -587,6 +618,35 @@ bool native_dpkg_package_has_exact_registered_live_version(
     return true;
 }
 
+bool get_repo_native_live_payload_version_hint(
+    const std::string& pkg_name,
+    std::string* version_out
+) {
+    if (version_out) version_out->clear();
+
+    std::string canonical_name = canonicalize_package_name(pkg_name);
+    if (canonical_name != "gpkg") return false;
+
+    const std::vector<std::string> probe_paths = {
+        ROOT_PREFIX + "/bin/apps/system/gpkg",
+        ROOT_PREFIX + "/bin/gpkg",
+    };
+    bool live_payload_present = false;
+    for (const auto& path : probe_paths) {
+        if (!path.empty() && access(path.c_str(), F_OK) == 0) {
+            live_payload_present = true;
+            break;
+        }
+    }
+    if (!live_payload_present) return false;
+
+    std::string version = trim(GPKG_VERSION);
+    if (version.empty() || version == OS_VERSION) return false;
+
+    if (version_out) *version_out = version;
+    return true;
+}
+
 std::string get_raw_base_system_registry_version_for_package(const std::string& pkg_name) {
     if (pkg_name.empty()) return "";
     std::string canonical_name = canonicalize_package_name(pkg_name);
@@ -626,13 +686,12 @@ std::string resolve_base_system_status_version(
         PackageStatusRecord dpkg_record;
         if (get_dpkg_package_status_record(pkg_name, &dpkg_record) &&
             package_status_is_installed_like(dpkg_record.status) &&
-            !trim(dpkg_record.version).empty()) {
+            native_dpkg_version_is_exact(dpkg_record.version)) {
             return trim(dpkg_record.version);
         }
     }
 
-    if (!normalized_registry_version.empty() &&
-        base_registry_identity_has_exact_registry_version(pkg_name)) {
+    if (!normalized_registry_version.empty()) {
         return normalized_registry_version;
     }
 
@@ -641,7 +700,7 @@ std::string resolve_base_system_status_version(
         return exact_registry_version;
     }
 
-    return NATIVE_DPKG_UNVERIFIED_VERSION;
+    return "";
 }
 
 bool package_status_is_installed_like(const std::string& state) {
@@ -651,6 +710,125 @@ bool package_status_is_installed_like(const std::string& state) {
            state == "triggers-awaited" ||
            state == "triggers-pending" ||
            state == "installed";
+}
+
+bool native_dpkg_version_is_exact(const std::string& version) {
+    return !trim(version).empty();
+}
+
+bool get_native_dpkg_exact_live_version_hint(
+    const std::string& pkg_name,
+    std::string* version_out
+) {
+    if (version_out) version_out->clear();
+    if (pkg_name.empty()) return false;
+
+    std::string exact_version;
+    if (native_dpkg_package_has_exact_registered_live_version(pkg_name, &exact_version) &&
+        !trim(exact_version).empty()) {
+        if (version_out) *version_out = trim(exact_version);
+        return true;
+    }
+
+    if (get_repo_native_live_payload_version_hint(pkg_name, &exact_version) &&
+        !trim(exact_version).empty()) {
+        if (version_out) *version_out = trim(exact_version);
+        return true;
+    }
+
+    NativeSyntheticStateRecord synthetic_record;
+    if (get_native_synthetic_state_record(pkg_name, &synthetic_record) &&
+        native_synthetic_state_record_has_exact_version(synthetic_record)) {
+        if (version_out) *version_out = trim(synthetic_record.version);
+        return true;
+    }
+
+    exact_version = trim(get_raw_base_system_registry_version_for_package(pkg_name));
+    if (!exact_version.empty()) {
+        if (version_out) *version_out = exact_version;
+        return true;
+    }
+
+    PackageStatusRecord dpkg_record;
+    if (get_dpkg_package_status_record(pkg_name, &dpkg_record) &&
+        package_status_is_installed_like(dpkg_record.status) &&
+        native_dpkg_version_is_exact(dpkg_record.version)) {
+        if (version_out) *version_out = trim(dpkg_record.version);
+        return true;
+    }
+
+    return false;
+}
+
+bool resolve_native_live_package_state(const std::string& pkg_name, NativeLivePackageState* out) {
+    if (out) *out = NativeLivePackageState{};
+    if (pkg_name.empty()) return false;
+
+    NativeLivePackageState state;
+    state.package = pkg_name;
+
+    std::string exact_version;
+    if (get_native_dpkg_exact_live_version_hint(pkg_name, &exact_version)) {
+        state.present = true;
+        state.version = trim(exact_version);
+        state.exact_version_known = native_dpkg_version_is_exact(state.version);
+        state.admissible_for_dpkg_status = state.exact_version_known;
+        state.version_confidence = state.exact_version_known ? "exact" : "unknown";
+
+        NativeSyntheticStateRecord synthetic_record;
+        if (get_native_synthetic_state_record(pkg_name, &synthetic_record) &&
+            native_synthetic_state_record_has_exact_version(synthetic_record)) {
+            state.provenance = synthetic_record.provenance.empty() ? "synthetic_exact" : synthetic_record.provenance;
+        } else if (native_dpkg_package_has_exact_registered_live_version(pkg_name)) {
+            state.provenance = "registered";
+        } else if (get_repo_native_live_payload_version_hint(pkg_name)) {
+            state.provenance = "live_payload";
+        } else if (!get_raw_base_system_registry_version_for_package(pkg_name).empty()) {
+            state.provenance = "base_registry";
+        } else {
+            state.provenance = "dpkg_status";
+        }
+        if (out) *out = state;
+        return true;
+    }
+
+    PackageStatusRecord registered_record;
+    if (get_package_status_record(pkg_name, &registered_record) &&
+        package_status_is_installed_like(registered_record.status)) {
+        state.present = true;
+        state.provenance = "registered";
+    }
+
+    NativeSyntheticStateRecord synthetic_record;
+    if (get_native_synthetic_state_record(pkg_name, &synthetic_record)) {
+        synthetic_record = normalize_native_synthetic_state_record(synthetic_record);
+        state.present = true;
+        state.provenance = synthetic_record.provenance.empty() ? state.provenance : synthetic_record.provenance;
+        state.version_confidence = synthetic_record.version_confidence.empty() ? state.version_confidence : synthetic_record.version_confidence;
+    }
+
+    PackageStatusRecord dpkg_record;
+    if (get_dpkg_package_status_record(pkg_name, &dpkg_record) &&
+        package_status_is_installed_like(dpkg_record.status)) {
+        state.present = true;
+        if (state.provenance == "unknown") state.provenance = "dpkg_status";
+    }
+
+    PackageStatusRecord base_record;
+    if (get_base_system_package_status_record(pkg_name, &base_record) &&
+        package_status_is_installed_like(base_record.status)) {
+        state.present = true;
+        if (state.provenance == "unknown") state.provenance = "base_registry";
+    }
+
+    if (!state.present && (package_is_base_system_provided(pkg_name) ||
+                           package_has_present_base_registry_entry_exact(pkg_name))) {
+        state.present = true;
+        state.provenance = "base_registry";
+    }
+
+    if (out) *out = state;
+    return state.present;
 }
 
 bool write_package_auto_state_records(const std::vector<PackageAutoStateRecord>& records) {
@@ -861,8 +1039,8 @@ std::vector<PackageStatusRecord> load_base_system_package_status_records() {
         if (record.package.empty()) return;
         auto existing = records_by_package.find(record.package);
         if (existing == records_by_package.end() ||
-            (existing->second.version == NATIVE_DPKG_UNVERIFIED_VERSION &&
-             record.version != NATIVE_DPKG_UNVERIFIED_VERSION)) {
+            (!native_dpkg_version_is_exact(existing->second.version) &&
+             native_dpkg_version_is_exact(record.version))) {
             records_by_package[record.package] = record;
         }
     };

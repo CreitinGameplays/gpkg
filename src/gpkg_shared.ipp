@@ -73,7 +73,6 @@ const std::string IMPORT_POLICY_PATH = ROOT_PREFIX + "/etc/gpkg/import-policy.js
 const std::string DPKG_ADMIN_DIR = ROOT_PREFIX + "/var/lib/dpkg";
 const std::string DPKG_STATUS_FILE = DPKG_ADMIN_DIR + "/status";
 const std::string DPKG_INFO_DIR = DPKG_ADMIN_DIR + "/info";
-const std::string NATIVE_DPKG_UNVERIFIED_VERSION = "0~gpkg-unverified";
 const std::string NATIVE_SYNTHETIC_STATUS_FILE = ROOT_PREFIX + "/var/lib/gpkg/native-synthetic-status";
 const std::string NATIVE_SYNTHETIC_INFO_DIR = ROOT_PREFIX + "/var/lib/gpkg/native-info";
 const std::string NATIVE_SYNTHETIC_OWNERS_DIR = ROOT_PREFIX + "/var/lib/gpkg/native-owners";
@@ -128,6 +127,16 @@ struct NativeSyntheticStateRecord {
     bool satisfies_versioned_deps = false;
 };
 
+struct NativeLivePackageState {
+    std::string package;
+    std::string version;
+    std::string provenance = "unknown";
+    std::string version_confidence = "unknown";
+    bool present = false;
+    bool exact_version_known = false;
+    bool admissible_for_dpkg_status = false;
+};
+
 struct PackageAutoStateRecord {
     std::string package;
     bool auto_installed = false;
@@ -172,7 +181,14 @@ bool get_base_system_package_status_record(const std::string& pkg_name, PackageS
 std::vector<NativeSyntheticStateRecord> load_native_synthetic_state_records();
 bool get_native_synthetic_state_record(const std::string& pkg_name, NativeSyntheticStateRecord* out = nullptr);
 bool save_native_synthetic_state_records(const std::vector<NativeSyntheticStateRecord>& records);
+NativeSyntheticStateRecord normalize_native_synthetic_state_record(const NativeSyntheticStateRecord& record);
+bool native_synthetic_state_record_has_exact_version(const NativeSyntheticStateRecord& record);
 bool package_status_is_installed_like(const std::string& state);
+bool native_dpkg_version_is_exact(const std::string& version);
+bool get_repo_native_live_payload_version_hint(const std::string& pkg_name, std::string* version_out = nullptr);
+bool get_native_dpkg_exact_live_version_hint(const std::string& pkg_name, std::string* version_out = nullptr);
+bool resolve_native_live_package_state(const std::string& pkg_name, NativeLivePackageState* out = nullptr);
+bool package_has_present_base_registry_entry_exact(const std::string& pkg_name);
 std::vector<PackageAutoStateRecord> load_package_auto_state_records();
 bool get_package_auto_installed_state(const std::string& pkg_name, bool* out_auto = nullptr);
 bool set_package_auto_installed_state(const std::string& pkg_name, bool auto_installed);

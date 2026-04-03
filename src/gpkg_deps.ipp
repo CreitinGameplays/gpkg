@@ -46,11 +46,7 @@ bool get_installed_package_metadata(const std::string& pkg_name, PackageMetadata
 
 bool get_live_installed_package_metadata(const std::string& pkg_name, PackageMetadata& out_meta) {
     auto has_comparable_live_version = [](const std::string& version) {
-        std::string normalized = trim(version);
-        return !normalized.empty() &&
-            normalized != "0" &&
-            normalized != "9999" &&
-            normalized != NATIVE_DPKG_UNVERIFIED_VERSION;
+        return native_dpkg_version_is_exact(version);
     };
 
     PackageStatusRecord status_record;
@@ -300,11 +296,7 @@ bool package_metadata_satisfies_dependency(
     const Dependency& dep
 ) {
     auto has_comparable_version = [&](const std::string& version) {
-        std::string normalized = trim(version);
-        return !normalized.empty() &&
-            normalized != "0" &&
-            normalized != "9999" &&
-            normalized != NATIVE_DPKG_UNVERIFIED_VERSION;
+        return native_dpkg_version_is_exact(version);
     };
 
     std::string canonical_package = canonicalize_package_name(package_name);
@@ -896,10 +888,7 @@ bool relation_matches_concrete_package(
     if (!pkg_meta) return dep.op.empty();
     if (!dep.op.empty()) {
         std::string normalized_version = trim(pkg_meta->version);
-        if (normalized_version.empty() ||
-            normalized_version == "0" ||
-            normalized_version == "9999" ||
-            normalized_version == NATIVE_DPKG_UNVERIFIED_VERSION) {
+        if (!native_dpkg_version_is_exact(normalized_version)) {
             return false;
         }
     }
