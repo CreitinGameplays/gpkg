@@ -114,6 +114,98 @@ std::string libapt_seeded_packages_list_name(const std::string& repo_dir) {
 
 bool libapt_copy_file(const std::string& src, const std::string& dst, std::string* error_out);
 bool libapt_write_text_file(const std::string& path, const std::string& content, std::string* error_out);
+bool libapt_prime_planner_cache(bool verbose, std::string* error_out);
+
+bool libapt_read_file_contents(
+    const std::string& path,
+    std::string& out_content,
+    std::string* error_out = nullptr
+) {
+    if (error_out) error_out->clear();
+    out_content.clear();
+
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        if (error_out) *error_out = "failed to open " + path + " for reading";
+        return false;
+    }
+
+    std::ostringstream buffer;
+    buffer << in.rdbuf();
+    if (!in.good() && !in.eof()) {
+        if (error_out) *error_out = "failed to read " + path;
+        return false;
+    }
+
+    out_content = buffer.str();
+    return true;
+}
+
+bool libapt_files_have_same_contents(
+    const std::string& left_path,
+    const std::string& right_path,
+    bool& same_out,
+    std::string* error_out = nullptr
+) {
+    if (error_out) error_out->clear();
+    same_out = false;
+
+    struct stat left_stat {};
+    if (stat(left_path.c_str(), &left_stat) != 0) {
+        if (error_out) *error_out = "failed to stat " + left_path;
+        return false;
+    }
+
+    struct stat right_stat {};
+    if (stat(right_path.c_str(), &right_stat) != 0) {
+        if (errno == ENOENT) return true;
+        if (error_out) *error_out = "failed to stat " + right_path;
+        return false;
+    }
+
+    if (left_stat.st_size != right_stat.st_size) return true;
+
+    std::ifstream left(left_path, std::ios::binary);
+    if (!left) {
+        if (error_out) *error_out = "failed to open " + left_path + " for reading";
+        return false;
+    }
+    std::ifstream right(right_path, std::ios::binary);
+    if (!right) {
+        if (error_out) *error_out = "failed to open " + right_path + " for reading";
+        return false;
+    }
+
+    char left_buffer[32768];
+    char right_buffer[32768];
+    while (true) {
+        left.read(left_buffer, sizeof(left_buffer));
+        right.read(right_buffer, sizeof(right_buffer));
+
+        std::streamsize left_count = left.gcount();
+        std::streamsize right_count = right.gcount();
+        if (left_count != right_count) return true;
+        if (left_count == 0) break;
+        if (std::memcmp(left_buffer, right_buffer, static_cast<size_t>(left_count)) != 0) {
+            return true;
+        }
+    }
+
+    if ((!left.good() && !left.eof()) || (!right.good() && !right.eof())) {
+        if (error_out) *error_out = "failed while comparing " + left_path + " and " + right_path;
+        return false;
+    }
+
+    same_out = true;
+    return true;
+}
+
+void libapt_try_preserve_file_times(const std::string& path, const struct stat& source_stat) {
+    utimbuf times {};
+    times.actime = source_stat.st_atime;
+    times.modtime = source_stat.st_mtime;
+    (void)utime(path.c_str(), &times);
+}
 
 std::string libapt_make_absolute_path(const std::string& path) {
     if (path.empty() || path.front() == '/') return path;
@@ -281,6 +373,27 @@ bool libapt_seed_repo_native_packages_index(
 bool libapt_copy_file(const std::string& src, const std::string& dst, std::string* error_out = nullptr) {
     if (error_out) error_out->clear();
 
+    struct stat src_stat {};
+    if (stat(src.c_str(), &src_stat) != 0) {
+        if (error_out) *error_out = "failed to open " + src + " for reading";
+        return false;
+    }
+
+    struct stat dst_stat {};
+    if (stat(dst.c_str(), &dst_stat) == 0) {
+        if (src_stat.st_size == dst_stat.st_size &&
+            src_stat.st_mtime == dst_stat.st_mtime) {
+            return true;
+        }
+
+        bool same_contents = false;
+        if (!libapt_files_have_same_contents(src, dst, same_contents, error_out)) return false;
+        if (same_contents) return true;
+    } else if (errno != ENOENT) {
+        if (error_out) *error_out = "failed to inspect " + dst;
+        return false;
+    }
+
     std::ifstream in(src, std::ios::binary);
     if (!in) {
         if (error_out) *error_out = "failed to open " + src + " for reading";
@@ -292,37 +405,80 @@ bool libapt_copy_file(const std::string& src, const std::string& dst, std::strin
         return false;
     }
 
-    std::ofstream out(dst, std::ios::binary | std::ios::trunc);
+    std::string temp_path = dst + ".tmp";
+    std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
     if (!out) {
-        if (error_out) *error_out = "failed to open " + dst + " for writing";
+        if (error_out) *error_out = "failed to open " + temp_path + " for writing";
         return false;
     }
 
     out << in.rdbuf();
     if (!out.good()) {
+        remove(temp_path.c_str());
         if (error_out) *error_out = "failed to copy " + src + " to " + dst;
         return false;
     }
 
+    out.close();
+    if (!out) {
+        remove(temp_path.c_str());
+        if (error_out) *error_out = "failed to finalize " + temp_path;
+        return false;
+    }
+
+    if (rename(temp_path.c_str(), dst.c_str()) != 0) {
+        remove(temp_path.c_str());
+        if (error_out) *error_out = "failed to replace " + dst;
+        return false;
+    }
+
+    libapt_try_preserve_file_times(dst, src_stat);
     return true;
 }
 
 bool libapt_write_text_file(const std::string& path, const std::string& content, std::string* error_out = nullptr) {
     if (error_out) error_out->clear();
+
+    struct stat existing_file_stat {};
+    if (stat(path.c_str(), &existing_file_stat) == 0) {
+        (void)existing_file_stat;
+        std::string existing_content;
+        if (!libapt_read_file_contents(path, existing_content, error_out)) return false;
+        if (existing_content == content) return true;
+    } else if (errno != ENOENT) {
+        if (error_out) *error_out = "failed to inspect " + path;
+        return false;
+    }
+
     if (!mkdir_parent(path)) {
         if (error_out) *error_out = "failed to create parent directory for " + path;
         return false;
     }
 
-    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    std::string temp_path = path + ".tmp";
+    std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
     if (!out) {
-        if (error_out) *error_out = "failed to open " + path + " for writing";
+        if (error_out) *error_out = "failed to open " + temp_path + " for writing";
         return false;
     }
 
     out << content;
     if (!out.good()) {
+        remove(temp_path.c_str());
         if (error_out) *error_out = "failed to write " + path;
+        return false;
+    }
+
+    out.close();
+    if (!out) {
+        remove(temp_path.c_str());
+        if (error_out) *error_out = "failed to finalize " + temp_path;
+        return false;
+    }
+
+    if (rename(temp_path.c_str(), path.c_str()) != 0) {
+        remove(temp_path.c_str());
+        if (error_out) *error_out = "failed to replace " + path;
         return false;
     }
     return true;
@@ -816,6 +972,25 @@ bool libapt_open_seeded_cache(
     return true;
 }
 
+bool libapt_prime_planner_cache(bool verbose, std::string* error_out) {
+    if (error_out) error_out->clear();
+
+    std::string packages_path = get_debian_packages_cache_path();
+    if (access(packages_path.c_str(), F_OK) != 0) {
+        if (error_out) *error_out = "Debian Packages cache is missing; run 'gpkg update'";
+        return false;
+    }
+
+    ScopedLibAptSessionRoot session_root;
+    pkgCacheFile cache_file;
+    if (!libapt_open_seeded_cache(packages_path, verbose, session_root, cache_file, error_out)) {
+        return false;
+    }
+
+    VLOG(verbose, "Primed libapt-pkg planner cache at " << session_root.path);
+    return true;
+}
+
 bool libapt_plan_install_like_transaction(
     const std::vector<std::string>& explicit_targets,
     const std::set<std::string>& reinstall_targets,
@@ -986,6 +1161,12 @@ bool libapt_plan_remove_transaction(
     out_result = {};
     if (error_out) *error_out = "libapt-pkg backend is not available in this gpkg build";
     return false;
+}
+
+bool libapt_prime_planner_cache(bool verbose, std::string* error_out) {
+    (void)verbose;
+    if (error_out) error_out->clear();
+    return true;
 }
 #endif
 

@@ -3195,6 +3195,20 @@ int handle_update(bool verbose) {
         return 1;
     }
 
+    bool libapt_cache_primed = false;
+    if (access(packages_txt.c_str(), F_OK) == 0) {
+        std::string libapt_prime_error;
+        if (!libapt_prime_planner_cache(verbose, &libapt_prime_error)) {
+            std::cerr << Color::YELLOW
+                      << "W: Failed to prime the libapt-pkg planner cache";
+            if (!libapt_prime_error.empty()) std::cerr << " (" << libapt_prime_error << ")";
+            std::cerr << ". Debian-backed installs may be slower until the cache is rebuilt."
+                      << Color::RESET << std::endl;
+        } else {
+            libapt_cache_primed = true;
+        }
+    }
+
     std::cout << Color::GREEN << "✓ Synced raw package indices from "
               << success_count << " source"
               << (success_count == 1 ? "" : "s")
@@ -3202,6 +3216,11 @@ int handle_update(bool verbose) {
     std::cout << Color::GREEN
               << "✓ Rebuilt compiled package catalogs for fast queries."
               << Color::RESET << std::endl;
+    if (libapt_cache_primed) {
+        std::cout << Color::GREEN
+                  << "✓ Primed the libapt-pkg planner cache for faster installs."
+                  << Color::RESET << std::endl;
+    }
 
     return 0;
 }

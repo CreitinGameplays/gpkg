@@ -32,6 +32,7 @@
 #include <sys/ioctl.h>
 #include <sys/wait.h>
 #include <thread>
+#include <utime.h>
 #include <unistd.h>
 #include <vector>
 
@@ -98,6 +99,7 @@ int run_command_argv(
 int decode_command_exit_status(int status);
 int compare_versions(const std::string& v1, const std::string& v2);
 std::string shell_quote(const std::string& value);
+bool libapt_prime_planner_cache(bool verbose, std::string* error_out = nullptr);
 
 struct CommandCaptureResult {
     int exit_code = 0;
