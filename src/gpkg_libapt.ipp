@@ -1111,7 +1111,7 @@ bool libapt_can_handle_repair_queue(
     for (const auto& meta : repair_queue) {
         if (!package_can_use_libapt_native_planner(meta)) {
             if (error_out) {
-                *error_out = meta.name + " is not available in the native planner cache yet, so the legacy repair path is still required";
+                *error_out = meta.name + " is not available in the native planner cache yet";
             }
             return false;
         }

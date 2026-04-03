@@ -6815,8 +6815,6 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
                   << " package(s)." << Color::RESET << std::endl;
     }
 
-finish_upgrade_execution:
-
     if (!failures.empty()) {
         std::cout << Color::CYAN << "Upgrade summary: "
                   << installed_upgrades.size() << " upgraded, "
@@ -7082,13 +7080,7 @@ int handle_repair(bool verbose) {
 
     std::cout << "Inspecting installed packages..." << std::endl;
     std::cout << "Optional dependency policy: " << describe_optional_dependency_policy() << std::endl;
-    DebianBackendSelection backend = select_debian_backend(
-        DebianBackendOperation::ResolveDependencies,
-        verbose
-    );
-    maybe_log_debian_backend_selection(backend, DebianBackendOperation::ResolveDependencies, verbose);
     RepairInspection inspection = inspect_repair_state(verbose);
-    bool using_libapt_plan = false;
     LibAptTransactionPlanResult libapt_plan;
 
     if (inspection.detected_issues.empty()) {
@@ -7163,37 +7155,37 @@ int handle_repair(bool verbose) {
 
     std::vector<std::string> registered_packages = get_registered_package_names();
     std::set<std::string> installed_set(registered_packages.begin(), registered_packages.end());
-    if (backend.selected == DebianBackendKind::LibAptPkg) {
-        std::string unsupported_reason;
-        if (libapt_can_handle_repair_queue(repair_queue, &unsupported_reason)) {
-            std::vector<std::string> explicit_targets;
-            std::set<std::string> reinstall_targets;
-            for (const auto& meta : repair_queue) explicit_targets.push_back(meta.name);
-            for (const auto& meta : inspection.reinstall_queue) reinstall_targets.insert(meta.name);
-
-            std::string apt_error;
-            if (!libapt_plan_install_like_transaction(
-                    explicit_targets,
-                    reinstall_targets,
-                    true,
-                    verbose,
-                    libapt_plan,
-                    &apt_error
-                )) {
-                std::cerr << Color::RED << "E: "
-                          << (apt_error.empty()
-                                  ? "libapt-pkg could not build a repair transaction"
-                                  : apt_error)
-                          << Color::RESET << std::endl;
-                return 1;
-            }
-            repair_queue = collect_libapt_install_queue(libapt_plan);
-            using_libapt_plan = true;
-        } else if (verbose && !unsupported_reason.empty()) {
-            std::cout << "[DEBUG] Falling back to the legacy repair planner because "
-                      << unsupported_reason << std::endl;
-        }
+    std::string unsupported_reason;
+    if (!libapt_can_handle_repair_queue(repair_queue, &unsupported_reason)) {
+        std::cerr << Color::RED << "E: "
+                  << (unsupported_reason.empty()
+                          ? "libapt-pkg could not represent the requested repair transaction"
+                          : unsupported_reason)
+                  << Color::RESET << std::endl;
+        return 1;
     }
+    std::vector<std::string> explicit_targets;
+    std::set<std::string> reinstall_targets;
+    for (const auto& meta : repair_queue) explicit_targets.push_back(meta.name);
+    for (const auto& meta : inspection.reinstall_queue) reinstall_targets.insert(meta.name);
+
+    std::string apt_error;
+    if (!libapt_plan_install_like_transaction(
+            explicit_targets,
+            reinstall_targets,
+            true,
+            verbose,
+            libapt_plan,
+            &apt_error
+        )) {
+        std::cerr << Color::RED << "E: "
+                  << (apt_error.empty()
+                          ? "libapt-pkg could not build a repair transaction"
+                          : apt_error)
+                  << Color::RESET << std::endl;
+        return 1;
+    }
+    repair_queue = collect_libapt_install_queue(libapt_plan);
 
     if (!expand_runtime_upgrade_companions(repair_queue, installed_set, verbose)) return 1;
     TransactionPlan repair_plan;
@@ -7243,139 +7235,39 @@ int handle_repair(bool verbose) {
 
     std::cout << Color::CYAN << "[*] Applying repair plan..." << Color::RESET << std::endl;
     size_t repaired_count = 0;
-    size_t install_progress_width = 0;
     std::vector<std::string> failures;
     bool mutated_runtime_state = false;
-    if (using_libapt_plan && !libapt_plan.ordered_operations.empty()) {
-        LibAptExecutionResult exec_result = execute_libapt_install_like_plan(
-            libapt_plan,
-            repair_plan,
-            {},
-            installed_set,
-            verbose,
-            !libapt_plan.auto_state_after.empty() ? &libapt_plan.auto_state_after : nullptr
-        );
-        if (!exec_result.success) {
-            std::string failed_name = exec_result.failed_package.empty()
-                ? (repair_queue.empty() ? std::string() : repair_queue.front().name)
-                : exec_result.failed_package;
-            std::cerr << Color::RED << "E: Repair stopped";
-            if (!failed_name.empty()) std::cerr << " at " << failed_name;
-            std::cerr << Color::RESET;
-            if (!verbose && !exec_result.log_path.empty()) {
-                std::cerr << " (see " << exec_result.log_path << ")";
-            }
-            std::cerr << std::endl;
-            failures.push_back(failed_name.empty() ? "unknown" : failed_name);
-        } else {
-            repaired_count = exec_result.installed_count;
-            mutated_runtime_state = exec_result.mutated_runtime_state;
-        }
-        goto finish_repair_execution;
+    if (libapt_plan.ordered_operations.empty()) {
+        std::cerr << Color::RED
+                  << "E: libapt-pkg did not produce an executable operation order for this repair"
+                  << Color::RESET << std::endl;
+        return 1;
     }
 
-    for (size_t i = 0; i < repair_queue.size();) {
-        if (!verbose) render_package_progress("current", i, repair_queue.size(), repair_queue[i].name, &install_progress_width);
-
-        if (package_uses_native_dpkg_backend(repair_queue[i])) {
-            size_t batch_end = i;
-            std::vector<PackageMetadata> batch;
-            while (batch_end < repair_queue.size() &&
-                   package_uses_native_dpkg_backend(repair_queue[batch_end])) {
-                batch.push_back(repair_queue[batch_end]);
-                ++batch_end;
-            }
-
-            InstallCommandResult result = install_native_debian_batch(
-                batch,
-                verbose,
-                i,
-                repair_queue.size(),
-                &install_progress_width
-            );
-            repaired_count += result.completed_count;
-            if (!result.success) {
-                if (!verbose) finish_progress_line(&install_progress_width);
-                std::string failed_name = result.failed_package.empty() ? batch.front().name : result.failed_package;
-                std::cerr << Color::RED << "E: Repair stopped at Debian package batch starting with "
-                          << failed_name << Color::RESET;
-                if (!verbose && !result.log_path.empty()) {
-                    std::cerr << " (see " << result.log_path << ")";
-                }
-                std::cerr << std::endl;
-                failures.push_back(failed_name);
-                break;
-            }
-
-            if (!finalize_native_debian_batch(
-                    batch,
-                    {},
-                    installed_set,
-                    repair_plan,
-                    verbose,
-                    (using_libapt_plan && !libapt_plan.auto_state_after.empty())
-                        ? &libapt_plan.auto_state_after
-                        : nullptr)) {
-                if (!verbose) finish_progress_line(&install_progress_width);
-                failures.push_back(batch.front().name);
-                break;
-            }
-
-            mutated_runtime_state = true;
-            i = batch_end;
-            if (!verbose) render_package_progress("current", i, repair_queue.size(), batch.back().name, &install_progress_width);
-            continue;
+    LibAptExecutionResult exec_result = execute_libapt_install_like_plan(
+        libapt_plan,
+        repair_plan,
+        {},
+        installed_set,
+        verbose,
+        !libapt_plan.auto_state_after.empty() ? &libapt_plan.auto_state_after : nullptr
+    );
+    if (!exec_result.success) {
+        std::string failed_name = exec_result.failed_package.empty()
+            ? (repair_queue.empty() ? std::string() : repair_queue.front().name)
+            : exec_result.failed_package;
+        std::cerr << Color::RED << "E: Repair stopped";
+        if (!failed_name.empty()) std::cerr << " at " << failed_name;
+        std::cerr << Color::RESET;
+        if (!verbose && !exec_result.log_path.empty()) {
+            std::cerr << " (see " << exec_result.log_path << ")";
         }
-
-        InstallCommandResult result = install_package_v2(repair_queue[i], verbose);
-        if (!result.success) {
-            if (!verbose) finish_progress_line(&install_progress_width);
-            std::cerr << Color::RED << "E: Repair stopped at " << repair_queue[i].name
-                      << Color::RESET;
-            if (!verbose && !result.log_path.empty()) {
-                std::cerr << " (see " << result.log_path << ")";
-            }
-            std::cerr << std::endl;
-            failures.push_back(repair_queue[i].name);
-            break;
-        }
-        mutated_runtime_state = true;
-        queue_triggers_for_package(repair_queue[i].name);
-        if (!update_package_auto_install_state_after_install(
-                repair_queue[i].name,
-                false,
-                installed_set)) {
-            if (!verbose) finish_progress_line(&install_progress_width);
-            std::cerr << Color::RED << "E: Failed to update gpkg auto-install state for "
-                      << repair_queue[i].name << Color::RESET << std::endl;
-            failures.push_back(repair_queue[i].name);
-            break;
-        }
-        std::string failed_pkg;
-        std::string failed_log;
-        if (!retire_replaced_packages_live(
-                repair_plan,
-                repair_queue[i].name,
-                verbose,
-                &failed_pkg,
-                &failed_log)) {
-            if (!verbose) finish_progress_line(&install_progress_width);
-            std::cerr << Color::RED << "E: Failed to retire replaced package " << failed_pkg
-                      << Color::RESET;
-            if (!verbose && !failed_log.empty()) {
-                std::cerr << " (see " << failed_log << ")";
-            }
-            std::cerr << std::endl;
-            failures.push_back(failed_pkg.empty() ? repair_queue[i].name : failed_pkg);
-            break;
-        }
-        ++repaired_count;
-        ++i;
-        if (!verbose) render_package_progress("current", i, repair_queue.size(), repair_queue[i - 1].name, &install_progress_width);
+        std::cerr << std::endl;
+        failures.push_back(failed_name.empty() ? "unknown" : failed_name);
+    } else {
+        repaired_count = exec_result.installed_count;
+        mutated_runtime_state = exec_result.mutated_runtime_state;
     }
-    if (!verbose) finish_progress_line(&install_progress_width);
-
-finish_repair_execution:
 
     if (!failures.empty()) {
         if (mutated_runtime_state) queue_runtime_linker_state_refresh();
@@ -7495,16 +7387,8 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
     std::vector<std::string> prioritized_repo_operands;
     std::vector<std::string> deferred_repo_operands;
     std::vector<std::string> operands = collect_cli_operands(argc, argv, 2);
-    std::set<std::string> visited;
     bool needs_repo_index = false;
     bool mutated_runtime_state = false;
-    RawDebianContext raw_context;
-    DebianBackendSelection backend = select_debian_backend(
-        DebianBackendOperation::ResolveDependencies,
-        verbose
-    );
-    maybe_log_debian_backend_selection(backend, DebianBackendOperation::ResolveDependencies, verbose);
-    bool using_libapt_plan = false;
     LibAptTransactionPlanResult libapt_plan;
 
     if (operands.empty()) {
@@ -7538,111 +7422,47 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
                   << join_strings(prioritized_repo_operands) << std::endl;
     }
 
-    for (const auto& arg : deferred_repo_operands) {
+    for (const auto& arg : repo_operands) {
         if (maybe_report_unavailable_install_target(arg, verbose)) {
             return 1;
         }
     }
 
-    for (const auto& arg : prioritized_repo_operands) {
-        std::string failure_reason;
-        bool force_explicit_queue =
-            g_force_reinstall || explicit_install_target_requires_queue(arg, verbose, &raw_context);
-        if (!resolve_dependencies(
-                arg,
-                "",
-                "",
-                install_queue,
-                visited,
-                installed_cache,
-                verbose,
-                force_explicit_queue,
-                nullptr,
-                false,
-                &raw_context,
-                &failure_reason
-            )) {
-            std::cerr << Color::RED << "E: Failed to resolve dependencies for " << arg;
-            if (!failure_reason.empty()) {
-                std::cerr << " (" << failure_reason << ")";
-            }
-            std::cerr << Color::RESET << std::endl;
-            return 1;
-        }
-    }
-
-    if (!deferred_repo_operands.empty() && backend.selected == DebianBackendKind::LibAptPkg) {
+    if (!repo_operands.empty()) {
+        std::vector<std::string> apt_targets = prioritized_repo_operands;
+        apt_targets.insert(apt_targets.end(), deferred_repo_operands.begin(), deferred_repo_operands.end());
         std::string unsupported_reason;
-        if (libapt_can_handle_repo_install_operands(deferred_repo_operands, verbose, &unsupported_reason)) {
-            std::set<std::string> reinstall_targets;
-            if (g_force_reinstall) {
-                reinstall_targets.insert(deferred_repo_operands.begin(), deferred_repo_operands.end());
-            }
-            std::string apt_error;
-            if (!libapt_plan_install_like_transaction(
-                    deferred_repo_operands,
-                    reinstall_targets,
-                    false,
-                    verbose,
-                    libapt_plan,
-                    &apt_error
-                )) {
-                std::cerr << Color::RED << "E: "
-                          << (apt_error.empty()
-                                  ? "libapt-pkg failed to resolve the requested install transaction"
-                                  : apt_error)
-                          << Color::RESET << std::endl;
-                return 1;
-            }
-
-            std::vector<PackageMetadata> libapt_queue =
-                collect_libapt_install_queue(libapt_plan, true);
-            install_queue.insert(install_queue.end(), libapt_queue.begin(), libapt_queue.end());
-            using_libapt_plan = true;
-        } else if (verbose && !unsupported_reason.empty()) {
-            std::cout << "[DEBUG] Falling back to the legacy install planner because "
-                      << unsupported_reason << std::endl;
-        }
-    }
-
-    if (!using_libapt_plan) {
-        for (const auto& arg : deferred_repo_operands) {
-            std::string failure_reason;
-            bool force_explicit_queue =
-                g_force_reinstall || explicit_install_target_requires_queue(arg, verbose, &raw_context);
-            if (!resolve_dependencies(
-                    arg,
-                    "",
-                    "",
-                    install_queue,
-                    visited,
-                    installed_cache,
-                    verbose,
-                    force_explicit_queue,
-                    nullptr,
-                    false,
-                    &raw_context,
-                    &failure_reason
-                )) {
-                std::cerr << Color::RED << "E: Failed to resolve dependencies for " << arg;
-                if (!failure_reason.empty()) {
-                    std::cerr << " (" << failure_reason << ")";
-                }
-                std::cerr << Color::RESET << std::endl;
-                return 1;
-            }
-        }
-    }
-
-    if (!using_libapt_plan) {
-        if (!expand_runtime_upgrade_companions(install_queue, installed_cache, verbose)) {
-            std::cerr << Color::RED << "E: Failed to expand runtime upgrade companion packages."
+        if (!libapt_can_handle_repo_install_operands(apt_targets, verbose, &unsupported_reason)) {
+            std::cerr << Color::RED << "E: "
+                      << (unsupported_reason.empty()
+                              ? "libapt-pkg could not represent the requested install transaction"
+                              : unsupported_reason)
                       << Color::RESET << std::endl;
             return 1;
         }
-    } else {
-        VLOG(verbose, "Skipping legacy runtime companion expansion because libapt-pkg already "
-                     << "produced the install transaction.");
+
+        std::set<std::string> reinstall_targets;
+        if (g_force_reinstall) {
+            reinstall_targets.insert(apt_targets.begin(), apt_targets.end());
+        }
+        std::string apt_error;
+        if (!libapt_plan_install_like_transaction(
+                apt_targets,
+                reinstall_targets,
+                false,
+                verbose,
+                libapt_plan,
+                &apt_error
+            )) {
+            std::cerr << Color::RED << "E: "
+                      << (apt_error.empty()
+                              ? "libapt-pkg failed to resolve the requested install transaction"
+                              : apt_error)
+                      << Color::RESET << std::endl;
+            return 1;
+        }
+
+        install_queue = collect_libapt_install_queue(libapt_plan, true);
     }
 
     for (const auto& local_file : local_files) {
@@ -7709,30 +7529,9 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
     install_queue = install_plan.install_queue;
 
     std::set<std::string> explicit_manual_targets;
-    for (const auto& arg : prioritized_repo_operands) {
-        std::string resolved = resolve_requested_package_for_manual_marking(
-            arg,
-            install_queue,
-            installed_cache,
-            verbose
-        );
-        if (!resolved.empty()) explicit_manual_targets.insert(resolved);
-    }
-    if (using_libapt_plan) {
-        for (const auto& action : libapt_plan.install_actions) {
-            if (!action.explicit_target) continue;
-            explicit_manual_targets.insert(action.meta.name);
-        }
-    } else {
-        for (const auto& arg : deferred_repo_operands) {
-            std::string resolved = resolve_requested_package_for_manual_marking(
-                arg,
-                install_queue,
-                installed_cache,
-                verbose
-            );
-            if (!resolved.empty()) explicit_manual_targets.insert(resolved);
-        }
+    for (const auto& action : libapt_plan.install_actions) {
+        if (!action.explicit_target) continue;
+        explicit_manual_targets.insert(action.meta.name);
     }
 
     if (install_queue.empty()) {
@@ -7834,134 +7633,37 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
 
     std::cout << Color::CYAN << "[*] Installing " << install_queue.size()
               << " package(s)..." << Color::RESET << std::endl;
-    if (using_libapt_plan && !libapt_plan.ordered_operations.empty()) {
-        LibAptExecutionResult exec_result = execute_libapt_install_like_plan(
-            libapt_plan,
-            install_plan,
-            explicit_manual_targets,
-            installed_cache,
-            verbose,
-            !libapt_plan.auto_state_after.empty() ? &libapt_plan.auto_state_after : nullptr
-        );
-        if (!exec_result.success) {
-            std::cerr << Color::RED << "E: Installation stopped";
-            if (!exec_result.failed_package.empty()) {
-                std::cerr << " at " << exec_result.failed_package;
-            }
-            std::cerr << Color::RESET;
-            if (!verbose && !exec_result.log_path.empty()) {
-                std::cerr << " See " << exec_result.log_path << " for details.";
-            }
-            std::cerr << std::endl;
-            return 1;
-        }
-
-        if (exec_result.mutated_runtime_state) queue_runtime_linker_state_refresh();
-        std::cout << Color::GREEN << "✓ Installed " << exec_result.installed_count
-                  << " package(s)." << Color::RESET << std::endl;
-        return 0;
+    if (libapt_plan.ordered_operations.empty()) {
+        std::cerr << Color::RED
+                  << "E: libapt-pkg did not produce an executable operation order for this install"
+                  << Color::RESET << std::endl;
+        return 1;
     }
 
-    size_t installed_count = 0;
-    size_t install_progress_width = 0;
-    for (size_t i = 0; i < install_queue.size();) {
-        if (!verbose) render_package_progress("current", i, install_queue.size(), install_queue[i].name, &install_progress_width);
-
-        if (package_uses_native_dpkg_backend(install_queue[i])) {
-            size_t batch_end = i;
-            std::vector<PackageMetadata> batch;
-            while (batch_end < install_queue.size() &&
-                   package_uses_native_dpkg_backend(install_queue[batch_end])) {
-                batch.push_back(install_queue[batch_end]);
-                ++batch_end;
-            }
-
-            InstallCommandResult result = install_native_debian_batch(
-                batch,
-                verbose,
-                i,
-                install_queue.size(),
-                &install_progress_width
-            );
-            installed_count += result.completed_count;
-            if (!result.success) {
-                if (!verbose) finish_progress_line(&install_progress_width);
-                std::string failed_name = result.failed_package.empty() ? batch.front().name : result.failed_package;
-                std::cerr << Color::RED << "E: Installation stopped at Debian package batch starting with "
-                          << failed_name << Color::RESET;
-                if (!verbose && !result.log_path.empty()) {
-                    std::cerr << " See " << result.log_path << " for details.";
-                }
-                std::cerr << std::endl;
-                return 1;
-            }
-
-            if (!finalize_native_debian_batch(
-                    batch,
-                    explicit_manual_targets,
-                    installed_cache,
-                    install_plan,
-                    verbose,
-                    (using_libapt_plan && !libapt_plan.auto_state_after.empty())
-                        ? &libapt_plan.auto_state_after
-                        : nullptr)) {
-                if (!verbose) finish_progress_line(&install_progress_width);
-                return 1;
-            }
-
-            mutated_runtime_state = true;
-            i = batch_end;
-            if (!verbose) render_package_progress("current", i, install_queue.size(), batch.back().name, &install_progress_width);
-            continue;
+    LibAptExecutionResult exec_result = execute_libapt_install_like_plan(
+        libapt_plan,
+        install_plan,
+        explicit_manual_targets,
+        installed_cache,
+        verbose,
+        !libapt_plan.auto_state_after.empty() ? &libapt_plan.auto_state_after : nullptr
+    );
+    if (!exec_result.success) {
+        std::cerr << Color::RED << "E: Installation stopped";
+        if (!exec_result.failed_package.empty()) {
+            std::cerr << " at " << exec_result.failed_package;
         }
-
-        InstallCommandResult result = install_package_v2(install_queue[i], verbose);
-        if (!result.success) {
-            if (!verbose) finish_progress_line(&install_progress_width);
-            std::cerr << Color::RED << "E: Installation stopped at " << install_queue[i].name
-                      << Color::RESET;
-            if (!verbose && !result.log_path.empty()) {
-                std::cerr << " See " << result.log_path << " for details.";
-            }
-            std::cerr << std::endl;
-            return 1;
+        std::cerr << Color::RESET;
+        if (!verbose && !exec_result.log_path.empty()) {
+            std::cerr << " See " << exec_result.log_path << " for details.";
         }
-        std::string failed_pkg;
-        std::string failed_log;
-        if (!retire_replaced_packages_live(
-                install_plan,
-                install_queue[i].name,
-                verbose,
-                &failed_pkg,
-                &failed_log)) {
-            if (!verbose) finish_progress_line(&install_progress_width);
-            std::cerr << Color::RED << "E: Failed to retire replaced package "
-                      << failed_pkg << Color::RESET << std::endl;
-            if (!verbose && !failed_log.empty()) {
-                std::cerr << " See " << failed_log << " for details.";
-            }
-            std::cerr << std::endl;
-            return 1;
-        }
-        if (!update_package_auto_install_state_after_install(
-                install_queue[i].name,
-                explicit_manual_targets.count(install_queue[i].name) != 0,
-                installed_cache)) {
-            if (!verbose) finish_progress_line(&install_progress_width);
-            std::cerr << Color::RED << "E: Failed to update gpkg auto-install state for "
-                      << install_queue[i].name << Color::RESET << std::endl;
-            return 1;
-        }
-        queue_triggers_for_package(install_queue[i].name);
-        mutated_runtime_state = true;
-        ++installed_count;
-        ++i;
-        if (!verbose) render_package_progress("current", i, install_queue.size(), install_queue[i - 1].name, &install_progress_width);
+        std::cerr << std::endl;
+        return 1;
     }
-    if (!verbose) finish_progress_line(&install_progress_width);
 
-    if (mutated_runtime_state) queue_runtime_linker_state_refresh();
-    std::cout << Color::GREEN << "✓ Installed " << installed_count << " package(s)." << Color::RESET << std::endl;
+    if (exec_result.mutated_runtime_state) queue_runtime_linker_state_refresh();
+    std::cout << Color::GREEN << "✓ Installed " << exec_result.installed_count
+              << " package(s)." << Color::RESET << std::endl;
     return 0;
 }
 
@@ -8007,110 +7709,50 @@ int handle_remove(int argc, char* argv[], bool verbose, bool purge, bool autorem
         return 1;
     }
 
-    DebianBackendSelection backend = select_debian_backend(
-        DebianBackendOperation::BuildTransactionPlan,
-        verbose
-    );
-    maybe_log_debian_backend_selection(backend, DebianBackendOperation::BuildTransactionPlan, verbose);
-    if (backend.selected == DebianBackendKind::LibAptPkg &&
-        libapt_can_handle_remove_target(target_pkg, purge) &&
-        (!autoremove || !libapt_has_non_native_auto_installed_packages())) {
-        LibAptTransactionPlanResult libapt_plan;
-        std::string apt_error;
-        if (!libapt_plan_remove_transaction({target_pkg}, purge, autoremove, verbose, libapt_plan, &apt_error)) {
-            std::cerr << Color::RED << "E: "
-                      << (apt_error.empty()
-                              ? "libapt-pkg could not build a safe removal transaction"
-                              : apt_error)
-                      << Color::RESET << std::endl;
-            return 1;
-        }
-
-        std::set<std::string> protected_kernel_packages =
-            autoremove ? get_autoremove_protected_kernel_packages(verbose) : std::set<std::string>{};
-        std::map<std::string, std::string> skipped_protected_packages;
-        std::set<std::string> skipped_kernel_packages;
-        std::vector<std::string> to_remove;
-        std::set<std::string> removal_set;
-        for (const auto& pkg : libapt_plan.remove_packages) {
-            if (pkg != target_pkg) {
-                std::string auto_reason;
-                if (package_is_removal_protected(pkg, &auto_reason)) {
-                    skipped_protected_packages[pkg] = auto_reason;
-                    continue;
-                }
-                if (protected_kernel_packages.count(pkg) != 0) {
-                    skipped_kernel_packages.insert(pkg);
-                    continue;
-                }
-            }
-            if (removal_set.insert(pkg).second) to_remove.push_back(pkg);
-        }
-
-        std::vector<std::string> to_purge;
-        std::set<std::string> purge_set;
-        if (purge) {
-            if (target_config_files && purge_set.insert(target_pkg).second) {
-                to_purge.push_back(target_pkg);
-            }
-            for (const auto& pkg : libapt_plan.purge_packages) {
-                if (purge_set.insert(pkg).second) to_purge.push_back(pkg);
-            }
-        }
-
-        if (!skipped_kernel_packages.empty()) {
-            std::cout << "Keeping protected kernel package(s):";
-            for (const auto& pkg : skipped_kernel_packages) std::cout << " " << pkg;
-            std::cout << std::endl;
-        }
-        if (!skipped_protected_packages.empty()) {
-            std::cout << "Keeping protected system package(s):" << std::endl;
-            for (const auto& entry : skipped_protected_packages) {
-                std::cout << "  " << entry.first << " (" << entry.second << ")" << std::endl;
-            }
-        }
-
-        if (!to_remove.empty()) sort_removal_queue_for_operation(to_remove, verbose);
-        return execute_removal_plan(to_remove, to_purge, verbose);
+    if (!libapt_can_handle_remove_target(target_pkg, purge)) {
+        std::cerr << Color::RED
+                  << "E: libapt-pkg could not represent the requested removal target"
+                  << Color::RESET << std::endl;
+        return 1;
+    }
+    if (autoremove && libapt_has_non_native_auto_installed_packages()) {
+        std::cerr << Color::RED
+                  << "E: libapt-pkg cannot safely autoremove while non-native auto-installed packages remain"
+                  << Color::RESET << std::endl;
+        return 1;
     }
 
+    LibAptTransactionPlanResult libapt_plan;
+    std::string apt_error;
+    if (!libapt_plan_remove_transaction({target_pkg}, purge, autoremove, verbose, libapt_plan, &apt_error)) {
+        std::cerr << Color::RED << "E: "
+                  << (apt_error.empty()
+                          ? "libapt-pkg could not build a safe removal transaction"
+                          : apt_error)
+                  << Color::RESET << std::endl;
+        return 1;
+    }
+
+    std::set<std::string> protected_kernel_packages =
+        autoremove ? get_autoremove_protected_kernel_packages(verbose) : std::set<std::string>{};
+    std::map<std::string, std::string> skipped_protected_packages;
+    std::set<std::string> skipped_kernel_packages;
     std::vector<std::string> to_remove;
     std::set<std::string> removal_set;
-    if (target_installed) {
-        to_remove.push_back(target_pkg);
-        removal_set.insert(target_pkg);
-    }
-
-    if (autoremove && target_installed) {
-        std::cout << "Calculating newly unneeded dependencies..." << std::endl;
-        std::set<std::string> skipped_kernel_packages;
-        std::map<std::string, std::string> skipped_protected_packages;
-        std::vector<std::string> autoremove_packages = collect_autoremove_packages(
-            removal_set,
-            verbose,
-            &skipped_kernel_packages,
-            &skipped_protected_packages
-        );
-        for (const auto& pkg : autoremove_packages) {
-            if (removal_set.insert(pkg).second) to_remove.push_back(pkg);
-        }
-
-        if (!skipped_kernel_packages.empty()) {
-            std::cout << "Keeping protected kernel package(s):";
-            for (const auto& pkg : skipped_kernel_packages) {
-                std::cout << " " << pkg;
+    for (const auto& pkg : libapt_plan.remove_packages) {
+        if (pkg != target_pkg) {
+            std::string auto_reason;
+            if (package_is_removal_protected(pkg, &auto_reason)) {
+                skipped_protected_packages[pkg] = auto_reason;
+                continue;
             }
-            std::cout << std::endl;
-        }
-        if (!skipped_protected_packages.empty()) {
-            std::cout << "Keeping protected system package(s):" << std::endl;
-            for (const auto& entry : skipped_protected_packages) {
-                std::cout << "  " << entry.first << " (" << entry.second << ")" << std::endl;
+            if (protected_kernel_packages.count(pkg) != 0) {
+                skipped_kernel_packages.insert(pkg);
+                continue;
             }
         }
+        if (removal_set.insert(pkg).second) to_remove.push_back(pkg);
     }
-
-    if (!to_remove.empty()) sort_removal_queue_for_operation(to_remove, verbose);
 
     std::vector<std::string> to_purge;
     std::set<std::string> purge_set;
@@ -8118,82 +7760,60 @@ int handle_remove(int argc, char* argv[], bool verbose, bool purge, bool autorem
         if (target_config_files && purge_set.insert(target_pkg).second) {
             to_purge.push_back(target_pkg);
         }
-        for (const auto& pkg : to_remove) {
+        for (const auto& pkg : libapt_plan.purge_packages) {
             if (purge_set.insert(pkg).second) to_purge.push_back(pkg);
         }
     }
 
+    if (!skipped_kernel_packages.empty()) {
+        std::cout << "Keeping protected kernel package(s):";
+        for (const auto& pkg : skipped_kernel_packages) std::cout << " " << pkg;
+        std::cout << std::endl;
+    }
+    if (!skipped_protected_packages.empty()) {
+        std::cout << "Keeping protected system package(s):" << std::endl;
+        for (const auto& entry : skipped_protected_packages) {
+            std::cout << "  " << entry.first << " (" << entry.second << ")" << std::endl;
+        }
+    }
+
+    if (!to_remove.empty()) sort_removal_queue_for_operation(to_remove, verbose);
     return execute_removal_plan(to_remove, to_purge, verbose);
 }
 
 int handle_autoremove(bool verbose, bool purge) {
     std::cout << "Calculating removable packages..." << std::endl;
 
-    DebianBackendSelection backend = select_debian_backend(
-        DebianBackendOperation::BuildTransactionPlan,
-        verbose
-    );
-    maybe_log_debian_backend_selection(backend, DebianBackendOperation::BuildTransactionPlan, verbose);
-    if (backend.selected == DebianBackendKind::LibAptPkg &&
-        !libapt_has_non_native_auto_installed_packages()) {
-        LibAptTransactionPlanResult libapt_plan;
-        std::string apt_error;
-        if (!libapt_plan_remove_transaction({}, purge, true, verbose, libapt_plan, &apt_error)) {
-            std::cerr << Color::RED << "E: "
-                      << (apt_error.empty()
-                              ? "libapt-pkg could not build an autoremove transaction"
-                              : apt_error)
-                      << Color::RESET << std::endl;
-            return 1;
-        }
-
-        std::set<std::string> skipped_kernel_packages = get_autoremove_protected_kernel_packages(verbose);
-        std::map<std::string, std::string> skipped_protected_packages;
-        std::vector<std::string> to_remove;
-        std::set<std::string> selected;
-        for (const auto& pkg : libapt_plan.remove_packages) {
-            std::string protection_reason;
-            if (package_is_removal_protected(pkg, &protection_reason)) {
-                skipped_protected_packages[pkg] = protection_reason;
-                continue;
-            }
-            if (skipped_kernel_packages.count(pkg) != 0) continue;
-            if (selected.insert(pkg).second) to_remove.push_back(pkg);
-        }
-
-        if (!skipped_kernel_packages.empty()) {
-            std::cout << "Keeping protected kernel package(s):";
-            for (const auto& pkg : skipped_kernel_packages) std::cout << " " << pkg;
-            std::cout << std::endl;
-        }
-        if (!skipped_protected_packages.empty()) {
-            std::cout << "Keeping protected system package(s):" << std::endl;
-            for (const auto& entry : skipped_protected_packages) {
-                std::cout << "  " << entry.first << " (" << entry.second << ")" << std::endl;
-            }
-        }
-
-        std::vector<std::string> to_purge;
-        if (purge) {
-            to_purge = to_remove;
-            std::vector<std::string> purge_only = collect_autoremove_purge_only_packages(selected, verbose);
-            to_purge.insert(to_purge.end(), purge_only.begin(), purge_only.end());
-            std::sort(to_purge.begin(), to_purge.end());
-            to_purge.erase(std::unique(to_purge.begin(), to_purge.end()), to_purge.end());
-        }
-
-        if (!to_remove.empty()) sort_removal_queue_for_operation(to_remove, verbose);
-        return execute_removal_plan(to_remove, to_purge, verbose);
+    if (libapt_has_non_native_auto_installed_packages()) {
+        std::cerr << Color::RED
+                  << "E: libapt-pkg cannot safely autoremove while non-native auto-installed packages remain"
+                  << Color::RESET << std::endl;
+        return 1;
+    }
+    LibAptTransactionPlanResult libapt_plan;
+    std::string apt_error;
+    if (!libapt_plan_remove_transaction({}, purge, true, verbose, libapt_plan, &apt_error)) {
+        std::cerr << Color::RED << "E: "
+                  << (apt_error.empty()
+                          ? "libapt-pkg could not build an autoremove transaction"
+                          : apt_error)
+                  << Color::RESET << std::endl;
+        return 1;
     }
 
-    std::set<std::string> skipped_kernel_packages;
+    std::set<std::string> skipped_kernel_packages = get_autoremove_protected_kernel_packages(verbose);
     std::map<std::string, std::string> skipped_protected_packages;
-    std::vector<std::string> to_remove = collect_autoremove_packages(
-        {},
-        verbose,
-        &skipped_kernel_packages,
-        &skipped_protected_packages
-    );
+    std::vector<std::string> to_remove;
+    std::set<std::string> selected;
+    for (const auto& pkg : libapt_plan.remove_packages) {
+        std::string protection_reason;
+        if (package_is_removal_protected(pkg, &protection_reason)) {
+            skipped_protected_packages[pkg] = protection_reason;
+            continue;
+        }
+        if (skipped_kernel_packages.count(pkg) != 0) continue;
+        if (selected.insert(pkg).second) to_remove.push_back(pkg);
+    }
 
     if (!skipped_kernel_packages.empty()) {
         std::cout << "Keeping protected kernel package(s):";
@@ -8210,7 +7830,6 @@ int handle_autoremove(bool verbose, bool purge) {
     }
 
     std::vector<std::string> to_purge;
-    std::set<std::string> selected(to_remove.begin(), to_remove.end());
     if (purge) {
         to_purge = to_remove;
         std::vector<std::string> purge_only = collect_autoremove_purge_only_packages(selected, verbose);
@@ -8219,5 +7838,6 @@ int handle_autoremove(bool verbose, bool purge) {
         to_purge.erase(std::unique(to_purge.begin(), to_purge.end()), to_purge.end());
     }
 
+    if (!to_remove.empty()) sort_removal_queue_for_operation(to_remove, verbose);
     return execute_removal_plan(to_remove, to_purge, verbose);
 }
