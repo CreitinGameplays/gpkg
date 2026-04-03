@@ -1013,6 +1013,17 @@ bool get_loaded_repo_package_info(const std::string& pkg_name, PackageMetadata& 
     return true;
 }
 
+bool get_repo_package_info_uncached(const std::string& pkg_name, PackageMetadata& out_meta) {
+    auto offset_it = g_repo_package_offsets.find(pkg_name);
+    if (offset_it == g_repo_package_offsets.end()) return false;
+
+    return read_repo_shard_entry_at_offset(
+        offset_it->second.shard_path,
+        offset_it->second.offset,
+        out_meta
+    );
+}
+
 std::string upgrade_catalog_file_fingerprint_component(const std::string& path) {
     struct stat st {};
     if (lstat(path.c_str(), &st) != 0) return path + ":missing";
@@ -1044,7 +1055,7 @@ std::set<std::string> load_present_base_registry_package_names() {
         if (canonical_name.empty()) continue;
 
         PackageMetadata exact_meta;
-        if (get_loaded_repo_package_info(canonical_name, exact_meta)) {
+        if (get_repo_package_info_uncached(canonical_name, exact_meta)) {
             names.insert(canonical_name);
             continue;
         }
@@ -1057,7 +1068,7 @@ std::set<std::string> load_present_base_registry_package_names() {
         std::string best_name;
         for (const auto& provider_name : provider_it->second) {
             PackageMetadata candidate;
-            if (!get_loaded_repo_package_info(provider_name, candidate)) continue;
+            if (!get_repo_package_info_uncached(provider_name, candidate)) continue;
             if (!found_provider || should_prefer_repo_candidate(candidate, best_meta)) {
                 found_provider = true;
                 best_meta = candidate;
@@ -1200,7 +1211,7 @@ bool resolve_catalog_relation(
     RelationAtom effective_relation = apply_catalog_policy_resolution(relation);
     std::string requested_name = canonicalize_package_name(effective_relation.name);
     PackageMetadata exact_meta;
-    if (get_loaded_repo_package_info(requested_name, exact_meta) &&
+    if (get_repo_package_info_uncached(requested_name, exact_meta) &&
         catalog_meta_satisfies_relation(requested_name, exact_meta, effective_relation)) {
         out_meta = exact_meta;
         out_name = exact_meta.name;
@@ -1218,7 +1229,7 @@ bool resolve_catalog_relation(
     std::string best_name;
     for (const auto& provider_name : provider_it->second) {
         PackageMetadata candidate;
-        if (!get_loaded_repo_package_info(provider_name, candidate)) continue;
+        if (!get_repo_package_info_uncached(provider_name, candidate)) continue;
         if (!catalog_meta_satisfies_relation(provider_name, candidate, effective_relation)) continue;
 
         if (!found || should_prefer_repo_candidate(candidate, best_meta)) {
@@ -1254,7 +1265,7 @@ bool validate_catalog_package_closure_recursive(
     if (!walk.insert(pkg_name).second) return true;
 
     PackageMetadata meta;
-    if (!get_loaded_repo_package_info(pkg_name, meta)) {
+    if (!get_repo_package_info_uncached(pkg_name, meta)) {
         cache.invalid_reasons[pkg_name] = "repository metadata is missing";
         walk.erase(pkg_name);
         return false;
@@ -3152,21 +3163,35 @@ int handle_update(bool verbose) {
         invalidate_repo_package_cache();
     }
 
-    std::string catalog_error;
-    if (!build_current_repo_catalog(verbose, &catalog_error)) {
-        std::cerr << Color::RED
-                  << "E: Failed to rebuild the compiled package catalog";
-        if (!catalog_error.empty()) std::cerr << " (" << catalog_error << ")";
-        std::cerr << Color::RESET << std::endl;
-        return 1;
-    }
+    try {
+        std::string catalog_error;
+        if (!build_current_repo_catalog(verbose, &catalog_error)) {
+            std::cerr << Color::RED
+                      << "E: Failed to rebuild the compiled package catalog";
+            if (!catalog_error.empty()) std::cerr << " (" << catalog_error << ")";
+            std::cerr << Color::RESET << std::endl;
+            return 1;
+        }
 
-    std::string upgrade_error;
-    if (!ensure_current_upgrade_catalog(verbose, &upgrade_error)) {
+        g_repo_package_cache.clear();
+
+        std::string upgrade_error;
+        if (!ensure_current_upgrade_catalog(verbose, &upgrade_error)) {
+            std::cerr << Color::RED
+                      << "E: Failed to rebuild the runtime upgrade catalog";
+            if (!upgrade_error.empty()) std::cerr << " (" << upgrade_error << ")";
+            std::cerr << Color::RESET << std::endl;
+            return 1;
+        }
+
+        g_repo_package_cache.clear();
+    } catch (const std::bad_alloc&) {
+        invalidate_repo_package_cache();
         std::cerr << Color::RED
-                  << "E: Failed to rebuild the runtime upgrade catalog";
-        if (!upgrade_error.empty()) std::cerr << " (" << upgrade_error << ")";
-        std::cerr << Color::RESET << std::endl;
+                  << "E: gpkg update ran out of memory while rebuilding compiled package metadata. "
+                  << "The package indices were updated, but the compiled catalogs need to be rebuilt "
+                  << "with a lower-memory pass."
+                  << Color::RESET << std::endl;
         return 1;
     }
 

@@ -5805,7 +5805,6 @@ struct PreparedUpgradeState {
     std::vector<PackageMetadata> upgrade_queue;
     std::vector<UpgradePlanEntry> explicit_targets;
     TransactionPlan plan;
-    bool using_libapt_plan = false;
     LibAptTransactionPlanResult libapt_plan;
     std::map<std::string, bool> auto_state_after;
     std::vector<std::string> skipped_managed_packages;
@@ -6429,7 +6428,6 @@ bool prepare_upgrade_transaction(
         return false;
     }
 
-    out_state.using_libapt_plan = true;
     out_state.upgrade_queue = collect_libapt_install_queue(out_state.libapt_plan);
     out_state.explicit_targets = collect_libapt_explicit_upgrade_targets(out_state.libapt_plan);
     out_state.auto_state_after = out_state.libapt_plan.auto_state_after;

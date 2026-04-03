@@ -21,6 +21,7 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <new>
 #include <openssl/sha.h>
 #include <regex>
 #include <sched.h>
