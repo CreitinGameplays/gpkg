@@ -3349,7 +3349,6 @@ InstallCommandResult install_native_debian_batch_legacy(
             }
         }
         }
-        bool runtime_sensitive = debian_archive_mutates_runtime_linker_state(meta);
         std::string overlap_repair_error;
         if (!prune_synthetic_dpkg_file_ownership_for_package(meta, verbose, &overlap_repair_error)) {
             batch_result.success = false;
@@ -3391,19 +3390,6 @@ InstallCommandResult install_native_debian_batch_legacy(
         if (batch_result.last_processed_package.empty()) batch_result.last_processed_package = meta.name;
         if (result.exit_code == 0) {
             ++batch_result.completed_count;
-            if (runtime_sensitive) {
-                int refresh_rc = run_ldconfig_trigger(verbose);
-                if (refresh_rc != 0) {
-                    batch_result.success = false;
-                    batch_result.failed_package = debian_backend_package_name(meta);
-                    if (batch_result.failed_package.empty()) batch_result.failed_package = meta.name;
-                    std::cerr << "E: Runtime linker refresh failed after installing "
-                              << batch_result.failed_package << std::endl;
-                    if (verbose) staged_batch_scope.keep_for_debugging();
-                    return batch_result;
-                }
-            }
-
             if (!verbose && progress_width && progress_total > 0) {
                 render_package_progress(
                     "current",
@@ -5059,11 +5045,26 @@ bool update_package_auto_install_state_after_install(
 }
 
 std::vector<PackageMetadata> collect_libapt_install_queue(
-    const LibAptTransactionPlanResult& plan
+    const LibAptTransactionPlanResult& plan,
+    bool drop_implicit_exact_reinstalls = false
 ) {
     std::vector<PackageMetadata> queue;
     queue.reserve(plan.install_actions.size());
     for (const auto& action : plan.install_actions) {
+        if (drop_implicit_exact_reinstalls &&
+            !action.explicit_target &&
+            action.reinstall_only) {
+            std::string exact_live_version;
+            if (package_has_exact_live_install_state(
+                    action.meta.name,
+                    &exact_live_version,
+                    nullptr
+                ) &&
+                !exact_live_version.empty() &&
+                compare_versions(exact_live_version, action.meta.version) == 0) {
+                continue;
+            }
+        }
         queue.push_back(action.meta);
     }
     return queue;
@@ -7530,7 +7531,8 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
                 return 1;
             }
 
-            std::vector<PackageMetadata> libapt_queue = collect_libapt_install_queue(libapt_plan);
+            std::vector<PackageMetadata> libapt_queue =
+                collect_libapt_install_queue(libapt_plan, true);
             install_queue.insert(install_queue.end(), libapt_queue.begin(), libapt_queue.end());
             using_libapt_plan = true;
         } else if (verbose && !unsupported_reason.empty()) {
@@ -7568,10 +7570,15 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
         }
     }
 
-    if (!expand_runtime_upgrade_companions(install_queue, installed_cache, verbose)) {
-        std::cerr << Color::RED << "E: Failed to expand runtime upgrade companion packages."
-                  << Color::RESET << std::endl;
-        return 1;
+    if (!using_libapt_plan) {
+        if (!expand_runtime_upgrade_companions(install_queue, installed_cache, verbose)) {
+            std::cerr << Color::RED << "E: Failed to expand runtime upgrade companion packages."
+                      << Color::RESET << std::endl;
+            return 1;
+        }
+    } else {
+        VLOG(verbose, "Skipping legacy runtime companion expansion because libapt-pkg already "
+                     << "produced the install transaction.");
     }
 
     for (const auto& local_file : local_files) {
