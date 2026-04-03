@@ -4104,6 +4104,117 @@ bool staged_native_debian_payload_path_is_directory_like(
     return live_path_is_directory_like(full_path);
 }
 
+std::string resolve_native_debian_preflight_symlink_target_path(
+    const std::string& logical_path,
+    const std::string& raw_target
+) {
+    std::string target = trim(raw_target);
+    if (target.empty()) return "";
+
+    std::string combined;
+    if (!target.empty() && target.front() == '/') {
+        combined = target;
+    } else {
+        std::string parent = native_debian_stage_parent_path(logical_path);
+        if (parent.empty()) parent = "/";
+        combined = parent;
+        if (combined.back() != '/') combined += "/";
+        combined += target;
+    }
+
+    std::vector<std::string> components;
+    size_t index = 0;
+    while (index < combined.size()) {
+        while (index < combined.size() && combined[index] == '/') ++index;
+        size_t next = combined.find('/', index);
+        std::string component = combined.substr(index, next == std::string::npos
+                                                           ? std::string::npos
+                                                           : next - index);
+        index = next == std::string::npos ? combined.size() : next;
+        if (component.empty() || component == ".") continue;
+        if (component == "..") {
+            if (!components.empty()) components.pop_back();
+            continue;
+        }
+        components.push_back(component);
+    }
+
+    std::string normalized = "/";
+    for (size_t i = 0; i < components.size(); ++i) {
+        if (i != 0) normalized += "/";
+        normalized += components[i];
+    }
+
+    normalized = canonical_multiarch_logical_path_for_estimate(normalized);
+    if (normalized.empty()) return "";
+    if (normalized.front() != '/') normalized = "/" + normalized;
+    return normalized;
+}
+
+bool staged_native_debian_batch_path_is_directory_like_impl(
+    const StagedNativeDebianBatch& stage,
+    const std::map<std::string, std::string>& staged_owner_by_path,
+    const std::string& logical_path,
+    std::set<std::string>& resolving,
+    bool* exists_out = nullptr
+) {
+    if (exists_out) *exists_out = false;
+    if (logical_path.empty()) return false;
+    if (resolving.count(logical_path) != 0) return false;
+
+    auto owner_it = staged_owner_by_path.find(logical_path);
+    if (owner_it == staged_owner_by_path.end() || owner_it->second.empty()) return false;
+
+    auto payload_it = stage.payload_root_by_package.find(owner_it->second);
+    if (payload_it == stage.payload_root_by_package.end() || payload_it->second.empty()) return false;
+
+    std::string full_path = payload_it->second + logical_path;
+    struct stat st {};
+    if (lstat(full_path.c_str(), &st) != 0) return false;
+
+    if (exists_out) *exists_out = true;
+    if (S_ISDIR(st.st_mode)) return true;
+    if (!S_ISLNK(st.st_mode)) return false;
+
+    std::string target = read_symlink_target(full_path);
+    std::string resolved_target = resolve_native_debian_preflight_symlink_target_path(
+        logical_path,
+        target
+    );
+    if (resolved_target.empty()) return false;
+
+    resolving.insert(logical_path);
+    bool target_exists = false;
+    bool directory_like = staged_native_debian_batch_path_is_directory_like_impl(
+        stage,
+        staged_owner_by_path,
+        resolved_target,
+        resolving,
+        &target_exists
+    );
+    if (!directory_like) {
+        directory_like = live_path_is_directory_like(ROOT_PREFIX + resolved_target);
+    }
+    resolving.erase(logical_path);
+    return directory_like;
+}
+
+bool staged_native_debian_batch_path_is_directory_like(
+    const StagedNativeDebianBatch& stage,
+    const std::map<std::string, std::string>& staged_owner_by_path,
+    const std::string& logical_path,
+    bool* exists_out = nullptr
+) {
+    std::set<std::string> resolving;
+    return staged_native_debian_batch_path_is_directory_like_impl(
+        stage,
+        staged_owner_by_path,
+        logical_path,
+        resolving,
+        exists_out
+    );
+}
+
 bool write_staged_native_debian_batch_manifest(
     const StagedNativeDebianBatch& stage,
     std::string* error_out = nullptr
@@ -4512,6 +4623,12 @@ bool prepare_live_root_for_staged_debian_batch(
             std::string logical_path = normalize_native_debian_preflight_path(raw_path);
             if (logical_path.empty()) continue;
 
+            auto final_owner_it = staged_owner_by_path.find(logical_path);
+            if (final_owner_it == staged_owner_by_path.end() ||
+                final_owner_it->second != package_name) {
+                continue;
+            }
+
             std::string full_path = ROOT_PREFIX + logical_path;
             struct stat live_st {};
             if (lstat(full_path.c_str(), &live_st) != 0) {
@@ -4524,8 +4641,12 @@ bool prepare_live_root_for_staged_debian_batch(
             }
 
             bool staged_exists = false;
-            bool staged_is_directory =
-                staged_native_debian_payload_path_is_directory_like(payload_root, logical_path, &staged_exists);
+            bool staged_is_directory = staged_native_debian_batch_path_is_directory_like(
+                stage,
+                staged_owner_by_path,
+                logical_path,
+                &staged_exists
+            );
             bool live_is_directory = live_path_is_directory_like(full_path);
             if (staged_exists && live_is_directory != staged_is_directory) {
                 if (error_out) {
