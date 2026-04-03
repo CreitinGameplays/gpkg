@@ -104,6 +104,10 @@ bool get_repo_native_live_payload_version_hint(
     const std::string& pkg_name,
     std::string* version_out = nullptr
 );
+bool get_native_dpkg_exact_live_version_hint(
+    const std::string& pkg_name,
+    std::string* version_out = nullptr
+);
 InstallCommandResult install_native_debian_batch(
     const std::vector<PackageMetadata>& batch,
     bool verbose,
@@ -225,7 +229,7 @@ bool get_local_installed_package_version(
         }
 
         std::string live_payload_version;
-        if (get_repo_native_live_payload_version_hint(pkg_name, &live_payload_version)) {
+        if (get_native_dpkg_exact_live_version_hint(pkg_name, &live_payload_version)) {
             consider_version(live_payload_version);
         }
 
@@ -237,7 +241,7 @@ bool get_local_installed_package_version(
     if (is_installed(pkg_name, version_out)) return true;
 
     std::string live_payload_version;
-    if (get_repo_native_live_payload_version_hint(pkg_name, &live_payload_version)) {
+    if (get_native_dpkg_exact_live_version_hint(pkg_name, &live_payload_version)) {
         if (version_out) *version_out = live_payload_version;
         return true;
     }
@@ -332,6 +336,37 @@ bool get_repo_native_live_payload_version_hint(
 
     if (version_out) *version_out = version;
     return true;
+}
+
+bool get_native_dpkg_exact_live_version_hint(
+    const std::string& pkg_name,
+    std::string* version_out
+) {
+    if (version_out) version_out->clear();
+    if (pkg_name.empty()) return false;
+
+    std::string exact_version;
+    if (native_dpkg_package_has_exact_registered_live_version(pkg_name, &exact_version) &&
+        !trim(exact_version).empty()) {
+        if (version_out) *version_out = trim(exact_version);
+        return true;
+    }
+
+    if (get_repo_native_live_payload_version_hint(pkg_name, &exact_version) &&
+        !trim(exact_version).empty()) {
+        if (version_out) *version_out = trim(exact_version);
+        return true;
+    }
+
+    if (base_registry_identity_has_exact_registry_version(pkg_name)) {
+        exact_version = trim(get_raw_base_system_registry_version_for_package(pkg_name));
+        if (!exact_version.empty()) {
+            if (version_out) *version_out = exact_version;
+            return true;
+        }
+    }
+
+    return false;
 }
 
 std::string to_lower_copy(const std::string& value) {
@@ -1170,7 +1205,7 @@ bool repair_native_dpkg_status_database(bool verbose, std::string* error_out) {
             synthetic_package = native_dpkg_package_looks_synthetic(pkg_name);
             std::string exact_registered_live_version;
             bool have_exact_registered_live_version =
-                native_dpkg_package_has_exact_registered_live_version(
+                get_native_dpkg_exact_live_version_hint(
                     pkg_name,
                     &exact_registered_live_version
                 );
@@ -1863,7 +1898,7 @@ bool bootstrap_native_dpkg_status_database(bool verbose, std::string* error_out)
         synthetic_record.provenance =
             package_has_present_base_registry_entry_exact(package_name) ? "base_registry" : "gpkg_legacy";
         synthetic_record.version_confidence =
-            native_dpkg_package_has_exact_registered_live_version(package_name) ? "exact" : "unknown";
+            get_native_dpkg_exact_live_version_hint(package_name) ? "exact" : "unknown";
         synthetic_record.owns_files = true;
         synthetic_record.satisfies_versioned_deps =
             synthetic_record.version_confidence == "exact";
@@ -3369,30 +3404,6 @@ InstallCommandResult install_native_debian_batch_legacy(
                 }
             }
 
-            std::vector<PackageMetadata> remaining_batch;
-            if (index + 1 < order.size()) {
-                remaining_batch.reserve(order.size() - index - 1);
-                for (size_t rest = index + 1; rest < order.size(); ++rest) {
-                    remaining_batch.push_back(batch[order[rest]]);
-                }
-            }
-            InstallCommandResult pending_after_install = reconcile_pending_native_dpkg_configurations(
-                verbose,
-                remaining_batch.empty() ? nullptr : &remaining_batch
-            );
-            if (!pending_after_install.success) {
-                batch_result.success = false;
-                batch_result.log_path = pending_after_install.log_path;
-                batch_result.failed_package = pending_after_install.failed_package;
-                if (batch_result.failed_package.empty()) {
-                    batch_result.failed_package = debian_backend_package_name(meta);
-                    if (batch_result.failed_package.empty()) batch_result.failed_package = meta.name;
-                }
-                std::cerr << "E: Failed to configure pending Debian packages after installing "
-                          << batch_result.last_processed_package << std::endl;
-                if (verbose) staged_batch_scope.keep_for_debugging();
-                return batch_result;
-            }
             if (!verbose && progress_width && progress_total > 0) {
                 render_package_progress(
                     "current",
