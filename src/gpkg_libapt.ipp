@@ -56,6 +56,7 @@ bool libapt_plan_remove_transaction(
     LibAptTransactionPlanResult& out_result,
     std::string* error_out
 );
+bool package_can_use_libapt_native_planner(const PackageMetadata& meta);
 
 #if defined(GPKG_HAVE_WORKING_LIBAPT_PKG_BACKEND)
 
@@ -103,10 +104,6 @@ std::string libapt_normalize_architecture_name(
     }
     if (lowered == "all" || lowered == "noarch") return "all";
     return lowered;
-}
-
-bool package_can_use_libapt_native_planner(const PackageMetadata& meta) {
-    return package_is_debian_source(meta) || meta.source_kind == "gpkg_repo";
 }
 
 bool libapt_append_seeded_packages_source(
@@ -766,6 +763,10 @@ bool libapt_plan_remove_transaction(
     return false;
 }
 #endif
+
+bool package_can_use_libapt_native_planner(const PackageMetadata& meta) {
+    return package_is_debian_source(meta) || meta.source_kind == "gpkg_repo";
+}
 
 bool libapt_can_handle_repo_install_operands(
     const std::vector<std::string>& repo_operands,
