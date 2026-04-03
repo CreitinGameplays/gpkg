@@ -115,13 +115,6 @@ InstallCommandResult install_native_debian_batch(
     size_t progress_total = 0,
     size_t* progress_width = nullptr
 );
-InstallCommandResult install_native_debian_batch_legacy(
-    const std::vector<PackageMetadata>& batch,
-    bool verbose,
-    size_t progress_base = 0,
-    size_t progress_total = 0,
-    size_t* progress_width = nullptr
-);
 
 bool update_package_auto_install_state_after_install(
     const std::string& pkg_name,
@@ -3142,7 +3135,7 @@ InstallCommandResult reconcile_pending_native_dpkg_configurations(
     return result;
 }
 
-InstallCommandResult install_native_debian_batch_legacy(
+InstallCommandResult install_native_debian_batch(
     const std::vector<PackageMetadata>& batch,
     bool verbose,
     size_t progress_base,
@@ -3438,27 +3431,6 @@ InstallCommandResult install_native_debian_batch_legacy(
     return batch_result;
 }
 
-InstallCommandResult install_native_debian_batch(
-    const std::vector<PackageMetadata>& batch,
-    bool verbose,
-    size_t progress_base,
-    size_t progress_total,
-    size_t* progress_width
-) {
-    DebianBackendSelection backend = select_debian_backend(
-        DebianBackendOperation::InstallNativeBatch,
-        verbose
-    );
-    maybe_log_debian_backend_selection(backend, DebianBackendOperation::InstallNativeBatch, verbose);
-    return install_native_debian_batch_legacy(
-        batch,
-        verbose,
-        progress_base,
-        progress_total,
-        progress_width
-    );
-}
-
 bool retire_gpkg_package_without_state_erasure(
     const std::string& pkg_name,
     bool verbose,
@@ -3596,6 +3568,324 @@ bool finalize_native_debian_batch(
     }
 
     return true;
+}
+
+const LibAptPlannedInstallAction* find_libapt_install_action(
+    const LibAptTransactionPlanResult& plan,
+    const std::string& apt_package_name
+) {
+    for (const auto& action : plan.install_actions) {
+        if (action.apt_package_name == apt_package_name) return &action;
+    }
+    return nullptr;
+}
+
+std::set<std::string> collect_skipped_libapt_exact_reinstalls(
+    const LibAptTransactionPlanResult& plan
+) {
+    std::set<std::string> skipped;
+    for (const auto& action : plan.install_actions) {
+        if (action.explicit_target || !action.reinstall_only) continue;
+
+        std::string exact_live_version;
+        if (!package_has_exact_live_install_state(action.meta.name, &exact_live_version, nullptr)) {
+            continue;
+        }
+        if (exact_live_version.empty() ||
+            compare_versions(exact_live_version, action.meta.version) != 0) {
+            continue;
+        }
+
+        std::string raw_name = trim(action.apt_package_name);
+        if (!raw_name.empty()) skipped.insert(raw_name);
+    }
+    return skipped;
+}
+
+InstallCommandResult unpack_native_debian_package_in_apt_order(
+    const PackageMetadata& meta,
+    bool verbose
+) {
+    if (!package_is_debian_source(meta)) return {false, "", meta.name, 0, ""};
+
+    std::string dpkg_bootstrap_error;
+    if (!ensure_native_dpkg_backend_ready(verbose, &dpkg_bootstrap_error)) {
+        std::cerr << "E: Native Debian backend is unavailable";
+        if (!dpkg_bootstrap_error.empty()) {
+            std::cerr << ": " << dpkg_bootstrap_error;
+        }
+        std::cerr << std::endl;
+        return {false, "", meta.name, 0, ""};
+    }
+
+    std::vector<PackageMetadata> batch = {meta};
+    ScopedNativeDebianBatchStage staged_batch_scope;
+    StagedNativeDebianBatch staged_batch;
+    std::string stage_error;
+    if (!stage_native_debian_batch_payloads(batch, verbose, &staged_batch, &stage_error)) {
+        if (!staged_batch.stage_root.empty() && verbose) {
+            staged_batch_scope.adopt(staged_batch.stage_root);
+            staged_batch_scope.keep_for_debugging();
+        }
+        std::cerr << "E: Failed to stage native Debian package";
+        if (!stage_error.empty()) std::cerr << ": " << stage_error;
+        std::cerr << std::endl;
+        return {false, "", meta.name, 0, ""};
+    }
+    staged_batch_scope.adopt(staged_batch.stage_root);
+
+    ScopedNativeDpkgMaintscriptCompat maintscript_compat(true, verbose);
+    ScopedMaintscriptShellOverride maintscript_shell(true, verbose);
+
+    std::vector<std::string> prepared_parent_dirs;
+    std::string prepare_error;
+    if (!prepare_live_root_for_staged_debian_batch(
+            batch,
+            staged_batch,
+            verbose,
+            &prepared_parent_dirs,
+            &prepare_error
+        )) {
+        if (verbose) staged_batch_scope.keep_for_debugging();
+        std::cerr << "E: Failed to prepare native Debian transaction";
+        if (!prepare_error.empty()) std::cerr << ": " << prepare_error;
+        std::cerr << std::endl;
+        return {false, "", meta.name, 0, ""};
+    }
+
+    std::string overlap_repair_error;
+    if (!prune_synthetic_dpkg_file_ownership_for_package(meta, verbose, &overlap_repair_error)) {
+        if (!overlap_repair_error.empty()) std::cerr << "E: " << overlap_repair_error << std::endl;
+        if (verbose) staged_batch_scope.keep_for_debugging();
+        return {false, "", meta.name, 0, ""};
+    }
+
+    std::string incoming_name = debian_backend_package_name(meta);
+    if (incoming_name.empty()) incoming_name = meta.name;
+    NativeSyntheticStateRecord removed_synthetic_record;
+    bool incoming_had_synthetic_record =
+        get_native_synthetic_state_record(incoming_name, &removed_synthetic_record);
+    std::string synthetic_state_error;
+    if (!remove_native_synthetic_state_record(incoming_name, nullptr, &synthetic_state_error)) {
+        if (!synthetic_state_error.empty()) std::cerr << "E: " << synthetic_state_error << std::endl;
+        if (verbose) staged_batch_scope.keep_for_debugging();
+        return {false, "", incoming_name, 0, ""};
+    }
+
+    CommandCaptureResult result = run_command_captured_argv(
+        build_dpkg_command_argv({"--unpack", get_cached_debian_archive_path(meta)}),
+        verbose,
+        "dpkg-unpack"
+    );
+    if (result.exit_code == 0) {
+        return {true, "", incoming_name, 1, ""};
+    }
+
+    if (incoming_had_synthetic_record) {
+        std::string restore_state_error;
+        if (!restore_native_synthetic_state_record(
+                removed_synthetic_record,
+                &restore_state_error
+            ) && verbose) {
+            std::cout << "[DEBUG] Failed to restore synthetic native state for "
+                      << incoming_name << ": " << restore_state_error << std::endl;
+        }
+    }
+    if (verbose) staged_batch_scope.keep_for_debugging();
+    return {false, result.log_path, incoming_name, 0, ""};
+}
+
+InstallCommandResult configure_native_debian_package_in_apt_order(
+    const std::string& pkg_name,
+    bool verbose
+) {
+    InstallCommandResult result;
+    result.failed_package = pkg_name;
+    result.last_processed_package = pkg_name;
+
+    int refresh_rc = run_ldconfig_trigger(verbose);
+    if (refresh_rc != 0) {
+        std::cerr << "E: Runtime linker refresh failed before configuring "
+                  << pkg_name << std::endl;
+        return result;
+    }
+
+    CommandCaptureResult configure_result = run_command_captured_argv(
+        build_dpkg_command_argv({"--configure", pkg_name}),
+        verbose,
+        "dpkg-configure"
+    );
+    if (configure_result.exit_code == 0) {
+        result.success = true;
+        result.completed_count = 1;
+        return result;
+    }
+
+    result.log_path = configure_result.log_path;
+    return result;
+}
+
+struct LibAptExecutionResult {
+    bool success = false;
+    size_t installed_count = 0;
+    bool mutated_runtime_state = false;
+    std::string failed_package;
+    std::string log_path;
+};
+
+LibAptExecutionResult execute_libapt_install_like_plan(
+    const LibAptTransactionPlanResult& apt_plan,
+    const TransactionPlan& transaction_plan,
+    const std::set<std::string>& manual_targets,
+    const std::set<std::string>& previously_registered,
+    bool verbose,
+    const std::map<std::string, bool>* auto_state_after = nullptr
+) {
+    LibAptExecutionResult exec_result;
+    std::set<std::string> skipped_exact_reinstalls =
+        collect_skipped_libapt_exact_reinstalls(apt_plan);
+
+    std::vector<PackageMetadata> debian_installs;
+    std::vector<PackageMetadata> non_debian_installs;
+    std::set<std::string> seen_debian_installs;
+    std::set<std::string> seen_non_debian_installs;
+
+    for (const auto& operation : apt_plan.ordered_operations) {
+        if (skipped_exact_reinstalls.count(operation.apt_package_name) != 0) {
+            continue;
+        }
+
+        const LibAptPlannedInstallAction* action =
+            find_libapt_install_action(apt_plan, operation.apt_package_name);
+
+        if (operation.type == LibAptOperationType::Remove ||
+            operation.type == LibAptOperationType::Purge) {
+            InstallCommandResult removal_result =
+                operation.type == LibAptOperationType::Purge
+                    ? purge_package_by_name(operation.apt_package_name, verbose)
+                    : retire_package_by_name(operation.apt_package_name, verbose);
+            if (!removal_result.success) {
+                exec_result.failed_package = removal_result.failed_package.empty()
+                    ? operation.apt_package_name
+                    : removal_result.failed_package;
+                exec_result.log_path = removal_result.log_path;
+                return exec_result;
+            }
+            exec_result.mutated_runtime_state = true;
+            continue;
+        }
+
+        if (operation.type == LibAptOperationType::Install) {
+            if (action == nullptr) continue;
+
+            InstallCommandResult install_result = package_uses_native_dpkg_backend(action->meta)
+                ? unpack_native_debian_package_in_apt_order(action->meta, verbose)
+                : install_package_from_file(get_install_archive_path(action->meta), verbose);
+            if (!install_result.success) {
+                exec_result.failed_package = install_result.failed_package.empty()
+                    ? action->meta.name
+                    : install_result.failed_package;
+                exec_result.log_path = install_result.log_path;
+                return exec_result;
+            }
+
+            if (package_uses_native_dpkg_backend(action->meta)) {
+                if (seen_debian_installs.insert(action->meta.name).second) {
+                    debian_installs.push_back(action->meta);
+                }
+            } else if (seen_non_debian_installs.insert(action->meta.name).second) {
+                non_debian_installs.push_back(action->meta);
+            }
+
+            exec_result.mutated_runtime_state = true;
+            ++exec_result.installed_count;
+            continue;
+        }
+
+        if (operation.type == LibAptOperationType::Configure) {
+            if (action != nullptr && !package_uses_native_dpkg_backend(action->meta)) {
+                continue;
+            }
+
+            InstallCommandResult configure_result =
+                configure_native_debian_package_in_apt_order(operation.apt_package_name, verbose);
+            if (!configure_result.success) {
+                exec_result.failed_package = configure_result.failed_package.empty()
+                    ? operation.apt_package_name
+                    : configure_result.failed_package;
+                exec_result.log_path = configure_result.log_path;
+                return exec_result;
+            }
+            exec_result.mutated_runtime_state = true;
+        }
+    }
+
+    InstallCommandResult final_pending = reconcile_pending_native_dpkg_configurations(verbose);
+    if (!final_pending.success) {
+        exec_result.failed_package = final_pending.failed_package;
+        exec_result.log_path = final_pending.log_path;
+        return exec_result;
+    }
+
+    if (!debian_installs.empty() &&
+        !finalize_native_debian_batch(
+            debian_installs,
+            manual_targets,
+            previously_registered,
+            transaction_plan,
+            verbose,
+            auto_state_after
+        )) {
+        exec_result.failed_package = debian_installs.front().name;
+        return exec_result;
+    }
+
+    for (const auto& meta : non_debian_installs) {
+        std::string failed_pkg;
+        std::string failed_log;
+        if (!retire_replaced_packages_live(
+                transaction_plan,
+                meta.name,
+                verbose,
+                &failed_pkg,
+                &failed_log
+            )) {
+            exec_result.failed_package = failed_pkg.empty() ? meta.name : failed_pkg;
+            exec_result.log_path = failed_log;
+            return exec_result;
+        }
+
+        bool auto_update_ok = true;
+        if (manual_targets.count(meta.name) != 0) {
+            auto_update_ok = set_package_auto_installed_state(meta.name, false);
+        } else if (auto_state_after) {
+            auto auto_it = auto_state_after->find(meta.name);
+            if (auto_it != auto_state_after->end()) {
+                auto_update_ok = set_package_auto_installed_state(meta.name, auto_it->second);
+            } else {
+                auto_update_ok = update_package_auto_install_state_after_install(
+                    meta.name,
+                    false,
+                    previously_registered
+                );
+            }
+        } else {
+            auto_update_ok = update_package_auto_install_state_after_install(
+                meta.name,
+                false,
+                previously_registered
+            );
+        }
+        if (!auto_update_ok) {
+            exec_result.failed_package = meta.name;
+            return exec_result;
+        }
+
+        queue_triggers_for_package(meta.name);
+    }
+
+    exec_result.success = true;
+    return exec_result;
 }
 
 bool parse_decimal_u64(const std::string& text, uint64_t* out) {
@@ -5515,6 +5805,8 @@ struct PreparedUpgradeState {
     std::vector<PackageMetadata> upgrade_queue;
     std::vector<UpgradePlanEntry> explicit_targets;
     TransactionPlan plan;
+    bool using_libapt_plan = false;
+    LibAptTransactionPlanResult libapt_plan;
     std::map<std::string, bool> auto_state_after;
     std::vector<std::string> skipped_managed_packages;
     std::string fatal_error;
@@ -6093,25 +6385,7 @@ bool expand_runtime_upgrade_companions(
     return true;
 }
 
-bool package_should_use_raw_debian_upgrade_fallback(
-    const std::string& pkg_name,
-    UpgradeContext& context
-) {
-    if (context.registered_package_set.count(pkg_name) == 0) return false;
-    if (std::find(
-            context.upgrade_catalog.resolved_roots.begin(),
-            context.upgrade_catalog.resolved_roots.end(),
-            pkg_name
-        ) != context.upgrade_catalog.resolved_roots.end()) {
-        return false;
-    }
-
-    PackageMetadata meta;
-    if (!get_live_package_metadata_for_upgrade_resolution(pkg_name, meta, &context)) return false;
-    return package_metadata_is_managed_debian_package(meta);
-}
-
-bool prepare_upgrade_transaction_legacy(
+bool prepare_upgrade_transaction(
     UpgradeContext& context,
     bool verbose,
     PreparedUpgradeState& out_state
@@ -6120,135 +6394,45 @@ bool prepare_upgrade_transaction_legacy(
     if (!context.upgrade_catalog_available) return false;
 
     std::vector<std::string> normalized_roots = collect_normalized_upgrade_roots(context, verbose);
-    VLOG(verbose, "Checking " << normalized_roots.size()
-         << " normalized installed or importable package families and upgradeable base runtimes.");
+    if (normalized_roots.empty()) return true;
 
-    std::set<std::string> queued_packages;
-    std::set<std::string> explicit_target_names;
-    std::set<std::string> target_walk;
-    std::set<std::string> dependency_visited;
-    auto companion_map = get_planner_upgrade_companion_map(&context, verbose);
-    RawDebianContext raw_context;
-
-    for (const auto& pkg : normalized_roots) {
-        bool allow_raw_fallback = package_should_use_raw_debian_upgrade_fallback(pkg, context);
-
-        PackageMetadata repo_meta;
-        std::string resolve_reason;
-        PackageMetadata installed_meta;
-        PackageMetadata* installed_meta_ptr = nullptr;
-        if (allow_raw_fallback &&
-            get_live_package_metadata_for_upgrade_resolution(pkg, installed_meta, &context)) {
-            installed_meta_ptr = &installed_meta;
-        }
-        if (!resolve_upgrade_target_metadata(
-                {pkg, "", ""},
-                repo_meta,
-                verbose,
-                allow_raw_fallback ? &raw_context : nullptr,
-                installed_meta_ptr,
-                &resolve_reason
-            )) {
-            if (allow_raw_fallback) {
-                out_state.skipped_managed_packages.push_back(
-                    pkg + " was skipped: " +
-                    (resolve_reason.empty()
-                        ? "no cached Debian upgrade candidate is currently available"
-                        : resolve_reason)
-                );
-            }
-            continue;
-        }
-        std::string current_ver;
-        bool was_installed = get_upgrade_target_current_version(
-            {pkg, "", ""},
-            repo_meta,
-            current_ver,
+    std::string unsupported_reason;
+    std::vector<std::string> apt_targets;
+    std::set<std::string> reinstall_targets;
+    if (!libapt_can_handle_upgrade_roots(
+            context,
+            normalized_roots,
             verbose,
-            &context
-        );
-        if (was_installed &&
-            !g_force_reinstall &&
-            compare_versions(repo_meta.version, current_ver) <= 0) {
-            continue;
-        }
+            &apt_targets,
+            &reinstall_targets,
+            &unsupported_reason
+        )) {
+        out_state.fatal_error = unsupported_reason.empty()
+            ? "libapt-pkg could not represent the requested upgrade roots"
+            : unsupported_reason;
+        return false;
+    }
+    if (apt_targets.empty()) return true;
 
-        if (was_installed && compare_versions(repo_meta.version, current_ver) > 0) {
-            VLOG(verbose, "Update found for " << pkg << ": " << current_ver << " -> " << repo_meta.version);
-        } else if (was_installed && g_force_reinstall) {
-            VLOG(verbose, "Reinstall requested for " << pkg << " at " << current_ver);
-        } else if (!was_installed) {
-            VLOG(verbose, "Import candidate found for normalized live family " << pkg
-                         << " at repository version " << repo_meta.version);
-        }
-        Dependency dep{pkg, "", ""};
-        auto queue_copy = out_state.upgrade_queue;
-        auto explicit_copy = out_state.explicit_targets;
-        auto queued_copy = queued_packages;
-        auto explicit_target_copy = explicit_target_names;
-        auto target_walk_copy = target_walk;
-        auto dependency_copy = dependency_visited;
-        auto shadowed_aliases_copy = context.shadowed_aliases_by_target;
-        auto shadowed_base_alias_copy = context.shadowed_base_alias_target;
-        RawDebianContext* queue_raw_context = allow_raw_fallback ? &raw_context : nullptr;
-        std::string queue_failure_reason;
-        if (!queue_upgrade_target(
-                dep,
-                companion_map,
-                queue_copy,
-                explicit_copy,
-                queued_copy,
-                explicit_target_copy,
-                target_walk_copy,
-                dependency_copy,
-                context.exact_live_packages,
-                verbose,
-                g_force_reinstall,
-                &context,
-                queue_raw_context,
-                &queue_failure_reason
-            )) {
-            context.shadowed_aliases_by_target.swap(shadowed_aliases_copy);
-            context.shadowed_base_alias_target.swap(shadowed_base_alias_copy);
-            out_state.skipped_managed_packages.push_back(
-                pkg + " was skipped: " +
-                (queue_failure_reason.empty()
-                    ? "dependency resolution failed under current GeminiOS policy"
-                    : queue_failure_reason)
-            );
-            continue;
-        }
-
-        TransactionPlan candidate_plan;
-        std::string plan_failure_reason;
-        if (!build_transaction_plan(
-                queue_copy,
-                context.exact_live_packages,
-                verbose,
-                candidate_plan,
-                &context,
-                &plan_failure_reason
-            )) {
-            context.shadowed_aliases_by_target.swap(shadowed_aliases_copy);
-            context.shadowed_base_alias_target.swap(shadowed_base_alias_copy);
-            out_state.skipped_managed_packages.push_back(
-                pkg + " was skipped: " +
-                (plan_failure_reason.empty()
-                    ? "the transaction would conflict with installed runtime state"
-                    : plan_failure_reason)
-            );
-            continue;
-        }
-
-        out_state.upgrade_queue.swap(queue_copy);
-        out_state.explicit_targets.swap(explicit_copy);
-        out_state.plan = std::move(candidate_plan);
-        queued_packages.swap(queued_copy);
-        explicit_target_names.swap(explicit_target_copy);
-        target_walk.swap(target_walk_copy);
-        dependency_visited.swap(dependency_copy);
+    std::string apt_error;
+    if (!libapt_plan_install_like_transaction(
+            apt_targets,
+            reinstall_targets,
+            false,
+            verbose,
+            out_state.libapt_plan,
+            &apt_error
+        )) {
+        out_state.fatal_error = apt_error.empty()
+            ? "libapt-pkg could not build a safe upgrade transaction"
+            : apt_error;
+        return false;
     }
 
+    out_state.using_libapt_plan = true;
+    out_state.upgrade_queue = collect_libapt_install_queue(out_state.libapt_plan);
+    out_state.explicit_targets = collect_libapt_explicit_upgrade_targets(out_state.libapt_plan);
+    out_state.auto_state_after = out_state.libapt_plan.auto_state_after;
     if (out_state.upgrade_queue.empty()) return true;
 
     std::string final_plan_reason;
@@ -6261,89 +6445,12 @@ bool prepare_upgrade_transaction_legacy(
             &final_plan_reason
         )) {
         out_state.fatal_error = final_plan_reason.empty()
-            ? "the upgrade planner could not build a safe transaction"
+            ? "the libapt-pkg upgrade queue could not be validated against GeminiOS runtime policy"
             : final_plan_reason;
         return false;
     }
     out_state.upgrade_queue = out_state.plan.install_queue;
     return true;
-}
-
-bool prepare_upgrade_transaction(
-    UpgradeContext& context,
-    bool verbose,
-    PreparedUpgradeState& out_state
-) {
-    DebianBackendSelection backend = select_debian_backend(
-        DebianBackendOperation::PrepareUpgrade,
-        verbose
-    );
-    maybe_log_debian_backend_selection(backend, DebianBackendOperation::PrepareUpgrade, verbose);
-    if (backend.selected == DebianBackendKind::LibAptPkg) {
-        out_state = {};
-        if (!context.upgrade_catalog_available) return false;
-
-        std::vector<std::string> normalized_roots = collect_normalized_upgrade_roots(context, verbose);
-        if (!normalized_roots.empty()) {
-            std::string unsupported_reason;
-            std::vector<std::string> apt_targets;
-            std::set<std::string> reinstall_targets;
-            if (libapt_can_handle_upgrade_roots(
-                    context,
-                    normalized_roots,
-                    verbose,
-                    &apt_targets,
-                    &reinstall_targets,
-                    &unsupported_reason
-                )) {
-                if (apt_targets.empty()) return true;
-
-                LibAptTransactionPlanResult apt_plan;
-                std::string apt_error;
-                if (!libapt_plan_install_like_transaction(
-                        apt_targets,
-                        reinstall_targets,
-                        false,
-                        verbose,
-                        apt_plan,
-                        &apt_error
-                    )) {
-                    out_state.fatal_error = apt_error.empty()
-                        ? "libapt-pkg could not build a safe upgrade transaction"
-                        : apt_error;
-                    return false;
-                }
-
-                out_state.upgrade_queue = collect_libapt_install_queue(apt_plan);
-                out_state.explicit_targets = collect_libapt_explicit_upgrade_targets(apt_plan);
-                out_state.auto_state_after = apt_plan.auto_state_after;
-                if (out_state.upgrade_queue.empty()) return true;
-
-                std::string final_plan_reason;
-                if (!build_transaction_plan(
-                        out_state.upgrade_queue,
-                        context.exact_live_packages,
-                        verbose,
-                        out_state.plan,
-                        &context,
-                        &final_plan_reason
-                    )) {
-                    out_state.fatal_error = final_plan_reason.empty()
-                        ? "the libapt-pkg upgrade queue could not be validated against GeminiOS runtime policy"
-                        : final_plan_reason;
-                    return false;
-                }
-                out_state.upgrade_queue = out_state.plan.install_queue;
-                return true;
-            }
-
-            if (verbose && !unsupported_reason.empty()) {
-                std::cout << "[DEBUG] Falling back to the legacy upgrade planner because "
-                          << unsupported_reason << std::endl;
-            }
-        }
-    }
-    return prepare_upgrade_transaction_legacy(context, verbose, out_state);
 }
 
 std::string describe_upgrade_catalog_skip_entry(const UpgradeCatalogSkipEntry& entry) {
@@ -6661,7 +6768,6 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
 
     size_t installed_count = 0;
     std::vector<std::string> failures;
-    size_t install_progress_width = 0;
     bool mutated_runtime_state = false;
     std::set<std::string> manual_targets;
     for (const auto& entry : explicit_targets) {
@@ -6672,116 +6778,44 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
 
     std::cout << Color::CYAN << "[*] Installing " << upgrade_queue.size()
               << " package(s)..." << Color::RESET << std::endl;
-    for (size_t i = 0; i < upgrade_queue.size();) {
-        if (!download_report.results[i].success) {
-            failures.push_back(upgrade_queue[i].name);
-            ++i;
-            continue;
+    if (prepared.libapt_plan.ordered_operations.empty()) {
+        std::cerr << Color::RED
+                  << "E: libapt-pkg did not produce an executable operation order for this upgrade"
+                  << Color::RESET << std::endl;
+        return 1;
+    }
+
+    LibAptExecutionResult exec_result = execute_libapt_install_like_plan(
+        prepared.libapt_plan,
+        upgrade_plan,
+        manual_targets,
+        context.exact_live_packages,
+        verbose,
+        prepared.auto_state_after.empty() ? nullptr : &prepared.auto_state_after
+    );
+    if (!exec_result.success) {
+        std::string failed_name = exec_result.failed_package.empty()
+            ? (upgrade_queue.empty() ? std::string() : upgrade_queue.front().name)
+            : exec_result.failed_package;
+        std::cerr << Color::RED << "E: Failed to install ";
+        if (!failed_name.empty()) std::cerr << failed_name;
+        else std::cerr << "the planned APT transaction";
+        std::cerr << Color::RESET;
+        if (!verbose && !exec_result.log_path.empty()) {
+            std::cerr << " (see " << exec_result.log_path << ")";
         }
-
-        if (!verbose) render_package_progress("current", i, upgrade_queue.size(), upgrade_queue[i].name, &install_progress_width);
-
-        if (package_uses_native_dpkg_backend(upgrade_queue[i])) {
-            size_t batch_end = i;
-            std::vector<PackageMetadata> batch;
-            while (batch_end < upgrade_queue.size() &&
-                   package_uses_native_dpkg_backend(upgrade_queue[batch_end]) &&
-                   download_report.results[batch_end].success) {
-                batch.push_back(upgrade_queue[batch_end]);
-                ++batch_end;
-            }
-
-            InstallCommandResult result = install_native_debian_batch(
-                batch,
-                verbose,
-                i,
-                upgrade_queue.size(),
-                &install_progress_width
-            );
-            installed_count += result.completed_count;
-            if (!result.success) {
-                if (!verbose) finish_progress_line(&install_progress_width);
-                std::string failed_name = result.failed_package.empty() ? batch.front().name : result.failed_package;
-                std::cerr << Color::RED << "E: Failed to install Debian package batch starting at "
-                          << failed_name << Color::RESET;
-                if (!verbose && !result.log_path.empty()) {
-                    std::cerr << " (see " << result.log_path << ")";
-                }
-                std::cerr << std::endl;
-                failures.push_back(failed_name);
-                break;
-            }
-
-            if (!finalize_native_debian_batch(
-                    batch,
-                    manual_targets,
-                    context.exact_live_packages,
-                    upgrade_plan,
-                    verbose,
-                    prepared.auto_state_after.empty() ? nullptr : &prepared.auto_state_after)) {
-                if (!verbose) finish_progress_line(&install_progress_width);
-                failures.push_back(batch.front().name);
-                break;
-            }
-
-            mutated_runtime_state = true;
-            i = batch_end;
-            if (!verbose) render_package_progress("current", i, upgrade_queue.size(), batch.back().name, &install_progress_width);
-            continue;
-        }
-
-        InstallCommandResult result = install_package_v2(upgrade_queue[i], verbose);
-        if (!result.success) {
-            if (!verbose) finish_progress_line(&install_progress_width);
-            std::cerr << Color::RED << "E: Failed to install " << upgrade_queue[i].name
-                      << Color::RESET;
-            if (!verbose && !result.log_path.empty()) {
-                std::cerr << " (see " << result.log_path << ")";
-            }
-            std::cerr << std::endl;
-            failures.push_back(upgrade_queue[i].name);
-            break;
-        }
-        std::string failed_pkg;
-        std::string failed_log;
-        if (!retire_replaced_packages_live(
-                upgrade_plan,
-                upgrade_queue[i].name,
-                verbose,
-                &failed_pkg,
-                &failed_log)) {
-            if (!verbose) finish_progress_line(&install_progress_width);
-            std::cerr << Color::RED
-                      << "E: Failed to retire replaced package " << failed_pkg
-                      << Color::RESET;
-            if (!verbose && !failed_log.empty()) {
-                std::cerr << " (see " << failed_log << ")";
-            }
-            std::cerr << std::endl;
-            failures.push_back(failed_pkg.empty() ? upgrade_queue[i].name : failed_pkg);
-            break;
-        }
-        if (!update_package_auto_install_state_after_install(
-                upgrade_queue[i].name,
-                manual_targets.count(upgrade_queue[i].name) != 0,
-                context.exact_live_packages)) {
-            if (!verbose) finish_progress_line(&install_progress_width);
-            std::cerr << Color::RED << "E: Failed to update gpkg auto-install state for "
-                      << upgrade_queue[i].name << Color::RESET << std::endl;
-            failures.push_back(upgrade_queue[i].name);
-            break;
-        }
-        queue_triggers_for_package(upgrade_queue[i].name);
-        mutated_runtime_state = true;
-        ++installed_count;
-        ++i;
-        if (!verbose) render_package_progress("current", i, upgrade_queue.size(), upgrade_queue[i - 1].name, &install_progress_width);
+        std::cerr << std::endl;
+        failures.push_back(failed_name.empty() ? "unknown" : failed_name);
+    } else {
+        installed_count = exec_result.installed_count;
+        mutated_runtime_state = exec_result.mutated_runtime_state;
     }
     if (!verbose) {
-        finish_progress_line(&install_progress_width);
         std::cout << Color::GREEN << "✓ Installed " << installed_count << "/" << upgrade_queue.size()
                   << " package(s)." << Color::RESET << std::endl;
     }
+
+finish_upgrade_execution:
 
     if (!failures.empty()) {
         std::cout << Color::CYAN << "Upgrade summary: "
@@ -7212,6 +7246,34 @@ int handle_repair(bool verbose) {
     size_t install_progress_width = 0;
     std::vector<std::string> failures;
     bool mutated_runtime_state = false;
+    if (using_libapt_plan && !libapt_plan.ordered_operations.empty()) {
+        LibAptExecutionResult exec_result = execute_libapt_install_like_plan(
+            libapt_plan,
+            repair_plan,
+            {},
+            installed_set,
+            verbose,
+            !libapt_plan.auto_state_after.empty() ? &libapt_plan.auto_state_after : nullptr
+        );
+        if (!exec_result.success) {
+            std::string failed_name = exec_result.failed_package.empty()
+                ? (repair_queue.empty() ? std::string() : repair_queue.front().name)
+                : exec_result.failed_package;
+            std::cerr << Color::RED << "E: Repair stopped";
+            if (!failed_name.empty()) std::cerr << " at " << failed_name;
+            std::cerr << Color::RESET;
+            if (!verbose && !exec_result.log_path.empty()) {
+                std::cerr << " (see " << exec_result.log_path << ")";
+            }
+            std::cerr << std::endl;
+            failures.push_back(failed_name.empty() ? "unknown" : failed_name);
+        } else {
+            repaired_count = exec_result.installed_count;
+            mutated_runtime_state = exec_result.mutated_runtime_state;
+        }
+        goto finish_repair_execution;
+    }
+
     for (size_t i = 0; i < repair_queue.size();) {
         if (!verbose) render_package_progress("current", i, repair_queue.size(), repair_queue[i].name, &install_progress_width);
 
@@ -7312,6 +7374,8 @@ int handle_repair(bool verbose) {
         if (!verbose) render_package_progress("current", i, repair_queue.size(), repair_queue[i - 1].name, &install_progress_width);
     }
     if (!verbose) finish_progress_line(&install_progress_width);
+
+finish_repair_execution:
 
     if (!failures.empty()) {
         if (mutated_runtime_state) queue_runtime_linker_state_refresh();
@@ -7770,6 +7834,34 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
 
     std::cout << Color::CYAN << "[*] Installing " << install_queue.size()
               << " package(s)..." << Color::RESET << std::endl;
+    if (using_libapt_plan && !libapt_plan.ordered_operations.empty()) {
+        LibAptExecutionResult exec_result = execute_libapt_install_like_plan(
+            libapt_plan,
+            install_plan,
+            explicit_manual_targets,
+            installed_cache,
+            verbose,
+            !libapt_plan.auto_state_after.empty() ? &libapt_plan.auto_state_after : nullptr
+        );
+        if (!exec_result.success) {
+            std::cerr << Color::RED << "E: Installation stopped";
+            if (!exec_result.failed_package.empty()) {
+                std::cerr << " at " << exec_result.failed_package;
+            }
+            std::cerr << Color::RESET;
+            if (!verbose && !exec_result.log_path.empty()) {
+                std::cerr << " See " << exec_result.log_path << " for details.";
+            }
+            std::cerr << std::endl;
+            return 1;
+        }
+
+        if (exec_result.mutated_runtime_state) queue_runtime_linker_state_refresh();
+        std::cout << Color::GREEN << "✓ Installed " << exec_result.installed_count
+                  << " package(s)." << Color::RESET << std::endl;
+        return 0;
+    }
+
     size_t installed_count = 0;
     size_t install_progress_width = 0;
     for (size_t i = 0; i < install_queue.size();) {

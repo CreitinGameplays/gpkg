@@ -202,8 +202,8 @@ enum class DebianBackendKind {
 };
 
 struct DebianBackendSelection {
-    DebianBackendKind selected = DebianBackendKind::Legacy;
-    DebianBackendKind requested = DebianBackendKind::Legacy;
+    DebianBackendKind selected = DebianBackendKind::LibAptPkg;
+    DebianBackendKind requested = DebianBackendKind::LibAptPkg;
     bool auto_selected = true;
     bool libapt_pkg_compiled = false;
     bool fell_back = false;
@@ -423,8 +423,8 @@ DebianBackendSelection select_debian_backend(
     (void)verbose;
 
     DebianBackendSelection selection;
-    selection.selected = DebianBackendKind::Legacy;
-    selection.requested = DebianBackendKind::Legacy;
+    selection.selected = DebianBackendKind::LibAptPkg;
+    selection.requested = DebianBackendKind::LibAptPkg;
     selection.auto_selected = true;
     selection.libapt_pkg_compiled = libapt_pkg_backend_is_compiled();
 
@@ -436,39 +436,25 @@ DebianBackendSelection select_debian_backend(
     else requested = ascii_lower_copy(requested.substr(start, end - start + 1));
     if (requested.empty()) requested = "auto";
 
-    if (requested == "legacy") {
-        selection.selected = DebianBackendKind::Legacy;
-        selection.requested = DebianBackendKind::Legacy;
-        selection.auto_selected = false;
-        return selection;
-    }
-
     if (requested == "libapt-pkg" || requested == "libapt" || requested == "apt") {
         selection.requested = DebianBackendKind::LibAptPkg;
         selection.auto_selected = false;
-        if (selection.libapt_pkg_compiled) {
-            selection.selected = DebianBackendKind::LibAptPkg;
-            return selection;
-        }
+        return selection;
+    }
 
-        selection.selected = DebianBackendKind::Legacy;
+    if (requested == "legacy") {
+        selection.requested = DebianBackendKind::Legacy;
+        selection.auto_selected = false;
         selection.fell_back = true;
+        selection.reason = selection.libapt_pkg_compiled
+            ? "legacy Debian backend has been removed; using libapt-pkg"
+            : "legacy Debian backend has been removed and libapt-pkg is not compiled into this gpkg build";
+    }
+
+    if (!selection.libapt_pkg_compiled && selection.reason.empty()) {
         selection.reason =
-            "gpkg was built without the libapt-pkg transaction backend; falling back to the legacy Debian engine for " +
-            describe_debian_backend_operation(operation);
-        return selection;
+            "libapt-pkg backend is not available in this gpkg build";
     }
-
-    selection.requested = DebianBackendKind::LibAptPkg;
-    selection.auto_selected = true;
-    if (selection.libapt_pkg_compiled) {
-        selection.selected = DebianBackendKind::LibAptPkg;
-        return selection;
-    }
-
-    selection.selected = DebianBackendKind::Legacy;
-    selection.reason =
-        "libapt-pkg backend is not compiled into this gpkg build yet; using the legacy Debian engine";
     return selection;
 }
 

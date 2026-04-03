@@ -5,12 +5,27 @@
 #include <apt-pkg/cachefile.h>
 #include <apt-pkg/configuration.h>
 #include <apt-pkg/init.h>
+#include <apt-pkg/packagemanager.h>
 #include <apt-pkg/pkgsystem.h>
 #include <apt-pkg/pkgrecords.h>
 #endif
 
+enum class LibAptOperationType {
+    Install,
+    Configure,
+    Remove,
+    Purge,
+};
+
+struct LibAptPlannedOperation {
+    LibAptOperationType type = LibAptOperationType::Install;
+    std::string apt_package_name;
+    std::string file_path;
+};
+
 struct LibAptPlannedInstallAction {
     PackageMetadata meta;
+    std::string apt_package_name;
     std::string current_version;
     bool was_installed = false;
     bool reinstall_only = false;
@@ -21,6 +36,7 @@ struct LibAptTransactionPlanResult {
     bool success = false;
     std::string error;
     std::vector<LibAptPlannedInstallAction> install_actions;
+    std::vector<LibAptPlannedOperation> ordered_operations;
     std::vector<std::string> remove_packages;
     std::vector<std::string> purge_packages;
     std::map<std::string, bool> auto_state_after;
@@ -47,6 +63,8 @@ bool get_upgrade_target_current_version(
     bool verbose,
     UpgradeContext* context
 );
+std::string get_install_archive_path(const PackageMetadata& meta);
+std::string get_cached_debian_archive_path(const PackageMetadata& meta);
 bool libapt_plan_install_like_transaction(
     const std::vector<std::string>& explicit_targets,
     const std::set<std::string>& reinstall_targets,
@@ -540,6 +558,90 @@ bool libapt_lookup_compiled_debian_metadata_for_candidate(
     return true;
 }
 
+class pkgGeminiPMPlanBuilder : public pkgPackageManager {
+    std::map<std::string, std::string> archive_paths_by_package_;
+    std::vector<LibAptPlannedOperation> operations_;
+
+   public:
+    explicit pkgGeminiPMPlanBuilder(
+        pkgDepCache* cache,
+        const std::map<std::string, std::string>& archive_paths_by_package
+    ) : pkgPackageManager(cache),
+        archive_paths_by_package_(archive_paths_by_package) {
+        for (PkgIterator pkg = Cache.PkgBegin(); pkg.end() == false; ++pkg) {
+            FileNames[pkg->ID].clear();
+        }
+
+        for (const auto& entry : archive_paths_by_package_) {
+            PkgIterator pkg = Cache.FindPkg(entry.first);
+            if (pkg.end()) continue;
+            FileNames[pkg->ID] = entry.second;
+        }
+    }
+
+    bool Install(PkgIterator pkg, std::string file) override {
+        operations_.push_back({LibAptOperationType::Install, pkg.Name(), file});
+        return true;
+    }
+
+    bool Configure(PkgIterator pkg) override {
+        operations_.push_back({LibAptOperationType::Configure, pkg.Name(), ""});
+        return true;
+    }
+
+    bool Remove(PkgIterator pkg, bool purge = false) override {
+        operations_.push_back({
+            purge ? LibAptOperationType::Purge : LibAptOperationType::Remove,
+            pkg.Name(),
+            ""
+        });
+        return true;
+    }
+
+    bool Go(APT::Progress::PackageManager* /*progress*/) override {
+        return true;
+    }
+
+    void Reset() override {
+        operations_.clear();
+    }
+
+    const std::vector<LibAptPlannedOperation>& operations() const {
+        return operations_;
+    }
+};
+
+bool libapt_build_operation_plan(
+    pkgCacheFile& cache_file,
+    LibAptTransactionPlanResult& out_result,
+    std::string* error_out = nullptr
+) {
+    if (error_out) error_out->clear();
+
+    std::map<std::string, std::string> archive_paths_by_package;
+    for (const auto& action : out_result.install_actions) {
+        std::string apt_package_name = trim(action.apt_package_name);
+        if (apt_package_name.empty()) continue;
+        archive_paths_by_package[apt_package_name] = package_is_debian_source(action.meta)
+            ? get_cached_debian_archive_path(action.meta)
+            : get_install_archive_path(action.meta);
+    }
+
+    pkgGeminiPMPlanBuilder plan_builder(&*cache_file, archive_paths_by_package);
+    pkgPackageManager::OrderResult order_result = plan_builder.DoInstallPreFork();
+    if (order_result != pkgPackageManager::Completed) {
+        if (error_out) {
+            *error_out = order_result == pkgPackageManager::Incomplete
+                ? "apt produced an incomplete package-manager order"
+                : "apt could not produce a GeminiOS package-manager order";
+        }
+        return false;
+    }
+
+    out_result.ordered_operations = plan_builder.operations();
+    return true;
+}
+
 bool libapt_resolve_metadata_for_candidate(
     const std::string& pkg_name,
     const std::string& version,
@@ -658,6 +760,7 @@ bool libapt_extract_transaction_result(
 
         LibAptPlannedInstallAction action;
         action.meta = meta;
+        action.apt_package_name = pkg.Name();
         action.current_version = pkg->CurrentVer == 0 ? "" : pkg.CurrentVer().VerStr();
         action.was_installed = currently_present;
         action.reinstall_only =
@@ -765,7 +868,7 @@ bool libapt_plan_install_like_transaction(
         return false;
     }
 
-    return libapt_extract_transaction_result(
+    if (!libapt_extract_transaction_result(
         cache_file,
         std::set<std::string>(explicit_targets.begin(), explicit_targets.end()),
         false,
@@ -773,7 +876,11 @@ bool libapt_plan_install_like_transaction(
         verbose,
         out_result,
         error_out
-    );
+    )) {
+        return false;
+    }
+
+    return libapt_build_operation_plan(cache_file, out_result, error_out);
 }
 
 bool libapt_plan_remove_transaction(
