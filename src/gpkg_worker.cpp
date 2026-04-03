@@ -819,6 +819,7 @@ bool refresh_linker_cache_if_available() {
 
     std::string ldconfig_path = find_ldconfig_path();
     if (!run_ldconfig(ldconfig_path)) return false;
+    if (!sync_multiarch_runtime_aliases()) return false;
 
     size_t failed = 0;
     constexpr size_t kMaxRefreshPasses = 8;
@@ -872,6 +873,7 @@ bool refresh_linker_cache_if_available() {
             break;
         }
         if (!run_ldconfig(ldconfig_path)) return false;
+        if (!sync_multiarch_runtime_aliases()) return false;
     }
 
     if (!converged) {
@@ -886,6 +888,7 @@ bool refresh_linker_cache_if_available() {
                   << (failed == 1 ? "" : "s")
                   << "." << std::endl;
     }
+    if (!sync_multiarch_runtime_aliases()) return false;
     return true;
 }
 
@@ -1641,7 +1644,6 @@ std::string select_global_runtime_alias_canonical_path(
                     runtime_path_resolves_to_valid_library(full_path, expected_name_for_validation)) {
                     std::string load_error;
                     if (!runtime_provider_compatible_with_current_process(full_path, &load_error)) {
-                        VLOG("Skipping runtime provider " << full_path << ": " << load_error);
                     } else {
                         Candidate candidate;
                         candidate.path = full_path;
@@ -1672,10 +1674,7 @@ std::string select_global_runtime_alias_canonical_path(
                     if (!runtime_path_resolves_to_valid_library(provider_full_path, provider_name)) continue;
 
                     std::string load_error;
-                    if (!runtime_provider_compatible_with_current_process(provider_full_path, &load_error)) {
-                        VLOG("Skipping runtime provider " << provider_full_path << ": " << load_error);
-                        continue;
-                    }
+                    if (!runtime_provider_compatible_with_current_process(provider_full_path, &load_error)) continue;
 
                     Candidate candidate;
                     candidate.path = provider_full_path;
@@ -2028,11 +2027,7 @@ std::vector<std::pair<std::string, std::string>> collect_broken_runtime_linker_s
                                 candidate_name,
                                 &resolved_path)) continue;
                         std::string load_error;
-                        if (!runtime_provider_compatible_with_current_process(candidate.full_path, &load_error)) {
-                            VLOG("Skipping runtime linker repair candidate " << candidate.full_path
-                                 << ": " << load_error);
-                            continue;
-                        }
+                        if (!runtime_provider_compatible_with_current_process(candidate.full_path, &load_error)) continue;
                         candidate.owned = owner_index.count(candidate.logical_path) != 0;
                         candidate.path_rank = runtime_alias_path_rank(candidate.logical_path);
                         candidate.name_rank = runtime_linker_provider_name_rank(candidate_name);
