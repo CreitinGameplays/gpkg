@@ -7283,10 +7283,24 @@ bool maybe_report_unavailable_install_target(
     return true;
 }
 
+bool install_operand_prefers_direct_self_upgrade(
+    const std::string& requested_name,
+    bool verbose
+) {
+    std::string canonical_name = canonicalize_package_name(requested_name, verbose);
+    if (canonical_name != "gpkg") return false;
+    if (!try_ensure_repo_package_cache_loaded(verbose)) return false;
+
+    PackageMetadata repo_meta;
+    return get_loaded_repo_package_info(canonical_name, repo_meta);
+}
+
 int handle_install(int argc, char* argv[], const std::set<std::string>& installed_cache, bool verbose) {
     std::vector<PackageMetadata> install_queue;
     std::vector<std::string> local_files;
     std::vector<std::string> repo_operands;
+    std::vector<std::string> prioritized_repo_operands;
+    std::vector<std::string> deferred_repo_operands;
     std::vector<std::string> operands = collect_cli_operands(argc, argv, 2);
     std::set<std::string> visited;
     bool needs_repo_index = false;
@@ -7319,21 +7333,61 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
     if (needs_repo_index && !ensure_repo_index_available()) return 1;
 
     for (const auto& arg : repo_operands) {
+        if (install_operand_prefers_direct_self_upgrade(arg, verbose)) {
+            prioritized_repo_operands.push_back(arg);
+            continue;
+        }
+        deferred_repo_operands.push_back(arg);
+    }
+
+    if (verbose && !prioritized_repo_operands.empty()) {
+        std::cout << "[DEBUG] Prioritizing direct GeminiOS repository resolution for explicit self-upgrade target(s): "
+                  << join_strings(prioritized_repo_operands) << std::endl;
+    }
+
+    for (const auto& arg : deferred_repo_operands) {
         if (maybe_report_unavailable_install_target(arg, verbose)) {
             return 1;
         }
     }
 
-    if (!repo_operands.empty() && backend.selected == DebianBackendKind::LibAptPkg) {
+    for (const auto& arg : prioritized_repo_operands) {
+        std::string failure_reason;
+        bool force_explicit_queue =
+            g_force_reinstall || explicit_install_target_requires_queue(arg, verbose, &raw_context);
+        if (!resolve_dependencies(
+                arg,
+                "",
+                "",
+                install_queue,
+                visited,
+                installed_cache,
+                verbose,
+                force_explicit_queue,
+                nullptr,
+                false,
+                &raw_context,
+                &failure_reason
+            )) {
+            std::cerr << Color::RED << "E: Failed to resolve dependencies for " << arg;
+            if (!failure_reason.empty()) {
+                std::cerr << " (" << failure_reason << ")";
+            }
+            std::cerr << Color::RESET << std::endl;
+            return 1;
+        }
+    }
+
+    if (!deferred_repo_operands.empty() && backend.selected == DebianBackendKind::LibAptPkg) {
         std::string unsupported_reason;
-        if (libapt_can_handle_repo_install_operands(repo_operands, verbose, &unsupported_reason)) {
+        if (libapt_can_handle_repo_install_operands(deferred_repo_operands, verbose, &unsupported_reason)) {
             std::set<std::string> reinstall_targets;
             if (g_force_reinstall) {
-                reinstall_targets.insert(repo_operands.begin(), repo_operands.end());
+                reinstall_targets.insert(deferred_repo_operands.begin(), deferred_repo_operands.end());
             }
             std::string apt_error;
             if (!libapt_plan_install_like_transaction(
-                    repo_operands,
+                    deferred_repo_operands,
                     reinstall_targets,
                     false,
                     verbose,
@@ -7348,7 +7402,8 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
                 return 1;
             }
 
-            install_queue = collect_libapt_install_queue(libapt_plan);
+            std::vector<PackageMetadata> libapt_queue = collect_libapt_install_queue(libapt_plan);
+            install_queue.insert(install_queue.end(), libapt_queue.begin(), libapt_queue.end());
             using_libapt_plan = true;
         } else if (verbose && !unsupported_reason.empty()) {
             std::cout << "[DEBUG] Falling back to the legacy install planner because "
@@ -7357,7 +7412,7 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
     }
 
     if (!using_libapt_plan) {
-        for (const auto& arg : repo_operands) {
+        for (const auto& arg : deferred_repo_operands) {
             std::string failure_reason;
             bool force_explicit_queue =
                 g_force_reinstall || explicit_install_target_requires_queue(arg, verbose, &raw_context);
@@ -7455,13 +7510,22 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
     install_queue = install_plan.install_queue;
 
     std::set<std::string> explicit_manual_targets;
+    for (const auto& arg : prioritized_repo_operands) {
+        std::string resolved = resolve_requested_package_for_manual_marking(
+            arg,
+            install_queue,
+            installed_cache,
+            verbose
+        );
+        if (!resolved.empty()) explicit_manual_targets.insert(resolved);
+    }
     if (using_libapt_plan) {
         for (const auto& action : libapt_plan.install_actions) {
             if (!action.explicit_target) continue;
             explicit_manual_targets.insert(action.meta.name);
         }
     } else {
-        for (const auto& arg : repo_operands) {
+        for (const auto& arg : deferred_repo_operands) {
             std::string resolved = resolve_requested_package_for_manual_marking(
                 arg,
                 install_queue,
