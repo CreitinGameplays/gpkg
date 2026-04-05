@@ -94,6 +94,7 @@ std::string sanitize_native_dpkg_status_version(
 );
 std::string native_synthetic_info_list_path(const std::string& pkg_name);
 std::string native_synthetic_owner_marker_path(const std::string& pkg_name);
+std::vector<std::string> list_native_dpkg_update_fragment_paths();
 bool package_name_is_debian_control_sidecar_package(const std::string& pkg_name);
 std::string resolve_context_synthetic_live_version(
     const std::string& pkg_name,
@@ -830,6 +831,75 @@ bool ensure_native_dpkg_admin_layout(std::string* error_out) {
     return true;
 }
 
+constexpr int NATIVE_DPKG_READY_STAMP_VERSION = 1;
+
+std::string build_native_dpkg_ready_stamp_contents() {
+    return "schema=" + std::to_string(NATIVE_DPKG_READY_STAMP_VERSION) + "\n";
+}
+
+bool refresh_native_dpkg_ready_stamp(std::string* error_out = nullptr) {
+    if (error_out) error_out->clear();
+    if (write_text_file_atomically(
+            NATIVE_DPKG_READY_STAMP_FILE,
+            build_native_dpkg_ready_stamp_contents()
+        )) {
+        return true;
+    }
+    if (error_out) {
+        *error_out = "failed to write " + NATIVE_DPKG_READY_STAMP_FILE + ": " +
+            std::strerror(errno);
+    }
+    return false;
+}
+
+bool native_dpkg_ready_stamp_is_current() {
+    std::ifstream in(NATIVE_DPKG_READY_STAMP_FILE);
+    if (!in) return false;
+
+    std::ostringstream buffer;
+    buffer << in.rdbuf();
+    if (!in.good() && !in.eof()) return false;
+
+    std::string content = buffer.str();
+    return trim(content) == trim(build_native_dpkg_ready_stamp_contents());
+}
+
+bool native_dpkg_backend_is_ready_for_fast_reuse(
+    bool verbose,
+    std::string* reason_out = nullptr
+) {
+    if (reason_out) reason_out->clear();
+
+    struct stat status_st {};
+    if (stat(DPKG_STATUS_FILE.c_str(), &status_st) != 0 || status_st.st_size <= 0) {
+        if (reason_out) *reason_out = DPKG_STATUS_FILE + " is missing or empty";
+        return false;
+    }
+
+    struct stat synthetic_st {};
+    if (stat(NATIVE_SYNTHETIC_STATUS_FILE.c_str(), &synthetic_st) != 0 || synthetic_st.st_size <= 0) {
+        if (reason_out) *reason_out = NATIVE_SYNTHETIC_STATUS_FILE + " is missing or empty";
+        return false;
+    }
+
+    std::vector<std::string> update_fragment_paths = list_native_dpkg_update_fragment_paths();
+    if (!update_fragment_paths.empty()) {
+        if (reason_out) {
+            *reason_out = std::to_string(update_fragment_paths.size()) +
+                " pending native dpkg update fragment(s) require repair";
+        }
+        return false;
+    }
+
+    if (!native_dpkg_ready_stamp_is_current()) {
+        if (reason_out) *reason_out = "native dpkg ready stamp is missing or outdated";
+        return false;
+    }
+
+    VLOG(verbose, "Reusing existing native dpkg backend state via readiness stamp.");
+    return true;
+}
+
 std::string native_synthetic_info_list_path(const std::string& pkg_name) {
     return NATIVE_SYNTHETIC_INFO_DIR + "/" + pkg_name + ".list";
 }
@@ -1453,6 +1523,10 @@ bool repair_native_dpkg_status_database(bool verbose, std::string* error_out) {
         return false;
     }
 
+    if (!refresh_native_dpkg_ready_stamp(error_out)) {
+        return false;
+    }
+
     return true;
 }
 
@@ -1822,6 +1896,10 @@ bool bootstrap_native_dpkg_status_database(bool verbose, std::string* error_out)
         return false;
     }
 
+    if (!refresh_native_dpkg_ready_stamp(error_out)) {
+        return false;
+    }
+
     VLOG(verbose, "Bootstrapped real native dpkg state at " << DPKG_STATUS_FILE
                   << " with " << synthetic_entries.size() << " compat package record(s) and "
                   << synthetic_entries.size() << " synthetic owner record(s).");
@@ -1836,11 +1914,20 @@ bool ensure_native_dpkg_backend_ready(bool verbose, std::string* error_out) {
         return false;
     }
 
+    if (!ensure_native_dpkg_admin_layout(error_out)) return false;
+
     struct stat status_st {};
     if (stat(DPKG_STATUS_FILE.c_str(), &status_st) == 0 && status_st.st_size > 0) {
+        std::string fast_reuse_reason;
+        if (native_dpkg_backend_is_ready_for_fast_reuse(verbose, &fast_reuse_reason)) {
+            return true;
+        }
+        VLOG(verbose, "Native dpkg backend requires repair: " << fast_reuse_reason);
         return repair_native_dpkg_status_database(verbose, error_out);
     }
 
+    VLOG(verbose, "Native dpkg backend requires bootstrap: " << DPKG_STATUS_FILE
+                 << " is missing or empty.");
     return bootstrap_native_dpkg_status_database(verbose, error_out);
 }
 
@@ -1944,6 +2031,54 @@ UpgradeContext build_upgrade_context(bool verbose) {
         context.upgrade_catalog_problem = catalog_problem;
     }
 
+    return context;
+}
+
+UpgradeContext build_install_policy_context(bool verbose) {
+    UpgradeContext context;
+
+    context.registered_status_records = load_package_status_records();
+    for (const auto& record : context.registered_status_records) {
+        if (record.package.empty()) continue;
+        context.registered_status_by_package[record.package] = record;
+    }
+
+    context.registered_package_names =
+        collect_registered_package_names_from_status_records(context.registered_status_records);
+    context.registered_package_set.insert(
+        context.registered_package_names.begin(),
+        context.registered_package_names.end()
+    );
+    context.exact_live_packages.insert(
+        context.registered_package_names.begin(),
+        context.registered_package_names.end()
+    );
+
+    context.dpkg_status_records = load_dpkg_package_status_records();
+    for (const auto& record : context.dpkg_status_records) {
+        if (record.package.empty()) continue;
+        context.dpkg_status_by_package[record.package] = record;
+        if (!package_status_is_installed_like(record.status)) continue;
+        if (native_dpkg_version_is_exact(record.version)) {
+            context.exact_live_packages.insert(record.package);
+        }
+    }
+
+    for (const auto& record : load_base_system_package_status_records()) {
+        if (record.package.empty()) continue;
+        context.base_status_by_package[record.package] = record;
+        if (!package_status_is_installed_like(record.status)) continue;
+        context.base_presence_by_package[record.package] = true;
+        context.present_base_packages.insert(record.package);
+        if (native_dpkg_version_is_exact(record.version)) {
+            context.exact_live_packages.insert(record.package);
+        }
+    }
+
+    VLOG(verbose, "Built lightweight install policy context with "
+                 << context.registered_status_by_package.size() << " registered package(s), "
+                 << context.dpkg_status_by_package.size() << " native dpkg package(s), and "
+                 << context.base_status_by_package.size() << " base package(s).");
     return context;
 }
 
@@ -7686,19 +7821,71 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
         mutated_runtime_state = true;
     }
 
-    UpgradeContext install_context = build_upgrade_context(verbose);
-    const std::set<std::string>& install_live_set =
-        install_context.exact_live_packages.empty() ? installed_cache : install_context.exact_live_packages;
-
     TransactionPlan install_plan;
-    if (!build_transaction_plan(
-            install_queue,
-            install_live_set,
-            verbose,
-            install_plan,
-            &install_context
-        )) {
-        return 1;
+    install_plan = {};
+    {
+        std::set<std::string> queued_names;
+        for (const auto& pkg : install_queue) {
+            std::string canonical_name = canonicalize_package_name(pkg.name, verbose);
+            if (!queued_names.insert(canonical_name).second) continue;
+            install_plan.install_queue.push_back(pkg);
+        }
+    }
+
+    bool queue_requires_retirement_scan = false;
+    for (const auto& pkg : install_plan.install_queue) {
+        if (!pkg.replaces.empty()) {
+            queue_requires_retirement_scan = true;
+            break;
+        }
+    }
+
+    if (queue_requires_retirement_scan) {
+        VLOG(verbose, "Building lightweight install context for replacement/retirement policy checks.");
+        UpgradeContext install_context = build_install_policy_context(verbose);
+        const std::set<std::string>& install_live_set =
+            install_context.exact_live_packages.empty() ? installed_cache : install_context.exact_live_packages;
+
+        std::map<std::string, PackageMetadata> installed_meta_cache;
+        std::set<std::string> missing_installed_meta;
+        auto get_installed_meta = [&](const std::string& pkg_name) -> const PackageMetadata* {
+            auto cache_it = installed_meta_cache.find(pkg_name);
+            if (cache_it != installed_meta_cache.end()) return &cache_it->second;
+            if (missing_installed_meta.count(pkg_name) != 0) return nullptr;
+
+            PackageMetadata meta;
+            if (!get_context_live_installed_package_metadata(install_context, pkg_name, meta)) {
+                missing_installed_meta.insert(pkg_name);
+                return nullptr;
+            }
+
+            auto inserted = installed_meta_cache.emplace(pkg_name, std::move(meta));
+            return &inserted.first->second;
+        };
+
+        std::set<std::string> scheduled_retirements;
+        for (const auto& pkg : install_plan.install_queue) {
+            for (const auto& installed_name : install_live_set) {
+                if (installed_name == pkg.name) continue;
+
+                const PackageMetadata* installed_meta = get_installed_meta(installed_name);
+                if (!package_replaces_package(pkg, installed_name, installed_meta)) continue;
+
+                bool queued_conflicts_installed =
+                    package_conflicts_with_package(pkg, installed_name, installed_meta);
+                bool installed_conflicts_queued =
+                    installed_meta &&
+                    package_conflicts_with_package(*installed_meta, pkg.name, &pkg);
+                if (!queued_conflicts_installed && !installed_conflicts_queued) continue;
+
+                if (scheduled_retirements.insert(installed_name).second) {
+                    install_plan.retirements.push_back({installed_name, pkg.name});
+                }
+            }
+        }
+        VLOG(verbose, "Using libapt-pkg solved queue directly for install policy checks.");
+    } else {
+        VLOG(verbose, "Using libapt-pkg solved queue directly; no replacement scan was needed.");
     }
     install_queue = install_plan.install_queue;
 

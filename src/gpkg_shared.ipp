@@ -78,6 +78,7 @@ const std::string DPKG_INFO_DIR = DPKG_ADMIN_DIR + "/info";
 const std::string NATIVE_SYNTHETIC_STATUS_FILE = ROOT_PREFIX + "/var/lib/gpkg/native-synthetic-status";
 const std::string NATIVE_SYNTHETIC_INFO_DIR = ROOT_PREFIX + "/var/lib/gpkg/native-info";
 const std::string NATIVE_SYNTHETIC_OWNERS_DIR = ROOT_PREFIX + "/var/lib/gpkg/native-owners";
+const std::string NATIVE_DPKG_READY_STAMP_FILE = ROOT_PREFIX + "/var/lib/gpkg/native-dpkg-ready.stamp";
 const std::string NATIVE_DPKG_STORE_DIR = ROOT_PREFIX + "/var/lib/gpkg/native-store";
 const std::string NATIVE_DPKG_STAGE_DIR = ROOT_PREFIX + "/var/lib/gpkg/native-stage";
 const std::string BASE_SYSTEM_REGISTRY_PATH = ROOT_PREFIX + "/usr/share/gpkg/base-system.json";

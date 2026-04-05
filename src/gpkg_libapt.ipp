@@ -949,8 +949,7 @@ bool libapt_extract_transaction_result(
         ++scanned_packages;
         pkgDepCache::StateCache& state = cache[pkg];
         bool currently_present =
-            pkg->CurrentVer != 0 ||
-            package_is_config_files_only(pkg.Name(), nullptr);
+            pkg->CurrentState != pkgCache::State::NotInstalled;
 
         bool should_remove =
             state.Delete() ||
