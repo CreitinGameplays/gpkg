@@ -1,4 +1,5 @@
 # GPKG: GeminiOS Package Manager
+MOVED TO GPKG-v2
 
 `gpkg` is GeminiOS's package manager. It handles repository metadata, dependency
 resolution, package downloads, and package operations across two backends:
