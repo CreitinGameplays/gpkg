@@ -86,6 +86,39 @@ bool ensure_native_dpkg_backend_ready(bool verbose, std::string* error_out);
 
 #if defined(GPKG_HAVE_WORKING_LIBAPT_PKG_BACKEND)
 
+using LibAptClock = std::chrono::steady_clock;
+
+std::string libapt_format_elapsed_ms(LibAptClock::time_point started_at) {
+    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        LibAptClock::now() - started_at
+    ).count();
+    return std::to_string(elapsed_ms) + " ms";
+}
+
+class ScopedLibAptDebugTimer {
+    bool verbose_ = false;
+    std::string label_;
+    LibAptClock::time_point started_at_;
+
+   public:
+    ScopedLibAptDebugTimer(bool verbose, std::string label)
+        : verbose_(verbose),
+          label_(std::move(label)),
+          started_at_(LibAptClock::now()) {
+        VLOG(verbose_, label_ << "...");
+    }
+
+    void checkpoint(const std::string& detail) const {
+        VLOG(verbose_, label_ << ": " << detail
+                             << " (" << libapt_format_elapsed_ms(started_at_) << ")");
+    }
+
+    void finish(const std::string& detail = "done") const {
+        VLOG(verbose_, label_ << ": " << detail
+                             << " (" << libapt_format_elapsed_ms(started_at_) << ")");
+    }
+};
+
 struct ScopedLibAptSessionRoot {
     std::string path;
     bool cleanup_on_destroy = false;
@@ -602,19 +635,23 @@ bool libapt_build_cache_file(
     std::string* error_out = nullptr
 ) {
     if (error_out) error_out->clear();
+    ScopedLibAptDebugTimer debug_timer(verbose, "libapt-pkg: building dependency cache state");
 
     if (!cache_file.BuildSourceList(nullptr)) {
         if (error_out) *error_out = "failed to build apt source list";
         return false;
     }
+    debug_timer.checkpoint("source list loaded");
     if (!cache_file.BuildCaches(nullptr, false)) {
         if (error_out) *error_out = "failed to build apt package caches";
         return false;
     }
+    debug_timer.checkpoint("package cache mmap/build completed");
     if (!cache_file.BuildPolicy(nullptr)) {
         if (error_out) *error_out = "failed to build apt policy";
         return false;
     }
+    debug_timer.checkpoint("policy constructed");
     if (!cache_file.BuildDepCache(nullptr)) {
         if (error_out) *error_out = "failed to build apt dependency cache";
         return false;
@@ -623,30 +660,41 @@ bool libapt_build_cache_file(
     VLOG(verbose, "Built libapt-pkg cache with "
                      << cache_file.GetPkgCache()->HeaderP->PackageCount
                      << " package entries.");
+    debug_timer.finish("dependency cache ready");
     return true;
 }
 
-void libapt_seed_auto_install_state(pkgCacheFile& cache_file) {
+void libapt_seed_auto_install_state(pkgCacheFile& cache_file, bool verbose) {
     pkgDepCache& cache = *cache_file;
+    size_t marked_packages = 0;
     for (pkgCache::PkgIterator pkg = cache.PkgBegin(); pkg.end() == false; ++pkg) {
         bool auto_installed = false;
         if (get_package_auto_installed_state(pkg.Name(), &auto_installed)) {
             cache.MarkAuto(pkg, auto_installed);
+            ++marked_packages;
         }
     }
     cache.MarkAndSweep();
+    VLOG(verbose, "libapt-pkg: synchronized auto-installed state for "
+                      << marked_packages << " package(s).");
 }
 
 bool libapt_find_package(
     pkgCacheFile& cache_file,
     const std::string& name,
     pkgCache::PkgIterator& out_pkg,
+    bool verbose,
     std::string* error_out = nullptr
 ) {
     if (error_out) error_out->clear();
+    ScopedLibAptDebugTimer debug_timer(verbose, "libapt-pkg: locating target '" + name + "'");
     pkgDepCache& cache = *cache_file;
     out_pkg = cache.FindPkg(name);
-    if (!out_pkg.end()) return true;
+    if (!out_pkg.end()) {
+        std::string current_version = out_pkg->CurrentVer == 0 ? "<not-installed>" : out_pkg.CurrentVer().VerStr();
+        debug_timer.finish("found target (current=" + current_version + ")");
+        return true;
+    }
 
     if (error_out) *error_out = "package '" + name + "' is not present in the seeded apt cache";
     return false;
@@ -775,9 +823,14 @@ class pkgGeminiPMPlanBuilder : public pkgPackageManager {
 bool libapt_build_operation_plan(
     pkgCacheFile& cache_file,
     LibAptTransactionPlanResult& out_result,
+    bool verbose,
     std::string* error_out = nullptr
 ) {
     if (error_out) error_out->clear();
+    ScopedLibAptDebugTimer debug_timer(
+        verbose,
+        "libapt-pkg: building package-manager operation plan"
+    );
 
     std::map<std::string, std::string> archive_paths_by_package;
     for (const auto& action : out_result.install_actions) {
@@ -800,6 +853,9 @@ bool libapt_build_operation_plan(
     }
 
     out_result.ordered_operations = plan_builder.operations();
+    debug_timer.finish(
+        "built " + std::to_string(out_result.ordered_operations.size()) + " ordered operation(s)"
+    );
     return true;
 }
 
@@ -880,12 +936,17 @@ bool libapt_extract_transaction_result(
 ) {
     if (error_out) error_out->clear();
     out_result = {};
+    ScopedLibAptDebugTimer debug_timer(verbose, "libapt-pkg: extracting planned transaction result");
 
     RawDebianContext raw_context;
     pkgDepCache& cache = *cache_file;
     pkgCache& pkg_cache = cache.GetCache();
+    size_t scanned_packages = 0;
+    size_t planned_install_actions = 0;
+    size_t planned_removals = 0;
 
     for (pkgCache::PkgIterator pkg = cache.PkgBegin(); pkg.end() == false; ++pkg) {
+        ++scanned_packages;
         pkgDepCache::StateCache& state = cache[pkg];
         bool currently_present =
             pkg->CurrentVer != 0 ||
@@ -898,6 +959,7 @@ bool libapt_extract_transaction_result(
             std::string pkg_name = pkg.Name();
             out_result.remove_packages.push_back(pkg_name);
             if (state.Purge() || purge_garbage) out_result.purge_packages.push_back(pkg_name);
+            ++planned_removals;
         }
 
         if (!state.Install() && !state.ReInstall()) continue;
@@ -930,6 +992,7 @@ bool libapt_extract_transaction_result(
             compare_versions(action.current_version, meta.version) == 0;
         action.explicit_target = explicit_targets.count(pkg.Name()) != 0;
         out_result.install_actions.push_back(action);
+        ++planned_install_actions;
         out_result.auto_state_after[pkg.Name()] =
             (state.Flags & pkgCache::Flag::Auto) == pkgCache::Flag::Auto;
     }
@@ -941,6 +1004,11 @@ bool libapt_extract_transaction_result(
     dedupe_names(out_result.remove_packages);
     dedupe_names(out_result.purge_packages);
     out_result.success = true;
+    debug_timer.finish(
+        "scanned " + std::to_string(scanned_packages) + " package(s), planned " +
+        std::to_string(planned_install_actions) + " install/reinstall action(s), " +
+        std::to_string(planned_removals) + " removal(s)"
+    );
     return true;
 }
 
@@ -952,8 +1020,11 @@ bool libapt_open_seeded_cache(
     std::string* error_out = nullptr
 ) {
     if (error_out) error_out->clear();
+    ScopedLibAptDebugTimer debug_timer(verbose, "libapt-pkg: opening seeded planner cache");
 
     std::string dpkg_bootstrap_error;
+    {
+        ScopedLibAptDebugTimer step_timer(verbose, "libapt-pkg: ensuring native dpkg backend state");
     if (!ensure_native_dpkg_backend_ready(verbose, &dpkg_bootstrap_error)) {
         if (error_out) {
             *error_out = dpkg_bootstrap_error.empty()
@@ -962,13 +1033,41 @@ bool libapt_open_seeded_cache(
         }
         return false;
     }
+        step_timer.finish("native dpkg backend state ready");
+    }
 
+    ScopedLibAptDebugTimer config_timer(verbose, "libapt-pkg: loading Debian backend config");
     DebianBackendConfig config = load_debian_backend_config(verbose);
-    if (!libapt_prepare_session_root(session_root, error_out)) return false;
-    if (!libapt_seed_debian_packages_index(session_root, packages_path, config, verbose, error_out)) return false;
-    if (!libapt_initialize_globals(session_root, config, verbose, error_out)) return false;
-    if (!libapt_build_cache_file(cache_file, verbose, error_out)) return false;
-    libapt_seed_auto_install_state(cache_file);
+    config_timer.finish("using architecture " + config.apt_arch);
+
+    {
+        ScopedLibAptDebugTimer step_timer(verbose, "libapt-pkg: preparing planner session root");
+        if (!libapt_prepare_session_root(session_root, error_out)) return false;
+        step_timer.finish("session root at " + session_root.path);
+    }
+    {
+        ScopedLibAptDebugTimer step_timer(verbose, "libapt-pkg: seeding planner session inputs");
+        if (!libapt_seed_debian_packages_index(session_root, packages_path, config, verbose, error_out)) {
+            return false;
+        }
+        step_timer.finish("session inputs ready");
+    }
+    {
+        ScopedLibAptDebugTimer step_timer(verbose, "libapt-pkg: initializing libapt globals");
+        if (!libapt_initialize_globals(session_root, config, verbose, error_out)) return false;
+        step_timer.finish("libapt globals initialized");
+    }
+    {
+        ScopedLibAptDebugTimer step_timer(verbose, "libapt-pkg: building/opening planner cache");
+        if (!libapt_build_cache_file(cache_file, verbose, error_out)) return false;
+        step_timer.finish("planner cache ready");
+    }
+    {
+        ScopedLibAptDebugTimer step_timer(verbose, "libapt-pkg: seeding auto-installed state");
+        libapt_seed_auto_install_state(cache_file, verbose);
+        step_timer.finish("auto-installed state synchronized");
+    }
+    debug_timer.finish("seeded planner cache is ready");
     return true;
 }
 
@@ -1001,6 +1100,7 @@ bool libapt_plan_install_like_transaction(
 ) {
     if (error_out) error_out->clear();
     out_result = {};
+    ScopedLibAptDebugTimer debug_timer(verbose, "libapt-pkg: planning install-like transaction");
 
     std::string packages_path = get_debian_packages_cache_path();
     if (access(packages_path.c_str(), F_OK) != 0) {
@@ -1013,23 +1113,30 @@ bool libapt_plan_install_like_transaction(
     if (!libapt_open_seeded_cache(packages_path, verbose, session_root, cache_file, error_out)) {
         return false;
     }
+    debug_timer.checkpoint("seeded planner cache opened at " + session_root.path);
 
     pkgDepCache& cache = *cache_file;
     for (const auto& target : explicit_targets) {
         pkgCache::PkgIterator pkg;
         std::string lookup_error;
-        if (!libapt_find_package(cache_file, target, pkg, &lookup_error)) {
+        if (!libapt_find_package(cache_file, target, pkg, verbose, &lookup_error)) {
             if (error_out) *error_out = lookup_error;
             return false;
         }
 
         {
+            ScopedLibAptDebugTimer mark_timer(
+                verbose,
+                "libapt-pkg: marking '" + target + "' for installation"
+            );
             pkgDepCache::ActionGroup group(cache);
             pkgCache::VerIterator candidate_version = cache.GetCandidateVersion(pkg);
             bool same_version_candidate =
                 pkg->CurrentVer != 0 &&
                 !candidate_version.end() &&
                 compare_versions(candidate_version.VerStr(), pkg.CurrentVer().VerStr()) == 0;
+            std::string candidate_version_str =
+                candidate_version.end() ? "<none>" : candidate_version.VerStr();
 
             bool marked_install = cache.MarkInstall(pkg, true, 0, true);
             if (!marked_install &&
@@ -1044,19 +1151,30 @@ bool libapt_plan_install_like_transaction(
                 return false;
             }
             if (reinstall_targets.count(target) != 0) cache.SetReInstall(pkg, true);
+            mark_timer.finish(
+                "candidate=" + candidate_version_str +
+                ", reinstall=" +
+                std::string(reinstall_targets.count(target) != 0 ? "yes" : "no")
+            );
         }
     }
 
-    if (fix_broken && !pkgFixBroken(cache)) {
-        if (error_out) *error_out = "apt could not repair broken dependency state";
-        return false;
+    if (fix_broken) {
+        ScopedLibAptDebugTimer fix_timer(verbose, "libapt-pkg: fixing broken dependency state");
+        if (!pkgFixBroken(cache)) {
+            if (error_out) *error_out = "apt could not repair broken dependency state";
+            return false;
+        }
+        fix_timer.finish("broken dependency repair completed");
     }
 
+    ScopedLibAptDebugTimer resolver_timer(verbose, "libapt-pkg: running problem resolver");
     pkgProblemResolver resolver(&cache);
     if (!resolver.Resolve(fix_broken)) {
         if (error_out) *error_out = "apt could not solve the requested transaction";
         return false;
     }
+    resolver_timer.finish("problem resolver converged");
 
     if (!libapt_extract_transaction_result(
         cache_file,
@@ -1070,7 +1188,16 @@ bool libapt_plan_install_like_transaction(
         return false;
     }
 
-    return libapt_build_operation_plan(cache_file, out_result, error_out);
+    debug_timer.checkpoint(
+        "extracted " + std::to_string(out_result.install_actions.size()) +
+        " install action(s) and " + std::to_string(out_result.remove_packages.size()) +
+        " removal(s)"
+    );
+    if (!libapt_build_operation_plan(cache_file, out_result, verbose, error_out)) {
+        return false;
+    }
+    debug_timer.finish("install-like transaction plan ready");
+    return true;
 }
 
 bool libapt_plan_remove_transaction(
@@ -1083,6 +1210,7 @@ bool libapt_plan_remove_transaction(
 ) {
     if (error_out) error_out->clear();
     out_result = {};
+    ScopedLibAptDebugTimer debug_timer(verbose, "libapt-pkg: planning remove transaction");
 
     std::string packages_path = get_debian_packages_cache_path();
     if (access(packages_path.c_str(), F_OK) != 0) {
@@ -1095,12 +1223,13 @@ bool libapt_plan_remove_transaction(
     if (!libapt_open_seeded_cache(packages_path, verbose, session_root, cache_file, error_out)) {
         return false;
     }
+    debug_timer.checkpoint("seeded planner cache opened at " + session_root.path);
 
     pkgDepCache& cache = *cache_file;
     for (const auto& target : explicit_targets) {
         pkgCache::PkgIterator pkg;
         std::string lookup_error;
-        if (!libapt_find_package(cache_file, target, pkg, &lookup_error)) {
+        if (!libapt_find_package(cache_file, target, pkg, verbose, &lookup_error)) {
             if (error_out) *error_out = lookup_error;
             return false;
         }
@@ -1111,11 +1240,17 @@ bool libapt_plan_remove_transaction(
                 return false;
             }
         }
+        VLOG(verbose, "libapt-pkg: marked '" << target << "' for "
+                                             << (purge ? "purge" : "removal") << ".");
     }
 
-    if (autoremove) cache.MarkAndSweep();
+    if (autoremove) {
+        ScopedLibAptDebugTimer autoremove_timer(verbose, "libapt-pkg: running autoremove sweep");
+        cache.MarkAndSweep();
+        autoremove_timer.finish("autoremove sweep completed");
+    }
 
-    return libapt_extract_transaction_result(
+    if (!libapt_extract_transaction_result(
         cache_file,
         std::set<std::string>(explicit_targets.begin(), explicit_targets.end()),
         autoremove,
@@ -1123,7 +1258,15 @@ bool libapt_plan_remove_transaction(
         verbose,
         out_result,
         error_out
+    )) {
+        return false;
+    }
+
+    debug_timer.finish(
+        "remove transaction planned with " + std::to_string(out_result.remove_packages.size()) +
+        " removal(s)"
     );
+    return true;
 }
 
 #endif

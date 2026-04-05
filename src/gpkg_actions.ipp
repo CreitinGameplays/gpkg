@@ -7276,26 +7276,21 @@ int handle_repair(bool verbose) {
 
 bool maybe_report_unavailable_install_target(
     const std::string& requested_name,
-    bool verbose
+    bool verbose,
+    RawDebianContext* raw_context_override = nullptr
 ) {
-    std::string canonical_name = canonicalize_package_name(requested_name, verbose);
+    std::string canonical_name = canonicalize_package_name(
+        relation_name_from_text(requested_name),
+        verbose
+    );
     if (canonical_name.empty()) return false;
 
-    RawDebianContext raw_context;
-    PackageUniverseResult available_result;
-    if (resolve_full_universe_relation_candidate(
-            canonical_name,
-            "",
-            "",
-            available_result,
-            verbose,
-            &raw_context
-        )) {
-        return false;
-    }
+    RawDebianContext local_raw_context;
+    RawDebianContext* raw_context =
+        raw_context_override ? raw_context_override : &local_raw_context;
 
     PackageUniverseResult exact_result;
-    if (query_full_universe_exact_package(canonical_name, exact_result, verbose, &raw_context)) {
+    if (query_full_universe_exact_package(canonical_name, exact_result, verbose, raw_context)) {
         if (exact_result.installable) return false;
 
         std::cerr << Color::YELLOW
@@ -7319,7 +7314,12 @@ bool maybe_report_unavailable_install_target(
 
     DebianSearchPreviewEntry preview;
     std::string preview_error;
-    if (!get_debian_search_preview_exact_package(canonical_name, preview, verbose, &preview_error)) {
+    if (!get_debian_search_preview_exact_package(
+            canonical_name,
+            preview,
+            verbose,
+            &preview_error
+        )) {
         return false;
     }
     if (preview.installable) return false;
@@ -7587,24 +7587,10 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
         }
     }
 
-    for (const auto& arg : repo_operands) {
-        if (maybe_report_unavailable_install_target(arg, verbose)) {
-            return 1;
-        }
-    }
-
     if (!repo_operands.empty()) {
         std::vector<std::string> apt_targets = repo_operands;
-        std::string unsupported_reason;
-        if (!libapt_can_handle_repo_install_operands(apt_targets, verbose, &unsupported_reason)) {
-            std::cerr << Color::RED << "E: "
-                      << (unsupported_reason.empty()
-                              ? "libapt-pkg could not represent the requested install transaction"
-                              : unsupported_reason)
-                      << Color::RESET << std::endl;
-            return 1;
-        }
-
+        VLOG(verbose, "Handing " << apt_targets.size()
+                                 << " requested package(s) to the libapt-pkg planner.");
         std::set<std::string> reinstall_targets;
         if (g_force_reinstall) {
             reinstall_targets.insert(apt_targets.begin(), apt_targets.end());
@@ -7618,7 +7604,19 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
                 libapt_plan,
                 &apt_error
             )) {
-            std::cerr << Color::RED << "E: "
+            RawDebianContext diagnostics_context;
+            for (const auto& arg : repo_operands) {
+                if (maybe_report_unavailable_install_target(
+                        arg,
+                        verbose,
+                        &diagnostics_context
+                    )) {
+                    return 1;
+                }
+            }
+
+            std::cerr << Color::RED
+                      << "E: "
                       << (apt_error.empty()
                               ? "libapt-pkg failed to resolve the requested install transaction"
                               : apt_error)

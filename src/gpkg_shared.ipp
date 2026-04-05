@@ -9,6 +9,7 @@
 #include <cctype>
 #include <cerrno>
 #include <csignal>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
